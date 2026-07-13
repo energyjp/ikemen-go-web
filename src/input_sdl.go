@@ -242,6 +242,24 @@ func KeyToString(k sdl.Keycode) string {
 	return ""
 }
 
+// expandModifiers normalizes a raw keymod state to the combined
+// CTRL/ALT/SHIFT/GUI bits used by ShortcutKey.Test (shared input.go).
+func expandModifiers(m sdl.Keymod) (expand sdl.Keymod) {
+	if (m & sdl.KMOD_GUI) != 0 {
+		expand |= sdl.KMOD_GUI
+	}
+	if (m & sdl.KMOD_CTRL) != 0 {
+		expand |= sdl.KMOD_CTRL
+	}
+	if (m & sdl.KMOD_ALT) != 0 {
+		expand |= sdl.KMOD_ALT
+	}
+	if (m & sdl.KMOD_SHIFT) != 0 {
+		expand |= sdl.KMOD_SHIFT
+	}
+	return
+}
+
 func NewModifierKey(ctrl, alt, shift bool) (mod sdl.Keymod) {
 	if ctrl {
 		// Convert Ctrl to Command (⌘) key for macOS if user prefers it

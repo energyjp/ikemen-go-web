@@ -5,7 +5,6 @@ import (
 	"math"
 	"strings"
 
-	"github.com/veandco/go-sdl2/sdl"
 )
 
 var ModAlt ModifierKey
@@ -93,21 +92,9 @@ func NewShortcutKey(key Key, ctrl, alt, shift bool) *ShortcutKey {
 
 func (sk ShortcutKey) Test(k Key, m ModifierKey) bool {
 	trgtMods := sk.Mod & ModCtrlAltShift
-	var expandCurr sdl.Keymod
-	if (m & sdl.KMOD_GUI) != 0 {
-		expandCurr |= sdl.KMOD_GUI
-	}
-	if (m & sdl.KMOD_CTRL) != 0 {
-		expandCurr |= sdl.KMOD_CTRL
-	}
-	if (m & sdl.KMOD_ALT) != 0 {
-		expandCurr |= sdl.KMOD_ALT
-	}
-	if (m & sdl.KMOD_SHIFT) != 0 {
-		expandCurr |= sdl.KMOD_SHIFT
-	}
-
-	return k == sk.Key && trgtMods == expandCurr
+	// Normalizing left/right variants into combined bits is platform-
+	// specific (SDL keymods vs the browser backend's own bitmask).
+	return k == sk.Key && trgtMods == expandModifiers(m)
 }
 
 func OnKeyReleased(key Key, mk ModifierKey) {

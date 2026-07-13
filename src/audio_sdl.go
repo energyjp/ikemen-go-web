@@ -12,17 +12,6 @@ import (
 	"github.com/veandco/go-sdl2/sdl"
 )
 
-type AudioSink interface {
-	Init(sr beep.SampleRate, bufferSize int) error
-	Play(s beep.Streamer)
-	Lock()
-	Unlock()
-	Close()
-	FillAudio()
-}
-
-var speaker AudioSink
-
 type SDLSpeaker struct {
 	dev        sdl.AudioDeviceID
 	mixer      *beep.Mixer
@@ -121,4 +110,8 @@ func (s *SDLSpeaker) Close() {
 	if s.dev != 0 {
 		sdl.CloseAudioDevice(s.dev)
 	}
+}
+
+func newSpeaker() AudioSink {
+	return &SDLSpeaker{}
 }

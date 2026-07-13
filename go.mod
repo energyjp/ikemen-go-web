@@ -20,12 +20,14 @@ require (
 	github.com/tidwall/sjson v1.2.5
 	github.com/veandco/go-sdl2 v0.5.0-alpha.7.0.20250220045537-7f43f67a3a12
 	github.com/yuin/gopher-lua v1.1.0
-	golang.org/x/mobile v0.0.0-20221110043201-43a038452099
+	golang.org/x/mobile v0.0.0-20231127183840-76ac6878050a
 	golang.org/x/text v0.20.0
 	gopkg.in/ini.v1 v1.67.0
 )
 
 require (
+	github.com/ebitengine/oto/v3 v3.2.0 // indirect
+	github.com/ebitengine/purego v0.7.1 // indirect
 	github.com/icza/bitio v1.1.0 // indirect
 	github.com/mewkiz/flac v1.0.12 // indirect
 	github.com/mewkiz/pkg v0.0.0-20230226050401-4010bf0fec14 // indirect
@@ -47,3 +49,5 @@ require (
 	golang.org/x/image v0.22.0
 	golang.org/x/sys v0.18.0
 )
+
+replace github.com/mewkiz/pkg => ./third_party/mewkiz-pkg

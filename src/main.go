@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/veandco/go-sdl2/sdl"
 	lua "github.com/yuin/gopher-lua"
 )
 
@@ -70,19 +69,9 @@ func realMain() {
 	if runtime.GOOS == "android" {
 		Logcat("Inside realMain...")
 		runtime.LockOSThread()
-		sdl.GLSetAttribute(sdl.GL_CONTEXT_PROFILE_MASK, sdl.GL_CONTEXT_PROFILE_ES)
-		sdl.GLSetAttribute(sdl.GL_CONTEXT_MAJOR_VERSION, 3)
-		sdl.GLSetAttribute(sdl.GL_CONTEXT_MINOR_VERSION, 2)
-		sdl.GLSetAttribute(sdl.GL_DOUBLEBUFFER, 1)
-		sdl.GLSetAttribute(sdl.GL_ALPHA_SIZE, 0)
-		sdl.GLSetAttribute(sdl.GL_DEPTH_SIZE, 24)
-		// sdl.SetHint("SDL_VIDEO_EXTERNAL_CONTEXT", "0")
-		// sdl.SetHint("SDL_HIDAPI_IGNORE_DEVICES", "1")
-		// sdl.SetHint("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
-		// sdl.SetHint(sdl.HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight")
-		// sdl.SetHint("SDL_ANDROID_TRAP_BACK_BUTTON", "1")
-		// sdl.SetHint("SDL_JOYSTICK_HIDAPI", "0")
-		// sdl.SetHint("SDL_ANDROID_SEPARATE_MOUSE_AND_TOUCH", "1")
+		// SDL GL attributes for the Android GLES context; lives in a
+		// platform file to keep SDL out of this shared file (js build).
+		platformAndroidGLInit()
 
 		if sys.baseDir == "" {
 			panic("FATAL: Android baseDir not set")
@@ -109,8 +98,8 @@ func realMain() {
 			Logcat("LOG: CHDIR SUCCESSFUL")
 		}
 
-		// Init SDL NOW
-		if err := sdl.Init(sdl.INIT_AUDIO | sdl.INIT_VIDEO | sdl.INIT_EVENTS | sdl.INIT_TIMER); err != nil {
+		// Init SDL NOW (platform file; no SDL in this shared file)
+		if err := platformCoreInit(); err != nil {
 			Logcat("LOG: SDL Init Failed: " + err.Error())
 			return
 		}
@@ -152,8 +141,7 @@ func realMain() {
 	}
 
 	if runtime.GOOS == "android" {
-		sdl.InitSubSystem(sdl.INIT_JOYSTICK)
-		sdl.InitSubSystem(sdl.INIT_GAMECONTROLLER)
+		platformInitJoysticks()
 		Logcat("LOG: Subsystems initialized!")
 	}
 

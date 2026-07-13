@@ -424,3 +424,23 @@ func (w *Window) Close() {
 	}
 	sdl.Quit()
 }
+
+// SDL GL attributes for the Android GLES context (called from realMain,
+// android only; split out so shared main.go carries no SDL import).
+func platformAndroidGLInit() {
+	sdl.GLSetAttribute(sdl.GL_CONTEXT_PROFILE_MASK, sdl.GL_CONTEXT_PROFILE_ES)
+	sdl.GLSetAttribute(sdl.GL_CONTEXT_MAJOR_VERSION, 3)
+	sdl.GLSetAttribute(sdl.GL_CONTEXT_MINOR_VERSION, 2)
+	sdl.GLSetAttribute(sdl.GL_DOUBLEBUFFER, 1)
+	sdl.GLSetAttribute(sdl.GL_ALPHA_SIZE, 0)
+	sdl.GLSetAttribute(sdl.GL_DEPTH_SIZE, 24)
+}
+
+func platformCoreInit() error {
+	return sdl.Init(sdl.INIT_AUDIO | sdl.INIT_VIDEO | sdl.INIT_EVENTS | sdl.INIT_TIMER)
+}
+
+func platformInitJoysticks() {
+	sdl.InitSubSystem(sdl.INIT_JOYSTICK)
+	sdl.InitSubSystem(sdl.INIT_GAMECONTROLLER)
+}

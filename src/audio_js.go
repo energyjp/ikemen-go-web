@@ -79,6 +79,11 @@ func (s *BeepSpeaker) Init(sampleRate beep.SampleRate, bufferSize int) error {
 	s.ctx = ctx
 	var reader io.Reader = &beepReader{s: s}
 	s.player = ctx.NewPlayer(reader)
+	// oto's default player buffer is very deep (it read-ahead-buffers on
+	// the order of a second, which players hear as sound lagging the
+	// action). ~100ms keeps hits and sounds in sync while leaving enough
+	// slack for browser scheduling jitter.
+	s.player.SetBufferSize(int(sampleRate) / 10 * 8) // 100ms of stereo f32
 	s.player.Play()
 	return nil
 }

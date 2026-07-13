@@ -889,7 +889,7 @@ func (rs *RollbackSession) InitP1(numPlayers int, localPort int, remotePort int,
 	peer := ggpo.NewPeer(rs, localPort, numPlayers, inputSize)
 	rs.backend = &peer
 
-	peer.InitializeConnection()
+	peer.InitializeConnection(platformGGPOTransport()...)
 
 	var handle ggpo.PlayerHandle
 	result := peer.AddPlayer(&player, &handle)
@@ -938,7 +938,7 @@ func (rs *RollbackSession) InitP2(numPlayers int, localPort int, remotePort int,
 	peer := ggpo.NewPeer(rs, localPort, numPlayers, inputSize)
 	rs.backend = &peer
 
-	peer.InitializeConnection()
+	peer.InitializeConnection(platformGGPOTransport()...)
 
 	var handle ggpo.PlayerHandle
 	result := peer.AddPlayer(&player, &handle)
@@ -990,7 +990,7 @@ func (rs *RollbackSession) InitSyncTest(numPlayers int) {
 	rs.backend = &peer
 
 	//
-	peer.InitializeConnection()
+	peer.InitializeConnection(platformGGPOTransport()...)
 	peer.Start()
 
 	var handle ggpo.PlayerHandle

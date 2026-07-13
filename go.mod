@@ -6,6 +6,7 @@ replace github.com/gopxl/beep/v2 => github.com/gopxl/beep/v2 v2.1.1-0.2024092113
 
 require (
 	github.com/Eiton/vulkan v0.0.0-20251125114215-6585a2a8590b
+	github.com/ebitengine/oto/v3 v3.2.0
 	github.com/flopp/go-findfont v0.1.0
 	github.com/go-gl/gl v0.0.0-20231021071112-07e5d0ea2e71
 	github.com/go-gl/mathgl v1.0.0
@@ -26,7 +27,6 @@ require (
 )
 
 require (
-	github.com/ebitengine/oto/v3 v3.2.0 // indirect
 	github.com/ebitengine/purego v0.7.1 // indirect
 	github.com/icza/bitio v1.1.0 // indirect
 	github.com/mewkiz/flac v1.0.12 // indirect
@@ -51,3 +51,5 @@ require (
 )
 
 replace github.com/mewkiz/pkg => ./third_party/mewkiz-pkg
+
+replace github.com/ikemen-engine/ggpo => ./third_party/ggpo

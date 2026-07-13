@@ -1,3 +1,5 @@
+//go:build !js
+
 // This replaces the "final mix" from a beep speaker
 // and wraps it in a similar interface for use with SDL
 package main

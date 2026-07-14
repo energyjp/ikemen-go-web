@@ -4,10 +4,24 @@ package main
 
 import (
 	"runtime"
+	"runtime/debug"
+	"strings"
 	"syscall/js"
 )
 
 // Platform stubs for the browser build.
+
+// GC headroom: field-tuned on the V2 build. Mark cost scales with live
+// heap and steals the single wasm thread (~35-40ms), so collections are
+// forced at gameplay blind spots (platformIdleGC) and the automatic GC
+// gets enough headroom (~a full round of garbage) to rarely fire
+// mid-action. A ?gogc= URL parameter still overrides via the boot page.
+func init() {
+	search := js.Global().Get("location").Get("search").String()
+	if !strings.Contains(search, "gogc=") {
+		debug.SetGCPercent(500)
+	}
+}
 
 // Android-only init paths (never taken on js; needed for compilation).
 func platformAndroidGLInit() {}

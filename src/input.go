@@ -142,6 +142,9 @@ func OnKeyPressed(key Key, mk ModifierKey) {
 		if !sys.gameRunning && sys.netConnection == nil {
 			if key == KeyPause {
 				sys.paused = !sys.paused
+				if sys.paused {
+					platformIdleGC() // pause = GC blind spot (wasm hitch fix)
+				}
 			}
 			if key == KeyScrollLock {
 				sys.frameStepFlag = true

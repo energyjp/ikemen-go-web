@@ -119,9 +119,14 @@ func (nc *NetConnection) webrtcStart(host bool) error {
 		// real internet and often recover, so we do NOT abandon the
 		// handshake on bridge.failed() (doing so killed this goroutine
 		// mid-negotiation, so the peer's hello was received but never read).
-		// Give up only if the engine is closing or the whole attempt times
-		// out.
-		deadline := time.Now().Add(60 * time.Second)
+		// Give up only if the engine is closing (user Esc'd or the engine's
+		// own lobby timer expired). Do NOT wall-clock the connect wait: the
+		// peer may need minutes to cold-download the ~17MB wasm + VFS before
+		// they can join, and a short deadline here made the host abandon the
+		// handshake goroutine BEFORE the connection established, so the peer's
+		// IKEMENGO hello was waited-for by a dead goroutine (host never sent).
+		// The 5-minute cap is only a zombie-goroutine safety net.
+		deadline := time.Now().Add(5 * time.Minute)
 		for !bridge.Call("connected").Bool() {
 			if nc.isClosing() || time.Now().After(deadline) {
 				return

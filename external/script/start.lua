@@ -2590,7 +2590,13 @@ function start.f_selectScreen()
 		for _, name in ipairs(itemname_order) do
 			local itemname = name
 			local mode = modeByName[itemname]
-			if mode ~= nil and main.teamMenu[side][itemname] then
+			-- Online 1v1 versus is restricted to Single: Simul/Turns/Tag load
+			-- multiple characters, which on the single-threaded wasm build
+			-- multiplies the live heap (longer GC freezes) AND the rollback
+			-- re-simulation cost per frame, wrecking the netcode. Coop netplay
+			-- modes are left alone - they are team modes by design.
+			local onlineSingleOnly = gameMode('netplayversus') and itemname ~= 'single'
+			if mode ~= nil and main.teamMenu[side][itemname] and not onlineSingleOnly then
 				table.insert(t_teamMenu[side], {
 					itemname    = itemname,
 					displayname = params[itemname],

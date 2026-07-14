@@ -999,6 +999,7 @@ func (s *System) loaderReset() {
 }
 
 func (s *System) loadStart() {
+	platformIdleGC() // loading screen: collect garbage where a pause is invisible
 	s.loaderReset()
 	s.loader.runTread()
 }
@@ -4081,6 +4082,7 @@ func (s *System) runNextRound() bool {
 			!(s.tmode[0] == TM_Turns && s.effectiveLoss[0]) &&
 			!(s.tmode[1] == TM_Turns && s.effectiveLoss[1]) {
 			// Prepare for the next round
+			platformIdleGC() // between-rounds blind spot: absorb the GC hitch here
 			s.roundNo++
 			for i := range s.roundsExisted {
 				s.roundsExisted[i]++

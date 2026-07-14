@@ -7682,6 +7682,12 @@ func systemScriptInit(l *lua.LState) {
 		} else {
 			sys.paused = !sys.paused
 		}
+		if sys.paused {
+			// Opening the pause menu is a gameplay blind spot: collect
+			// garbage here so long pause-free sessions (training) reach
+			// the automatic mid-action GC less often (wasm hitch fix).
+			platformIdleGC()
+		}
 		return 0
 	})
 	luaRegister(l, "togglePlayer", func(*lua.LState) int {

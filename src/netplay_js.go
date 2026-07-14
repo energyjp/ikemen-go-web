@@ -173,7 +173,15 @@ func (nc *NetConnection) Connect(server, port string) {
 // ---------------------------------------------------------------------------
 // GGPO rollback transport
 
+// The engine creates a fresh GGPO session (and transport) per match; the
+// previous match's transport must be stopped so its reader releases the
+// shared DataChannel queue.
+var activeGGPOTransport *transport.WebRTC
+
 func platformGGPOTransport() []transport.Connection {
+	if activeGGPOTransport != nil {
+		activeGGPOTransport.Close()
+	}
 	bridge := js.Global().Get("ikemenNet")
 	// The port this side expects the REMOTE player's packets to come from:
 	// must match the port registered via NewRemotePlayer (host registers
@@ -182,5 +190,14 @@ func platformGGPOTransport() []transport.Connection {
 	if sys.netConnection != nil && sys.netConnection.host {
 		remotePort = 7550
 	}
-	return []transport.Connection{transport.NewWebRTC(bridge, webrtcPeerIP, remotePort)}
+	activeGGPOTransport = transport.NewWebRTC(bridge, webrtcPeerIP, remotePort)
+	return []transport.Connection{activeGGPOTransport}
+}
+
+// platformNetStats feeds connection quality to the page overlay.
+func platformNetStats(pingMs int) {
+	bridge := js.Global().Get("ikemenNet")
+	if bridge.Truthy() && !bridge.Get("setPing").IsUndefined() {
+		bridge.Call("setPing", pingMs)
+	}
 }

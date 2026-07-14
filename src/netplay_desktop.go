@@ -142,3 +142,6 @@ func (nc *NetConnection) Connect(server, port string) {
 	})
 }
 
+
+// platformNetStats is a browser-overlay affordance (see netplay_js.go).
+func platformNetStats(pingMs int) {}

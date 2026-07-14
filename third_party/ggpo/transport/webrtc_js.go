@@ -3,6 +3,7 @@
 package transport
 
 import (
+	"sync/atomic"
 	"syscall/js"
 	"time"
 
@@ -22,6 +23,7 @@ type WebRTC struct {
 	bridge   js.Value
 	peerIp   string
 	peerPort int
+	closed   atomic.Bool
 }
 
 // NewWebRTC wraps the page bridge as a GGPO transport. peerIp/peerPort
@@ -43,6 +45,13 @@ func (w *WebRTC) SendTo(msg messages.UDPMessage, remoteIp string, remotePort int
 func (w *WebRTC) Read(messageChan chan MessageChannelItem) {
 	recvBuf := make([]byte, MaxUDPPacketSize*2)
 	for {
+		// The engine builds a fresh GGPO session per match over the same
+		// DataChannel; the previous session's reader MUST stop or the two
+		// readers steal each other's datagrams (observed as a
+		// FindSavedFrameIndex panic when starting a rematch).
+		if w.closed.Load() {
+			return
+		}
 		v := w.bridge.Call("readGGPO")
 		if v.IsNull() {
 			return // channel closed
@@ -70,7 +79,9 @@ func (w *WebRTC) Read(messageChan chan MessageChannelItem) {
 }
 
 func (w *WebRTC) Close() {
-	// The lobby layer owns the RTCPeerConnection lifecycle.
+	// Stops this transport's Read loop. The RTCPeerConnection itself is
+	// owned by the lobby layer and survives across matches.
+	w.closed.Store(true)
 }
 
 func (w *WebRTC) IsInitialized() bool {

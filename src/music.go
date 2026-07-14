@@ -450,15 +450,21 @@ func (m Music) act() {
 		return
 	}
 	//fmt.Printf("[music] act: tickCount=%d round=%d match=%d bgmState=%d\n", sys.tickCount, sys.round, sys.match, sys.stage.bgmState)
-	// The round-start music reset must not run while paused: tickCount is
-	// frozen at 0 during a pause, so without this guard the reset fires
-	// every paused frame and (with PersistMusic off) repeatedly Stop()s the
-	// music that just started. On fast match reloads a pause can linger into
-	// the opening frames, which stopped the BGM for the whole match.
-	if sys.tickCount == 0 && sys.roundNo == 1 && !sys.roundResetMatchStart && !sys.paused &&
+	// Clear the round-start reset latch once the match is actually ticking,
+	// so the next round can reset again.
+	if sys.tickCount != 0 {
+		sys.bgmResetDone = false
+	}
+	// The round-start music reset must run ONCE per round, not on every frame
+	// tickCount is frozen at 0. A pause freezes tickCount at 0, and on a fast
+	// match reload a pause can linger into the opening frames - without the
+	// latch the reset fires every such frame and (with PersistMusic off)
+	// repeatedly Stop()s the music that just started, muting it all match.
+	if sys.tickCount == 0 && sys.roundNo == 1 && !sys.roundResetMatchStart && !sys.bgmResetDone &&
 		(sys.matchNo == 1 || !sys.sel.gameParams.PersistMusic || sys.stage.bgmState != BGMStateRound) {
 		sys.bgm.Stop()
 		sys.stage.bgmState = BGMStateIdle
+		sys.bgmResetDone = true
 	}
 	// Iterate players in order: P2, P2 teammates, then P1, P1 teammates.
 	// Skips empty slots and ignores attached chars.

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"runtime/pprof"
 	"syscall/js"
 	"time"
@@ -57,6 +58,15 @@ func Logcat(s string) {
 // the boot page's debug hook can read it out.
 func init() {
 	if os.Getenv("IKEMEN_PROFILE") == "" {
+		// Disable heap-profile allocation sampling in normal play. Go's default
+		// MemProfileRate (512 KiB) makes the allocator invoke profilealloc,
+		// which unwinds the wasm call stack on every sampled allocation - a
+		// fragile operation on js/wasm that appeared in a mid-round-load runtime
+		// corruption crash ("g 0: unexpected return pc for runtime.fillAligned",
+		// stack profilealloc -> mallocgc -> beforeIdle). We never read these
+		// samples unless ?profile=1, so switch the sampling off entirely; this
+		// also shaves per-allocation overhead. ?profile=1 keeps it on below.
+		runtime.MemProfileRate = 0
 		return
 	}
 	go func() {

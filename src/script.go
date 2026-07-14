@@ -5873,7 +5873,14 @@ func systemScriptInit(l *lua.LState) {
 		@function replayRecord
 		@tparam string path Output file path.
 		function replayRecord(path) end*/
-		if sys.netConnection != nil {
+		// Replay recording streams input to an os.File every frame. In the
+		// browser (wasm) build that write path (os.File.Write -> Pwrite) is
+		// unsupported by the VFS fs shim and CRASHES the engine mid-match
+		// (guest dropped at char-select with an fsCall panic). Replays are a
+		// desktop convenience anyway - the file isn't retrievable in-browser -
+		// so skip recording entirely on js, leaving recording==nil so
+		// update()/SaveReplay() no-op cleanly.
+		if sys.netConnection != nil && runtime.GOOS != "js" {
 			sys.netConnection.recording, _ = os.Create(strArg(l, 1))
 			sys.netConnection.headerWritten = false
 		}

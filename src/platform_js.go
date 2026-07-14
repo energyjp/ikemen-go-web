@@ -69,5 +69,13 @@ func (bgv *bgVideo) MixerCleared() bool { return true }
 // hitch); collecting at blind spots keeps the automatic mid-round GC from
 // firing. Desktop builds don't need this (no-op there).
 func platformIdleGC() {
+	// NEVER during netplay: GGPO re-simulates frames (including round
+	// transitions) during rollbacks, and a forced GC inside that loop
+	// stalls long enough to trip the disconnect timeout. Online play
+	// relies on the automatic GC instead (a rare 40ms hitch, which the
+	// rollback buffer absorbs).
+	if sys.netConnection != nil || sys.rollback.session != nil {
+		return
+	}
 	runtime.GC()
 }

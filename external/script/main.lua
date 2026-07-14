@@ -2231,6 +2231,23 @@ main.t_itemname = {
 		end
 		return nil
 	end,
+	--WEB JOIN (WebRTC, no address; see 'serverjoin' redirect in menu dispatch)
+	['webjoin'] = function(t, item)
+		main.f_waitForPreloads(true)
+		local doneSnd = motif[main.group].cursor.done.snd.serverconnect or motif[main.group].cursor.done.snd.default
+		sndPlay(motif.Snd, doneSnd[1], doneSnd[2])
+		hook.run("main.t_itemname", t, item)
+		if main.f_connect('webrtc', 'WebRTC peer') then
+			if synchronize() then
+				enterSyncedNetplayMenu()
+			end
+			replayStop()
+			exitNetPlay()
+			exitReplay()
+			showSessionWarning()
+		end
+		return nil
+	end,
 	--SERVER HOST
 	['serverhost'] = function(t, item)
 		main.f_waitForPreloads(true)
@@ -2763,6 +2780,11 @@ function main.f_createMenu(tbl, bool_bgreset, bool_main, bool_f1, bool_del)
 							f = 'bonus'
 						elseif f:match('^ip_') then
 							f = 'serverconnect'
+						elseif f == 'serverjoin' and main.webBuild then
+							-- Web build: joining needs no IP - signaling happens in
+							-- the page's WebRTC panel - so skip the server-list
+							-- submenu and connect directly.
+							f = 'webjoin'
 						elseif tbl.submenu[f].loop ~= nil and #tbl.submenu[f].items > 0 then
 							-- Check if the target submenu would immediately auto-run a single actionable item.
 							-- If so, treat that as if it was selected directly here, so fadeout uses the current menu.

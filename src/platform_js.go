@@ -2,7 +2,10 @@
 
 package main
 
-import "syscall/js"
+import (
+	"runtime"
+	"syscall/js"
+)
 
 // Platform stubs for the browser build.
 
@@ -45,3 +48,12 @@ func (bgv *bgVideo) Reset() {}
 func (bgv *bgVideo) Close() {}
 
 func (bgv *bgVideo) MixerCleared() bool { return true }
+
+// platformIdleGC forces a garbage collection at moments where a pause is
+// invisible (loading screens, between rounds). On single-threaded wasm the
+// GC mark phase freezes the game thread for ~35-40ms (a visible 2-3 frame
+// hitch); collecting at blind spots keeps the automatic mid-round GC from
+// firing. Desktop builds don't need this (no-op there).
+func platformIdleGC() {
+	runtime.GC()
+}

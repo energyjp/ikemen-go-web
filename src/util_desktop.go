@@ -81,3 +81,7 @@ func selectRenderer(cfgVal string) (Renderer, FontRenderer) {
 func Logcat(s string) {
 	fmt.Println(s)
 }
+
+// platformIdleGC is a wasm affordance (see platform_js.go); parallel
+// desktop GC doesn't hitch the game thread.
+func platformIdleGC() {}

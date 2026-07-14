@@ -224,6 +224,11 @@ type System struct {
 	debugLastID         int32
 	soundMixer          *beep.Mixer
 	bgm                 Bgm
+	// Latch so the round-start BGM reset runs once per round instead of on
+	// every frame tickCount is frozen at 0 (which a pause does). Without it,
+	// a pause lingering into a match's opening frames repeatedly Stop()s the
+	// music that just started, leaving it silent for the whole match.
+	bgmResetDone bool
 	matchMusicSel       []*bgMusic
 	pauseVolumeApplied  bool
 	soundChannels       SoundChannels // System sounds. Lifebars etc

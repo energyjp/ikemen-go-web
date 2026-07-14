@@ -4,6 +4,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"syscall/js"
 	"time"
 
@@ -120,32 +121,50 @@ func (nc *NetConnection) webrtcStart(host bool) error {
 			time.Sleep(100 * time.Millisecond)
 		}
 		conn := &webrtcConn{bridge: bridge}
+		hlog := func(s string) { js.Global().Get("console").Call("log", "[HSHAKE] "+s) }
 		// IKEMENGO handshake, byte-compatible with the TCP path.
 		if host {
+			hlog("host: sending IKEMENGO")
 			if sys.cfg.Netplay.RollbackNetcode {
 				sys.rollback.session.remoteIp = webrtcPeerIP
 			}
 			if _, err := conn.Write([]byte("IKEMENGO")); err != nil {
+				hlog("host: write failed: " + err.Error())
 				return
 			}
+			hlog("host: waiting for ack")
 			ack := make([]byte, 8)
-			if _, err := ioReadFull(conn, ack); err != nil || string(ack) != "IKEMENGO" {
+			if n, err := ioReadFull(conn, ack); err != nil {
+				hlog("host: ack read error: " + err.Error())
+				return
+			} else if string(ack) != "IKEMENGO" {
+				hlog(fmt.Sprintf("host: bad ack (n=%d) %q", n, string(ack)))
 				return
 			}
+			hlog("host: handshake complete")
 		} else {
+			hlog("guest: waiting for IKEMENGO")
 			buf := make([]byte, 8)
-			if _, err := ioReadFull(conn, buf); err != nil || string(buf) != "IKEMENGO" {
+			if n, err := ioReadFull(conn, buf); err != nil {
+				hlog("guest: read error: " + err.Error())
+				return
+			} else if string(buf) != "IKEMENGO" {
+				hlog(fmt.Sprintf("guest: bad hello (n=%d) %q", n, string(buf)))
 				return
 			}
+			hlog("guest: got IKEMENGO, sending ack")
 			if _, err := conn.Write([]byte("IKEMENGO")); err != nil {
+				hlog("guest: ack write failed: " + err.Error())
 				return
 			}
+			hlog("guest: handshake complete")
 		}
 		if nc.isClosing() {
 			conn.Close()
 			return
 		}
 		nc.conn = conn
+		hlog("conn established; entering synchronize")
 	})
 	return nil
 }

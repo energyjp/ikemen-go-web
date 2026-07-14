@@ -53,3 +53,5 @@ require (
 replace github.com/mewkiz/pkg => ./third_party/mewkiz-pkg
 
 replace github.com/ikemen-engine/ggpo => ./third_party/ggpo
+
+replace github.com/yuin/gopher-lua => ./third_party/gopher-lua

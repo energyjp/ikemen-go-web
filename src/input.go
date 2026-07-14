@@ -68,9 +68,13 @@ func (ck CommandStepKey) IsButtonRelease() bool {
 
 type ShortcutScript struct {
 	Activate bool
-	Script   string
-	Pause    bool
-	DebugKey bool
+	// Browser key events arrive between frames (async JS callbacks), so a
+	// blind per-frame reset would eat presses that landed since the last
+	// frame. Presses latch into ActivatePending; eventUpdate consumes it.
+	ActivatePending bool
+	Script          string
+	Pause           bool
+	DebugKey        bool
 }
 
 type ShortcutKey struct {
@@ -116,13 +120,13 @@ func OnKeyPressed(key Key, mk ModifierKey) {
 		}
 		sys.keyState[key] = true
 		sys.keyInput = key
-		sys.esc = sys.esc ||
+		sys.escPending = sys.escPending ||
 			key == KeyEscape && (mk&ModCtrlAlt) == 0
 		for k, v := range sys.shortcutScripts {
 			if sys.netConnection == nil && (sys.replayFile == nil || !v.DebugKey) &&
 				//(!sys.paused || sys.frameStepFlag || v.Pause) &&
 				(sys.cfg.Debug.AllowDebugKeys || !v.DebugKey) {
-				v.Activate = v.Activate || k.Test(key, mk)
+				v.ActivatePending = v.ActivatePending || k.Test(key, mk)
 			}
 		}
 		if key == KeyF12 {

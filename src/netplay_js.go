@@ -114,14 +114,30 @@ func (nc *NetConnection) webrtcStart(host bool) error {
 	}
 	bridge.Call("start", mode)
 	SafeGo(func() {
+		// Wait for the DataChannel to open. Transient ICE 'failed'/
+		// 'disconnected' states are NORMAL during NAT traversal over the
+		// real internet and often recover, so we do NOT abandon the
+		// handshake on bridge.failed() (doing so killed this goroutine
+		// mid-negotiation, so the peer's hello was received but never read).
+		// Give up only if the engine is closing or the whole attempt times
+		// out.
+		deadline := time.Now().Add(60 * time.Second)
 		for !bridge.Call("connected").Bool() {
-			if bridge.Call("failed").Bool() || nc.isClosing() {
+			if nc.isClosing() || time.Now().After(deadline) {
 				return
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
 		conn := &webrtcConn{bridge: bridge}
-		hlog := func(s string) { js.Global().Get("console").Call("log", "[HSHAKE] "+s) }
+		hlog := func(s string) {
+			// Prefer the on-screen overlay (visible without F12); fall back
+			// to the console if the bridge lacks olog.
+			if !bridge.Get("olog").IsUndefined() {
+				bridge.Call("olog", "HSHAKE "+s)
+			} else {
+				js.Global().Get("console").Call("log", "[HSHAKE] "+s)
+			}
+		}
 		// IKEMENGO handshake, byte-compatible with the TCP path.
 		if host {
 			hlog("host: sending IKEMENGO")

@@ -2287,8 +2287,15 @@ func (s *System) updateMusicMaps() {
 		s.cgi[i].music = make(Music)
 		// Append stage def file music parameters
 		s.cgi[i].music.Append(sys.stage.music)
-		// Append select.def stage music parameters
-		s.cgi[i].music.Append(sys.stage.si().music)
+		// Override with select.def stage music parameters. This is an EXPLICIT
+		// per-stage assignment (roster.json "music=..." -> select.def), so it
+		// must REPLACE the stage's own [Music] bgmusic, not append alongside
+		// it. Appending put both under the same prefix, and Read() picks a
+		// random candidate per match - so an assigned track silently lost the
+		// coin flip ~half the time, and when the stage's built-in track was
+		// missing (e.g. kfm.mid isn't in the web build) that half was dead
+		// silence with a "can't find kfm.mid" error.
+		s.cgi[i].music.Override(sys.stage.si().music)
 		// Override with select.def char music parameters
 		useCharMusic := false
 		if sys.sel.gameParams != nil {

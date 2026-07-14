@@ -161,6 +161,14 @@ func (rs *RollbackSystem) runFrame(s *System) bool {
 		return false
 	}
 
+	// Surface the connection quality once a second (browser overlay ping
+	// counter; no-op on desktop).
+	if rs.session != nil && rs.session.backend != nil && sys.gameTime()%60 == 0 {
+		if stats, err := rs.session.backend.GetNetworkStats(rs.session.remotePlayerHandle); err == nil {
+			platformNetStats(int(stats.Network.Ping))
+		}
+	}
+
 	if rs.session.syncTest && rs.session.netTime == 0 {
 		if rs.session.config.DesyncTestAI {
 			buffer = getAIInputs(0)

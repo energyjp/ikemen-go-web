@@ -88,6 +88,7 @@ type SystemStateVars struct {
 	tmode                   [2]TeamMode
 	numSimul, numTurns      [2]int32
 	esc                     bool
+	escPending              bool // latched by OnKeyPressed, consumed once per frame in eventUpdate
 	envcol_under            bool
 	lastCharId              int32
 	tickCount               int
@@ -738,9 +739,14 @@ func (s *System) setGameAspect() {
 }
 
 func (s *System) eventUpdate() bool {
-	s.esc = false
+	// Consume key-press latches set by OnKeyPressed. On js/wasm key events
+	// arrive between frames, so a blind reset here would eat presses that
+	// landed since the last frame.
+	s.esc = s.escPending
+	s.escPending = false
 	for _, v := range s.shortcutScripts {
-		v.Activate = false
+		v.Activate = v.ActivatePending
+		v.ActivatePending = false
 	}
 	s.window.pollEvents()
 	s.gameEnd = s.window.shouldClose()

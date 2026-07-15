@@ -14131,6 +14131,35 @@ func (cl *CharList) enemyNear(c *Char, n int32, p2list bool) *Char {
 		*cache = append(*cache, p.id)
 	}
 
+	// Scene Viewer lock-on (training sandbox): a character whose "_sv_target"
+	// map points at an existing enemy treats that player as its NEAREST enemy.
+	// Everything proximity-based - autoturn, a statedef's facep2, p2-relative
+	// movement in character code - then follows the lock instead of raw
+	// distance, which a facing fix alone can't do: "P2" is nearest-living-enemy
+	// throughout Mugen's model.
+	//
+	// The lock is read from the ROOT player, not from c: a helper's map is
+	// copied at spawn and would hold a stale 0, so helper-driven logic would
+	// still chase the nearest enemy. Characters that do their own pos x math
+	// stay unfixable, which is accepted - this is a scene-setup tool.
+	if sys.gameMode == "training" && c.playerNo >= 0 && c.playerNo < len(sys.chars) &&
+		len(sys.chars[c.playerNo]) > 0 {
+		if t, ok := sys.chars[c.playerNo][0].mapArray["_sv_target"]; ok && t > 0 {
+			if tn := int(t) - 1; tn >= 0 && tn < len(sys.chars) && len(sys.chars[tn]) > 0 {
+				tid := sys.chars[tn][0].id
+				for i, id := range *cache {
+					if id == tid {
+						if i > 0 {
+							copy((*cache)[1:i+1], (*cache)[:i])
+							(*cache)[0] = tid
+						}
+						break
+					}
+				}
+			}
+		}
+	}
+
 	// Bounds check
 	if int(n) >= len(*cache) {
 		return nil

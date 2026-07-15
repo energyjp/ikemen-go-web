@@ -2465,6 +2465,11 @@ main.t_itemname = {
 		main.teamMenu[1].tag = true
 		main.teamMenu[1].turns = true
 		main.teamMenu[2].single = true
+		-- Simul on the dummy side too. Stock training only offers single there,
+		-- which caps the room at 4 characters; with both sides on Simul the
+		-- engine allows 4 per side = 8, which is what the Scene Viewer sandbox
+		-- cycles through. Training-only, so no other mode's team rules move.
+		main.teamMenu[2].simul = true
 		main.matchWins.draw = {0, 0}
 		main.matchWins.simul = {0, 0}
 		main.matchWins.single = {0, 0}

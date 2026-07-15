@@ -1004,7 +1004,7 @@ func (s *System) loaderReset() {
 }
 
 func (s *System) loadStart() {
-	platformIdleGC() // loading screen: collect garbage where a pause is invisible
+	platformLoadGC() // match load: the one blind spot wide enough to hide a collection online
 	s.loaderReset()
 	s.loader.runTread()
 }

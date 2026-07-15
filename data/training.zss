@@ -272,3 +272,34 @@ ignoreHitPause if gameMode = "training" {
 		}
 	}
 }
+
+#===============================================================================
+# Scene Viewer sandbox: facing lock-on. The mod (external/mods/sceneviewer.lua)
+# sets map(_sv_target) to an enemy playerNo via CAPSLOCK; while set, this
+# keeps the character facing that player, overriding autoturn.
+# Two-tier enforcement:
+#  - autoturn is suppressed whenever the character isn't being grabbed/hit
+#    (movetype != H) - including no-ctrl windows like jump squat and attack
+#    recovery, where proximity autoturn used to sneak in a wrong-way flip
+#    and send facing-relative velocities toward the nearest enemy instead
+#    of the locked target;
+#  - active re-facing (turn) still only happens with ctrl, so scene states
+#    that set facing themselves are never disturbed.
+# Cleared to 0 by the mod (Shift+TAB or target cycle off).
+#===============================================================================
+[StateDef -2]
+
+if gameMode != "training" || isHelper || map(_sv_target) = 0 {
+	# inert outside the sandbox
+} else if roundState = 2 && alive {
+	if moveType != H {
+		assertSpecial{flag: noAutoTurn}
+	}
+	if ctrl {
+		if player(map(_sv_target)),pos x > pos x && facing = -1 {
+			turn{}
+		} else if player(map(_sv_target)),pos x < pos x && facing = 1 {
+			turn{}
+		}
+	}
+}

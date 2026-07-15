@@ -4379,23 +4379,30 @@ func (c *Char) loadPalettes() {
 			}
 		}
 
-		// Overwrite SFF palettes with ACT palettes
+		// Fill the selectable slots from the def's pal1..palN files, but only
+		// where the SFF does not already carry that palette itself.
+		//
+		// An SFFv2 stores its palettes internally, and those are the ones the
+		// sprites are actually indexed against, so Mugen loads them from the SFF
+		// and the def's palette files go unused. Applying the files on top of them
+		// breaks characters whose copies have drifted out of sync: Dr.Kira ships
+		// all twelve as exports that predate the tag helper sharing her palette,
+		// so they lack the ramps that helper is drawn with (index 16-31 and 40-50)
+		// and applying them renders it black. Her def also points pal12 at a file
+		// with no extension, which the author would have noticed had these files
+		// ever been the palettes in use.
 		for i := 0; i < maxPal; i++ {
 			pal := gi.palInfo[i]
 			pIdx, existsInSff := gi.palettedata.palList.PalTable[[...]uint16{1, uint16(i + 1)}]
+			if existsInSff && pIdx >= 0 {
+				pal.exists = true
+				gi.palInfo[i] = pal
+				continue
+			}
 
+			// No internal palette for this slot, so an external file can supply one
 			if pl, ok := readAct(&pal); ok {
-				// Determine index where ACT file should go
-				var targetIdx int
-				if existsInSff && pIdx >= 0 {
-					// Overwrite existing SFFv2 slot with ACT data
-					targetIdx = pIdx
-				} else {
-					// Add a new slot
-					targetIdx = len(gi.palettedata.palList.palettes)
-				}
-
-				// Assign the new palette
+				targetIdx := len(gi.palettedata.palList.palettes)
 				gi.palettedata.palList.SetSource(targetIdx, pl)
 				gi.palettedata.palList.PalTex[targetIdx] = NewTextureFromPalette(pl)
 				gi.palettedata.palList.PalTable[[2]uint16{1, uint16(i + 1)}] = targetIdx
@@ -4403,8 +4410,7 @@ func (c *Char) loadPalettes() {
 
 				pal.exists = true
 			} else {
-				// If no external ACT file is found, fallback to whether the palette natively exists inside the SFF
-				pal.exists = existsInSff
+				pal.exists = false
 			}
 			gi.palInfo[i] = pal
 		}

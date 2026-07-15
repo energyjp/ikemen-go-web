@@ -281,7 +281,9 @@ function start.f_remapAI(ai)
 			end
 		elseif start.p[side].teamMode == 1 then --Simul
 			if not t_ex[side] then
-				if (not main.cpuSide[side] and not main.coop) or start.challenger > 0 then
+				--gameMode('training') as in Single/Turns above: the dummy is set from
+				--the training menu, so it must not start with a difficulty level
+				if (not main.cpuSide[side] and not main.coop) or start.challenger > 0 or gameMode('training') then
 					setCom(side, 0)
 				else
 					setCom(side, ai or start.f_difficulty(side, offset))
@@ -296,7 +298,7 @@ function start.f_remapAI(ai)
 		else --Tag
 			for i = side, #start.p[side].t_selected * 2 do
 				if not t_ex[i] and (i - 1) % 2 + 1 == side then
-					if (not main.cpuSide[side] and not main.coop) or start.challenger > 0 then
+					if (not main.cpuSide[side] and not main.coop) or start.challenger > 0 or gameMode('training') then
 						remapInput(i, getRemapInput(side)) --P1/3/5/7 => P1 controls, P2/4/6/8 => P2 controls
 						setCom(i, 0)
 					else

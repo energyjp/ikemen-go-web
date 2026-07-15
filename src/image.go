@@ -516,6 +516,51 @@ func NewTextureFromPalette(pal []uint32) Texture {
 	return tx
 }
 
+// readPngPalette pulls the palette out of an indexed PNG's PLTE chunk.
+// Characters increasingly ship palettes as indexed PNGs (pal1 = whatever.png)
+// rather than .act files. Those bytes are NOT act triplets, so reading them
+// raw fed the PNG's own signature/IHDR in as colours - and on SFFv2 those
+// bogus palettes then OVERWRITE the sprite's good internal ones, which is why
+// such characters rendered as garbage instead of just losing their extra pals.
+// PLTE stores colours in natural index order (verified against a character
+// shipping both formats: its .act, which the loader reads in REVERSE, matched
+// the PLTE read forwards 245/256). Index 0 is transparent, as with .act.
+func readPngPalette(data []byte) ([]uint32, bool) {
+	const sig = "\x89PNG\r\n\x1a\n"
+	if len(data) < len(sig) || string(data[:len(sig)]) != sig {
+		return nil, false
+	}
+	for i := len(sig); i+8 <= len(data); {
+		ln := int(binary.BigEndian.Uint32(data[i:]))
+		typ := string(data[i+4 : i+8])
+		body := data[i+8:]
+		if ln < 0 || ln > len(body) {
+			return nil, false
+		}
+		if typ == "PLTE" {
+			pal := make([]uint32, 256)
+			n := ln / 3
+			if n > 256 {
+				n = 256
+			}
+			for j := 0; j < n; j++ {
+				r, g, b := body[j*3], body[j*3+1], body[j*3+2]
+				var alpha byte = 255
+				if j == 0 {
+					alpha = 0 // index 0 is transparent, same as .act
+				}
+				pal[j] = uint32(alpha)<<24 | uint32(b)<<16 | uint32(g)<<8 | uint32(r)
+			}
+			return pal, true
+		}
+		if typ == "IEND" {
+			break
+		}
+		i += 12 + ln // length + type + data + crc
+	}
+	return nil, false
+}
+
 func readActPalette(filename string) ([]uint32, error) {
 	f, err := OpenFile(filename)
 	if err != nil {
@@ -525,16 +570,27 @@ func readActPalette(filename string) ([]uint32, error) {
 		chk(f.Close())
 	}()
 
+	// Palette files are tiny (act = 768 bytes, an indexed PNG a few KB), so read
+	// the whole thing: a PNG's PLTE chunk can sit past the first 768 bytes, and
+	// the browser VFS can't be relied on to seek back.
+	whole, err := io.ReadAll(f)
+	if err != nil {
+		return nil, err
+	}
+
+	// A palette shipped as an indexed PNG: take it from the PLTE chunk instead
+	// of treating the file's bytes as raw act triplets.
+	if pal, ok := readPngPalette(whole); ok {
+		return pal, nil
+	}
+	if len(whole) >= 8 && string(whole[:8]) == "\x89PNG\r\n\x1a\n" {
+		return nil, Error("palette PNG has no PLTE chunk (not an indexed PNG): " + filename)
+	}
+
 	// Standard size is 256 colors * 3 bytes = 768 bytes
 	const actSize = 768
 	data := make([]byte, actSize)
-
-	// Read as much as possible
-	// If file is smaller, we just process what we got
-	n, err := io.ReadFull(f, data)
-	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
-		return nil, err
-	}
+	n := copy(data, whole)
 
 	// Always return a 256-color palette
 	pal := make([]uint32, 256)

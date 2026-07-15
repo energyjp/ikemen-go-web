@@ -6277,7 +6277,11 @@ func systemScriptInit(l *lua.LState) {
 		if pn < 1 || pn > MaxPlayerNo {
 			l.RaiseError("\nInvalid player number: %v\n", pn)
 		}
-		sys.aiLevel[pn-1] = Clamp(float32(numArg(l, 2)), 0, 8)
+		level := Clamp(float32(numArg(l, 2)), 0, 8)
+		if !sys.aiLevelAllowed(pn - 1) {
+			level = 0
+		}
+		sys.aiLevel[pn-1] = level
 		return 0
 	})
 	luaRegister(l, "setConsecutiveWins", func(l *lua.LState) int {

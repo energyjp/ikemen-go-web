@@ -4202,12 +4202,16 @@ func (c *Char) load(def string) error {
 		PalTable:   make(map[[2]uint16]int),
 		numcols:    make(map[[2]uint16]int),
 		PalTex:     append([]Texture{}, gi.sff.palList.PalTex...),
+		palAlias:   make(map[int]int),
 	}
 	for key, value := range gi.sff.palList.PalTable {
 		gi.palettedata.palList.PalTable[key] = value
 	}
 	for key, value := range gi.sff.palList.numcols {
 		gi.palettedata.palList.numcols[key] = value
+	}
+	for key, value := range gi.sff.palList.palAlias {
+		gi.palettedata.palList.palAlias[key] = value
 	}
 
 	// Read animations
@@ -9336,6 +9340,16 @@ func (c *Char) remapPal(pfx *PalFX, src [2]int32, dst [2]int32) {
 	if plist.SwapPalMap(&pfx.remap) {
 		// Always remap the requested source palette
 		plist.Remap(si, di)
+
+		// An SFF may declare the same palette key more than once. PalTable only
+		// keeps the first, but sprites can be indexed against any of them, so the
+		// rest have to follow or they stay on the colors they loaded with. Dr.Kira
+		// declares 1,1 twice and her doggy and mating press sprites (groups 19230
+		// and 12250) are indexed against the second one, so without this they hold
+		// palette 1 while the rest of her wears the palette the player picked.
+		for _, alias := range plist.AliasesOf(si) {
+			plist.Remap(alias, di)
+		}
 
 		// For SFFv1, remapping 1,1 should also remap whatever palettes sprites 0,0 and 9000,0 use
 		// TODO: Because 9000,0 is not hardcoded in Ikemen, this might create trouble for custom portraits

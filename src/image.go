@@ -398,6 +398,12 @@ type PaletteList struct {
 	PalTable   map[[2]uint16]int // Group/index key to original index value
 	numcols    map[[2]uint16]int
 	PalTex     []Texture
+	// PalTable can only name one palette per key, but an SFF may declare the same
+	// key more than once, and its sprites can reference those extra palettes by
+	// index. They are the same palette as far as the character is concerned, so a
+	// remap of the key has to move them too or they stay stuck on the colors they
+	// loaded with. Maps each extra palette to the index PalTable kept for its key.
+	palAlias map[int]int
 }
 
 func (pl *PaletteList) init() {
@@ -406,6 +412,18 @@ func (pl *PaletteList) init() {
 	pl.PalTable = make(map[[2]uint16]int)
 	pl.numcols = make(map[[2]uint16]int)
 	pl.PalTex = nil
+	pl.palAlias = make(map[int]int)
+}
+
+// AliasesOf returns the extra palettes that declared the same key as idx
+func (pl *PaletteList) AliasesOf(idx int) []int {
+	var out []int
+	for dup, canon := range pl.palAlias {
+		if canon == idx && dup != idx {
+			out = append(out, dup)
+		}
+	}
+	return out
 }
 
 func (pl *PaletteList) SetSource(i int, p []uint32) {
@@ -2000,9 +2018,11 @@ func (s *Sff) loadPalettes(f io.ReadSeeker, lofs uint32) error {
 		var pal []uint32
 		var idx int
 		if old, ok := uniquePals[[2]uint16{gn[0], gn[1]}]; ok {
-			// Duplicate key
+			// Duplicate key. Sprites may still reference this palette by its own
+			// index, so remember that it stands in for the one PalTable keeps
 			idx = old
 			pal = s.palList.Get(old)
+			s.palList.palAlias[i] = old
 			LogMessage("WARNING: Duplicate palette key in %v: %v,%v (%v/%v)", s.filename, gn[0], gn[1], i+1, s.header.NumberOfPalettes)
 		} else if plSize == 0 {
 			// Linked palette

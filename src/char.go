@@ -5135,6 +5135,9 @@ func (c *Char) setAILevel(level float32) {
 	if c.playerNo < 0 || c.playerNo >= len(sys.aiLevel) {
 		return
 	}
+	if !sys.aiLevelAllowed(c.playerNo) {
+		level = 0
+	}
 	sys.aiLevel[c.playerNo] = level
 	for _, c := range sys.chars[c.playerNo] {
 		if level == 0 {

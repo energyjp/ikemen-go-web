@@ -1770,6 +1770,16 @@ func (s *System) maxDrawsReached(team int) bool {
 	return limit >= 0 && s.draws >= limit
 }
 
+// Training is a sandbox: only the two team leaders may ever be AI controlled
+// there, P2 through training.zss's dummy control. Extra Simul/Tag members have
+// no dummy settings of their own, so they must stay idle. This gates the
+// assignment instead of clearing it afterwards because start.lua's f_remapAI
+// hands every member past the leaders a real AI level during match setup, and
+// clearing that later lets the AI act for a beat first.
+func (s *System) aiLevelAllowed(pn int) bool {
+	return s.gameMode != "training" || pn < 2
+}
+
 // This checks if a round is eligible for "Final Round" behavior, not if it's literally the final round
 // https://github.com/ikemen-engine/Ikemen-GO/issues/1659
 func (s *System) roundIsFinal() bool {

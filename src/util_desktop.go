@@ -82,6 +82,7 @@ func Logcat(s string) {
 	fmt.Println(s)
 }
 
-// platformIdleGC is a wasm affordance (see platform_js.go); parallel
-// desktop GC doesn't hitch the game thread.
+// platformIdleGC and platformLoadGC are wasm affordances (see platform_js.go);
+// parallel desktop GC doesn't hitch the game thread.
 func platformIdleGC() {}
+func platformLoadGC() {}

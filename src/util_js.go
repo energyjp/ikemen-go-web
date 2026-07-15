@@ -40,8 +40,17 @@ func ShowErrorDialog(message string) {
 }
 
 // TTF font loading stub - no FreeType on wasm.
+//
+// This used to panic, which took the whole engine down at boot with nothing
+// playable: a screenpack only has to ASK for a TrueType font once, and several
+// of the shipped ones do (mugen1 and big both reference mssansserif-tt36, and
+// Open_Sans is TrueType too). Loading is lazy, so it killed the game whenever
+// the first screen using that font came up rather than predictably at startup.
+//
+// Leaving the font unloaded costs the text drawn with it and nothing else,
+// which leaves a screenpack the player can still use.
 func LoadFntTtf(f *Fnt, fontfile string, filename string, height int32) {
-	panic(Error("TrueType fonts are not supported on this platform"))
+	LogMessage("WARNING: TrueType fonts are not supported in the browser build, skipping %v", filename)
 }
 
 // The browser has exactly one viable backend.

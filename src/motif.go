@@ -2515,7 +2515,7 @@ func (m *Motif) loadFiles() {
 	sys.keepAlive()
 
 	for key, fnt := range m.Files.Font {
-		LoadFile(&fnt.Font, []string{fnt.Font}, "", func(filename string) error {
+		LoadFile(&fnt.Font, []string{fnt.Font, sys.motif.Def, "", "data/"}, "font/", func(filename string) error {
 			re := regexp.MustCompile(`\d+`)
 			i := int(Atoi(re.FindString(key)))
 

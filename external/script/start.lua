@@ -1871,6 +1871,22 @@ function start.f_selectReset(hardReset, preserveProgress)
 			stageListNo = 0
 		end
 		restoreCursor = false
+		--A cursor that starts on an empty cell can't move at all when the motif
+		--forbids moving over empty boxes: every direction is blocked, so nothing
+		--can ever be picked. Screenpack grids place their startcell for their
+		--own roster, so with a different one it can land anywhere. Start such a
+		--cursor on the first character instead.
+		local function f_firstOccupiedCell()
+			for y = 1, #start.t_grid do
+				for x = 1, #start.t_grid[y] do
+					local cell = start.t_grid[y][x]
+					if cell.char ~= nil and cell.skip ~= 1 and cell.hidden ~= 2 then
+						return y - 1, x - 1
+					end
+				end
+			end
+			return 0, 0
+		end
 		--cursor start cell
 		for i = 1, gameOption('Config.Players') do
 			if start.f_getCursorData(i).cursor.startcell[1] < motif.select_info.rows then
@@ -1882,6 +1898,12 @@ function start.f_selectReset(hardReset, preserveProgress)
 				start.c[i].selX = start.f_getCursorData(i).cursor.startcell[2]
 			else
 				start.c[i].selX = 0
+			end
+			if not motif.select_info.moveoveremptyboxes then
+				local cell = (start.t_grid[start.c[i].selY + 1] or {})[start.c[i].selX + 1]
+				if cell == nil or cell.char == nil then
+					start.c[i].selY, start.c[i].selX = f_firstOccupiedCell()
+				end
 			end
 			start.c[i].cell = -1
 			start.c[i].randCnt = 0

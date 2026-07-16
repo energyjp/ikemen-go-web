@@ -271,11 +271,26 @@ func (l *StreamLooper) Stream(samples [][2]float64) (n int, ok bool) {
 
 		sn, sok := l.s.Stream(samples[:toStream])
 		n += sn
-		if sn < toStream || !sok {
-			l.err = l.s.Err()
-			return n, n > 0
-		}
 		samples = samples[sn:]
+		if sn < toStream || !sok {
+			if err := l.s.Err(); err != nil {
+				l.err = err
+				return n, n > 0
+			}
+			// Some decoders (e.g. mp3) overestimate Len(), so the source can
+			// run dry before Position() reaches loopend. Treat an error-free
+			// early end as hitting the loop end, or playback stops for good.
+			if l.loopcount == 0 || (sn == 0 && l.s.Position() <= l.loopstart) {
+				return n, n > 0
+			}
+			if l.loopcount > 0 {
+				l.loopcount--
+			}
+			if err := l.s.Seek(l.loopstart); err != nil {
+				l.err = err
+				return n, n > 0
+			}
+		}
 	}
 	return n, true
 }

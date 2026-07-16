@@ -119,17 +119,32 @@ func (nc *NetConnection) webrtcStart(host bool) error {
 		// real internet and often recover, so we do NOT abandon the
 		// handshake on bridge.failed() (doing so killed this goroutine
 		// mid-negotiation, so the peer's hello was received but never read).
-		// Give up only if the engine is closing (user Esc'd or the engine's
-		// own lobby timer expired). Do NOT wall-clock the connect wait: the
-		// peer may need minutes to cold-download the ~17MB wasm + VFS before
-		// they can join, and a short deadline here made the host abandon the
-		// handshake goroutine BEFORE the connection established, so the peer's
-		// IKEMENGO hello was waited-for by a dead goroutine (host never sent).
-		// The 5-minute cap is only a zombie-goroutine safety net.
-		deadline := time.Now().Add(5 * time.Minute)
+		// Give up only if the engine is closing (user Esc'd) or the bridge
+		// reports the session CONTINUOUSLY failed for over a minute (its own
+		// state machine already grants transient 'failed'/'disconnected' blips
+		// a 12s recovery grace and clears the flag on recovery, so a minute of
+		// unbroken failure is a genuinely dead session, not NAT traversal).
+		// Do NOT wall-clock the connect wait with a short deadline: a host in
+		// the room-code lobby legitimately waits however long the friend takes
+		// to download the build and join - a flat 5-minute cap here silently
+		// killed this goroutine during such a wait, so when the guest finally
+		// connected the transport was alive but the host engine never sent
+		// IKEMENGO (guest hung at "waiting for IKEMENGO"). The remaining
+		// absolute cap exists only to reap a true zombie goroutine.
+		deadline := time.Now().Add(2 * time.Hour)
+		var failedSince time.Time
 		for !bridge.Call("connected").Bool() {
 			if nc.isClosing() || time.Now().After(deadline) {
 				return
+			}
+			if bridge.Call("failed").Bool() {
+				if failedSince.IsZero() {
+					failedSince = time.Now()
+				} else if time.Since(failedSince) > time.Minute {
+					return
+				}
+			} else {
+				failedSince = time.Time{}
 			}
 			time.Sleep(100 * time.Millisecond)
 		}

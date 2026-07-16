@@ -718,6 +718,13 @@ func (f *Fnt) DrawTtf(txt string, x, y, xscl, yscl, rxadd float32, rot Rotation,
 	if len(txt) == 0 {
 		return
 	}
+	// The font is declared TrueType but was never loaded - the browser build has
+	// no FreeType and skips them. Callers dispatch here on the declared type
+	// alone, so without this the first thing to draw with such a font takes the
+	// engine down (a victory screen, three rounds after the motif loaded fine).
+	if f.ttf == nil {
+		return
+	}
 
 	if f.ttf != nil {
 		f.ttf.UpdateResolution(int(sys.gameWidth), int(sys.gameHeight))

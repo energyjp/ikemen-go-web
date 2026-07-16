@@ -39,18 +39,36 @@ func ShowErrorDialog(message string) {
 	alert.Invoke("I.K.E.M.E.N Error\n\n" + message)
 }
 
-// TTF font loading stub - no FreeType on wasm.
+// TTF font loading for the browser build.
 //
-// This used to panic, which took the whole engine down at boot with nothing
-// playable: a screenpack only has to ASK for a TrueType font once, and several
-// of the shipped ones do (mugen1 and big both reference mssansserif-tt36, and
-// Open_Sans is TrueType too). Loading is lazy, so it killed the game whenever
-// the first screen using that font came up rather than predictably at startup.
-//
-// Leaving the font unloaded costs the text drawn with it and nothing else,
-// which leaves a screenpack the player can still use.
+// Fonts are read from the wasm virtual filesystem only (there is no system
+// font directory to fall back to, unlike the desktop findfont path). If the
+// file is missing or fails to parse we leave the font unloaded and keep going:
+// that costs only the text drawn with this font, which keeps a screenpack the
+// player can still use rather than taking the whole engine down.
 func LoadFntTtf(f *Fnt, fontfile string, filename string, height int32) {
-	LogMessage("WARNING: TrueType fonts are not supported in the browser build, skipping %v", filename)
+	fileDir := SearchFile(filename, []string{fontfile, sys.motif.Def, "", "data/"}, "font/")
+	if len(FileExist(fileDir)) == 0 {
+		LogMessage("WARNING: TrueType font not found, skipping %v", filename)
+		return
+	}
+	if height == -1 {
+		height = int32(f.Size[1])
+	} else {
+		f.Size[1] = uint16(height)
+	}
+	ttf, err := gfxFont.LoadFont(fileDir, height, int(sys.gameWidth), int(sys.gameHeight))
+	if err != nil {
+		LogMessage("WARNING: failed to load ttf font %v: %v", fileDir, err)
+		return
+	}
+	f.ttf = ttf.(Font)
+
+	// Create Ttf dummy palettes
+	f.palettes = make([][256]uint32, 1)
+	for i := 0; i < 256; i++ {
+		f.palettes[0][i] = 0
+	}
 }
 
 // The browser has exactly one viable backend.

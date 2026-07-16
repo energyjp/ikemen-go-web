@@ -1143,13 +1143,3 @@ func (r *Renderer_WebGL) SetVSync(interval int) {
 }
 
 func (r *Renderer_WebGL) NewWorkerThread() bool { return false }
-
-// FontRenderer_WebGL: bitmap fonts render through the sprite pipeline;
-// TTF fonts are unsupported in the browser build.
-type FontRenderer_WebGL struct{}
-
-func (fr *FontRenderer_WebGL) Init(renderer interface{}) {}
-
-func (fr *FontRenderer_WebGL) LoadFont(file string, scale int32, windowWidth int, windowHeight int) (interface{}, error) {
-	return nil, Error("TrueType fonts are not supported in the browser build")
-}

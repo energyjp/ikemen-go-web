@@ -71,7 +71,25 @@ func ReadAnimFrame(line string) (*AnimFrame, error) {
 
 	// Read H and V flags
 	if len(ary) >= 6 && ary[5] != "" {
-		for _, ch := range ary[5] {
+		flags := ary[5]
+		// WinMugen tolerated the transparency spec in this field ("...,5,A"
+		// instead of "...,5,,A") and old screenpacks depend on it - drawing
+		// their cursors opaque instead of additive is a visible difference.
+		// Hand everything from the first non-flip character to the alpha field
+		// when that's empty; a genuinely bad flag still errors as before.
+		for i, ch := range flags {
+			if ch != 'H' && ch != 'h' && ch != 'V' && ch != 'v' {
+				if len(ary) < 7 || ary[6] == "" {
+					for len(ary) < 7 {
+						ary = append(ary, "")
+					}
+					ary[6] = flags[i:]
+					flags = flags[:i]
+				}
+				break
+			}
+		}
+		for _, ch := range flags {
 			switch ch {
 			case 'H', 'h':
 				af.Hscale = -1

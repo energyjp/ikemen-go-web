@@ -24,6 +24,9 @@ type Window struct {
 	closeflag  bool
 	frameCh    chan struct{}
 	rafCb      js.Func
+	frameIntMs float64 // target ms between engine frames (from Video.Framerate)
+	nextFrame  float64 // rAF timestamp at which the next frame may be released
+	frames     int     // released-frame counter (exposed for perf diagnostics)
 }
 
 func (s *System) newWindow(w, h int) (*Window, error) {
@@ -49,11 +52,40 @@ func (s *System) newWindow(w, h int) (*Window, error) {
 	}
 	doc.Set("title", win.title)
 
-	// requestAnimationFrame pump: each callback releases one SwapBuffers.
+	// requestAnimationFrame pump, capped to the configured framerate.
+	//
+	// Browsers fire rAF at the DISPLAY's refresh rate - 120/144/240Hz on
+	// high-refresh screens. The engine runs one full game+render iteration per
+	// released frame, and every render marshals GL calls through scratch typed
+	// arrays (garbage). Releasing a frame on every rAF therefore runs the whole
+	// loop 2-4x more often than the game is authored for, multiplying
+	// allocation and forcing far more frequent GC pauses (the 200-500ms mark
+	// stalls high-refresh users saw) for zero visual benefit. So release a
+	// frame at most once per Video.Framerate interval; extra rAF callbacks on a
+	// fast display just re-arm. On a 60Hz display this is a no-op.
+	win.frameIntMs = 1000.0 / float64(s.cfg.Video.Framerate)
+	if !(win.frameIntMs > 0) {
+		win.frameIntMs = 1000.0 / 60.0
+	}
 	win.rafCb = js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-		select {
-		case win.frameCh <- struct{}{}:
-		default:
+		now := 0.0
+		if len(args) > 0 {
+			now = args[0].Float() // DOMHighResTimeStamp, ms
+		}
+		if win.nextFrame == 0 {
+			win.nextFrame = now
+		}
+		if now >= win.nextFrame {
+			win.nextFrame += win.frameIntMs
+			if win.nextFrame <= now { // fell behind (tab was hidden etc.) - don't spiral
+				win.nextFrame = now + win.frameIntMs
+			}
+			win.frames++
+			js.Global().Set("__ikemenEngineFrames", win.frames)
+			select {
+			case win.frameCh <- struct{}{}:
+			default:
+			}
 		}
 		js.Global().Call("requestAnimationFrame", win.rafCb)
 		return nil

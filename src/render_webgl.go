@@ -257,13 +257,13 @@ func (t *Texture_WebGL) GetHeight() int32 { return t.height }
 // renderer
 
 type Renderer_WebGL struct {
-	gl     js.Value // WebGL2RenderingContext
-	consts map[string]js.Value
+	gl      js.Value // WebGL2RenderingContext
+	consts  map[string]js.Value
 	scratch wglScratch
 
-	fbo         js.Value
-	fboTexture  js.Value
-	rboDepth    js.Value
+	fbo          js.Value
+	fboTexture   js.Value
+	rboDepth     js.Value
 	fboPP        []js.Value
 	fboPPTexture []js.Value
 
@@ -700,6 +700,12 @@ func (r *Renderer_WebGL) EndFrame() {
 
 		r.gl.Call("drawArrays", r.c("TRIANGLE_STRIP"), 0, 4)
 	}
+	// Unbind the post-process texture so it is not still the active sampler
+	// when the NEXT frame renders into the scene FBO - that pairing is what
+	// makes some drivers spam "Feedback loop formed between Framebuffer and
+	// active Texture" every frame (harmless per the spec, but the driver-side
+	// error handling is a real per-frame cost on the machines that report it).
+	r.gl.Call("bindTexture", r.c("TEXTURE_2D"), js.Null())
 }
 
 func (r *Renderer_WebGL) Await() {
@@ -971,15 +977,15 @@ func (r *Renderer_WebGL) SetUniformMatrix(name string, value []float32) {
 	r.gl.Call("uniformMatrix4fv", loc, false, r.scratch.floats(value))
 }
 
-func (r *Renderer_WebGL) SetModelUniformI(name string, val int)                {}
-func (r *Renderer_WebGL) SetModelUniformF(name string, values ...float32)      {}
-func (r *Renderer_WebGL) SetModelUniformFv(name string, values []float32)      {}
-func (r *Renderer_WebGL) SetModelUniformMatrix(name string, value []float32)   {}
-func (r *Renderer_WebGL) SetModelUniformMatrix3(name string, value []float32)  {}
-func (r *Renderer_WebGL) SetModelTexture(name string, t Texture)               {}
-func (r *Renderer_WebGL) SetShadowMapUniformI(name string, val int)            {}
-func (r *Renderer_WebGL) SetShadowMapUniformF(name string, values ...float32)  {}
-func (r *Renderer_WebGL) SetShadowMapUniformFv(name string, values []float32)  {}
+func (r *Renderer_WebGL) SetModelUniformI(name string, val int)                   {}
+func (r *Renderer_WebGL) SetModelUniformF(name string, values ...float32)         {}
+func (r *Renderer_WebGL) SetModelUniformFv(name string, values []float32)         {}
+func (r *Renderer_WebGL) SetModelUniformMatrix(name string, value []float32)      {}
+func (r *Renderer_WebGL) SetModelUniformMatrix3(name string, value []float32)     {}
+func (r *Renderer_WebGL) SetModelTexture(name string, t Texture)                  {}
+func (r *Renderer_WebGL) SetShadowMapUniformI(name string, val int)               {}
+func (r *Renderer_WebGL) SetShadowMapUniformF(name string, values ...float32)     {}
+func (r *Renderer_WebGL) SetShadowMapUniformFv(name string, values []float32)     {}
 func (r *Renderer_WebGL) SetShadowMapUniformMatrix(name string, value []float32)  {}
 func (r *Renderer_WebGL) SetShadowMapUniformMatrix3(name string, value []float32) {}
 func (r *Renderer_WebGL) SetShadowMapTexture(name string, t Texture)              {}

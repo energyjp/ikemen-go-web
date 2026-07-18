@@ -1038,6 +1038,23 @@ func (ts *TextSprite) decodeEscapes(text string) string {
 	return strings.ReplaceAll(text, "\\n", "\n")
 }
 
+// ensureProcessed refreshes the cached tab-expanded, \n-decoded, line-split
+// form of ts.text, but only when the text actually changed (a cheap string
+// compare otherwise). It's a separate method so textImgDraw can run it on the
+// PERSISTENT sprite before it snapshots a throwaway Copy for deferred drawing -
+// if only Draw populated the cache, it would populate the discarded copy and
+// reprocess the whole string every single frame.
+func (ts *TextSprite) ensureProcessed() {
+	if ts.procLines != nil && ts.procSrc == ts.text {
+		return
+	}
+	processed := strings.ReplaceAll(ts.text, "\t", "    ")
+	processed = ts.decodeEscapes(processed)
+	ts.procSrc = ts.text
+	ts.procText = processed
+	ts.procLines = strings.Split(processed, "\n")
+}
+
 // wrapText wraps the fullLine text based on the typedLen and other parameters
 func (ts *TextSprite) wrapText(fullLine string, typedLen int) {
 	// If typedLen <= 0, nothing to display
@@ -1384,15 +1401,9 @@ func (ts *TextSprite) Draw(ln int16) {
 		return
 	}
 
-	// Preprocess (tab-expand, \n-decode, line split) once per distinct string;
-	// reuse the cached result on the frames where the text hasn't changed.
-	if ts.procLines == nil || ts.procSrc != ts.text {
-		processed := strings.ReplaceAll(ts.text, "\t", "    ")
-		processed = ts.decodeEscapes(processed)
-		ts.procSrc = ts.text
-		ts.procText = processed
-		ts.procLines = strings.Split(processed, "\n")
-	}
+	// Preprocess (tab-expand, \n-decode, line split) once per distinct string.
+	// Usually a no-op here: textImgDraw already primed it on the source sprite.
+	ts.ensureProcessed()
 	text := ts.procText
 
 	maxChars := int32(len(text))

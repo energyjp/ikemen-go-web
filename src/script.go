@@ -7088,6 +7088,10 @@ func systemScriptInit(l *lua.LState) {
 		if !nilArg(l, 2) {
 			layer = int16(numArg(l, 2))
 		}
+		// Prime the text-preprocessing cache on the PERSISTENT sprite so the
+		// snapshot below inherits it; otherwise every frame reprocesses the
+		// whole string on a copy that's immediately discarded.
+		ts.ensureProcessed()
 		//tsSnap := *ts
 		tsSnap := ts.Copy()
 		layerLocal := layer

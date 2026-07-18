@@ -284,21 +284,42 @@ func (rp *RenderParams) IsValid() bool {
 		IsFinite(rp.x+rp.y+rp.xts+rp.xbs+rp.ys+rp.vs+rp.rxadd+rp.rot.angle+rp.rcx+rp.rcy)
 }
 
+// Reused scratch for drawQuads' per-quad data. Passing a local array's slice to
+// the gfx interface methods forces it to escape to the heap, so the old code
+// allocated a [16]float32 (vertices) + [4]float32 (uniform) + [16]float32
+// (modelview) on EVERY quad. At thousands of quads per frame that was the single
+// largest source of GC pressure (drawQuads alone allocated >1GB per 30s in a
+// heap profile). The render path is single-threaded (all GL runs on the main
+// goroutine) and each buffer is filled and then immediately consumed by the
+// synchronous gfx call below, so sharing them across calls is safe.
+var (
+	drawQuadsVtx [16]float32
+	drawQuadsX1  [4]float32
+	drawQuadsMv  [16]float32
+
+	// Same purpose for RenderSprite's per-sprite projection matrix and tint.
+	renderSpriteProj [16]float32
+	renderSpriteTint [4]float32
+)
+
 func drawQuads(modelview mgl.Mat4, x1, y1, x2, y2, x3, y3, x4, y4 float32) {
-	gfx.SetUniformMatrix("modelview", modelview[:])
-	gfx.SetUniformF("x1x2x4x3", x1, x2, x4, x3) // this uniform is optional
+	copy(drawQuadsMv[:], modelview[:])
+	gfx.SetUniformMatrix("modelview", drawQuadsMv[:])
+	drawQuadsX1[0], drawQuadsX1[1], drawQuadsX1[2], drawQuadsX1[3] = x1, x2, x4, x3
+	gfx.SetUniformF("x1x2x4x3", drawQuadsX1[:]...) // this uniform is optional
 
 	// This effectively side-steps a low-level rectangle rasterization edge case,
 	// that caused visible and frequent artifacts on the diagonal.
 	// See: https://github.com/ikemen-engine/Ikemen-GO/issues/3583
 	uvBias := float32(0.000002)
 
-	gfx.SetVertexData(
-		x2, y2, 1, 1-uvBias,
+	drawQuadsVtx = [16]float32{
+		x2, y2, 1, 1 - uvBias,
 		x3, y3, 1, 0,
-		x1, y1, uvBias, 1-uvBias,
+		x1, y1, uvBias, 1 - uvBias,
 		x4, y4, uvBias, 0,
-	)
+	}
+	gfx.SetVertexData(drawQuadsVtx[:]...)
 
 	gfx.RenderQuad()
 }
@@ -695,15 +716,20 @@ func RenderSprite(rp RenderParams) {
 
 	gfx.EnableScissor(rp.window[0], rp.window[1], rp.window[2], rp.window[3])
 
-	// Static uniforms
-	gfx.SetUniformMatrix("projection", proj[:])
+	// Static uniforms.
+	// proj[:] / tint[:] would escape to the heap when passed to the gfx
+	// interface, allocating on every sprite; copy into the reusable buffers
+	// (single-threaded render path, consumed synchronously) to avoid it.
+	copy(renderSpriteProj[:], proj[:])
+	gfx.SetUniformMatrix("projection", renderSpriteProj[:])
 	gfx.SetUniformI("isFlat", 0)
 	gfx.SetUniformI("mask", int(rp.mask))
 	gfx.SetUniformI("isTrapez", int(Btoi(Abs(Abs(rp.xts)-Abs(rp.xbs)) > 0.001)))
 
 	gfx.SetUniformF("gray", spfx.gray)
 	gfx.SetUniformF("hue", spfx.hue)
-	gfx.SetUniformFv("tint", tint[:])
+	copy(renderSpriteTint[:], tint[:])
+	gfx.SetUniformFv("tint", renderSpriteTint[:])
 
 	if rp.paltex == nil {
 		gfx.SetUniformI("isRgba", 1)

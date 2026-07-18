@@ -863,7 +863,12 @@ func (r *Renderer_WebGL) SetUniformISub(prog *ShaderProgram_WebGL, idx int, val 
 	if !loc.Truthy() {
 		return
 	}
-	if prog == r.spriteShader {
+	// Dedup for EVERY program, not just the sprite shader: GL uniform state is
+	// per-program and persists across program switches, and the cache key is
+	// namespaced by program id. Text rendering repeats identical uniform sets
+	// per line per frame (a screen of TrueType text = hundreds of redundant
+	// uniform calls a second, each an allocating js bridge crossing).
+	{
 		key := (prog.id << 16) | uint32(idx)
 		if old, exists := r.uniformICache[key]; exists && old == val {
 			return
@@ -881,7 +886,8 @@ func (r *Renderer_WebGL) SetUniformFSub(prog *ShaderProgram_WebGL, idx int, valu
 	if !loc.Truthy() {
 		return
 	}
-	if prog == r.spriteShader {
+	// Dedup for every program - see SetUniformISub.
+	{
 		key := (prog.id << 16) | uint32(idx)
 		switch len(values) {
 		case 1:

@@ -796,6 +796,14 @@ type TextSprite struct {
 	scaleInit    [2]float32
 	windowInit   [4]float32
 	velocityInit [2]float32
+	// Per-frame text-preprocessing cache (tab-expand + \n-decode + line split),
+	// keyed on the raw text. Draw runs every frame; without this, static text
+	// (menus, lifebar labels, the multi-line F1 info box) re-allocates its
+	// processed string and line slice 60 times a second. Dynamic text changes
+	// ts.text, which misses the cache and recomputes - so no staleness.
+	procSrc   string
+	procText  string
+	procLines []string
 }
 
 func NewTextSprite() *TextSprite {
@@ -1376,10 +1384,16 @@ func (ts *TextSprite) Draw(ln int16) {
 		return
 	}
 
-	// Replace each tab with 4 spaces
-	// We do this first so that length checks are accurate
-	text := strings.ReplaceAll(ts.text, "\t", "    ")
-	text = ts.decodeEscapes(text)
+	// Preprocess (tab-expand, \n-decode, line split) once per distinct string;
+	// reuse the cached result on the frames where the text hasn't changed.
+	if ts.procLines == nil || ts.procSrc != ts.text {
+		processed := strings.ReplaceAll(ts.text, "\t", "    ")
+		processed = ts.decodeEscapes(processed)
+		ts.procSrc = ts.text
+		ts.procText = processed
+		ts.procLines = strings.Split(processed, "\n")
+	}
+	text := ts.procText
 
 	maxChars := int32(len(text))
 
@@ -1400,7 +1414,7 @@ func (ts *TextSprite) Draw(ln int16) {
 		phantomX = 1 * ts.localScale
 	}
 
-	lines := strings.Split(text, "\n")
+	lines := ts.procLines
 
 	spacingXAdd := int32(math.Round(float64(ts.textSpacing[0])))
 

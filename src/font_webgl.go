@@ -24,6 +24,12 @@ type Font_WebGL struct {
 	textures     []*TextureAtlas
 	color        color
 	shaderPalFX  ShaderPalFX
+	// Reused across Printf calls: text draws run per line, per frame, so
+	// fresh allocations here become megabytes per second of garbage on the
+	// single wasm thread (a screen-full of TrueType text measurably shortened
+	// the GC cycle and lengthened marks). Grown once, reused forever.
+	runeBuf []rune
+	vertBuf []float32
 }
 
 type FontRenderer_WebGL struct {
@@ -113,8 +119,24 @@ func (f *Font_WebGL) Printf(x, y float32, xscl, yscl float32, spacingXAdd float3
 	rxadd float32, rot Rotation, projectionMode int32, fLength float32, rcx, rcy float32,
 	fs string, argv ...interface{}) error {
 
-	text := fmt.Sprintf(fs, argv...)
-	indices := []rune(text)
+	// Fast path for the universal "%s" single-string call: skip fmt.Sprintf
+	// and its allocation. Anything fancier still formats normally.
+	var text string
+	if fs == "%s" && len(argv) == 1 {
+		if s, ok := argv[0].(string); ok {
+			text = s
+		} else {
+			text = fmt.Sprintf(fs, argv...)
+		}
+	} else {
+		text = fmt.Sprintf(fs, argv...)
+	}
+	// Decode into the reusable rune buffer instead of allocating []rune(text).
+	f.runeBuf = f.runeBuf[:0]
+	for _, rn := range text {
+		f.runeBuf = append(f.runeBuf, rn)
+	}
+	indices := f.runeBuf
 	r := gfx.(*Renderer_WebGL)
 	fr := gfxFont.(*FontRenderer_WebGL)
 
@@ -126,9 +148,12 @@ func (f *Font_WebGL) Printf(x, y float32, xscl, yscl float32, spacingXAdd float3
 	fr.SetFontPipeline()
 	program := fr.shaderProgram
 
-	// Buffer to store vertex data for multiple glyphs
+	// Reusable vertex batch buffer (see the struct comment).
 	batchSize := Min(MaxFontBatchSize, int32(len(indices)))
-	batchVertices := make([]float32, 0, batchSize*6*4)
+	if cap(f.vertBuf) < int(batchSize)*6*4 {
+		f.vertBuf = make([]float32, 0, int(batchSize)*6*4)
+	}
+	batchVertices := f.vertBuf[:0]
 
 	//setup blending mode
 	if blend {

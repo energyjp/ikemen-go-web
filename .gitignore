@@ -85,3 +85,6 @@ build/winres/
 *.exe
 *.dll
 external/script/version
+
+# Build output - build with the command in README-WEB.md, or grab a Release
+bin/*.wasm

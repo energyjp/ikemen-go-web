@@ -9395,11 +9395,27 @@ func (c *Char) forceRemapPal(pfx *PalFX, dst [2]int32) {
 		pfx.remap[i] = i
 	}
 
+	// Only palettes in the SELECTABLE family (PalTable key group 1: the base
+	// palette and loaded .act slots) may be force-remapped. Mugen's remappal is
+	// documented to affect sprites sharing the character's palette; sprites
+	// with their own private palettes keep their colors. For SFF v1 and typical
+	// v2 characters every palette is keyed (1,n), so behavior is unchanged -
+	// but v2 characters that carry private palettes for overlay/scene art
+	// (keyed outside group 1) were having ALL of them force-remapped to the
+	// selected color whenever an ownpal helper/explod spawned, recoloring art
+	// that was never authored for the act's color layout.
+	selectable := make(map[int]bool, len(plist.PalTable))
+	for key, idx := range plist.PalTable {
+		if key[0] == 1 {
+			selectable[idx] = true
+		}
+	}
+
 	// Selective remap only if color depths match
 	// https://github.com/ikemen-engine/Ikemen-GO/issues/2408
 	for i := 0; i < len(pfx.remap); i++ {
 		// Get the palette at this index
-		if i < len(plist.palettes) && plist.palettes[i] != nil {
+		if i < len(plist.palettes) && plist.palettes[i] != nil && selectable[i] {
 			srcDepth := len(plist.palettes[i])
 			if srcDepth == dstDepth {
 				pfx.remap[i] = di

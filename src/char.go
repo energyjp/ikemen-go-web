@@ -6385,7 +6385,13 @@ func (c *Char) playSound(params *PlaySndParams) {
 		if current_ffx != "" {
 			ch.SetVolume(float32(vol * 64 / 25))
 		} else {
-			ch.SetVolume(float32(c.gi().data.volume * vol / 100))
+			// Cap character sounds at 100%: SetVolume accepts up to 512% and
+			// H-edits routinely ship PlaySnd volume=255 (legacy param, ~150%
+			// effective) or data.volume abuse - amplitudes past 100% just clip
+			// in the mixer and come out as ear-splitting distortion. Sounds
+			// authored louder than full scale were relying on that clipping;
+			// capping them is strictly an improvement.
+			ch.SetVolume(float32(Min(c.gi().data.volume*vol/100, 100)))
 		}
 
 		if params.channel >= 0 {

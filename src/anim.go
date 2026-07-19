@@ -876,6 +876,11 @@ func (a *Animation) alphaToBlend() (blendMode TransType, blendAlpha [2]int32) {
 }
 
 func (a *Animation) pal(pfx *PalFX) (p []uint32, plt Texture) {
+	// Palette-resolution debug tap (?paldebug=1): logs how scene-band sprites
+	// resolve their palette, throttled per (group,image).
+	if palDebugEnabled && a.spr != nil {
+		logPalDebug(a, pfx)
+	}
 	if a.palettedata != nil {
 		// Apply temporary palette remap if provided
 		if pfx != nil && len(pfx.remap) > 0 {

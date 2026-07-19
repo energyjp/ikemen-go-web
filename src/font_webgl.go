@@ -36,6 +36,8 @@ type FontRenderer_WebGL struct {
 	shaderProgram *ShaderProgram_WebGL
 	vao           js.Value
 	vbo           js.Value
+	vaoID         int32 // command-buffer table handles
+	vboID         int32
 }
 
 func (fr *FontRenderer_WebGL) Init(renderer interface{}) {
@@ -45,24 +47,26 @@ func (fr *FontRenderer_WebGL) Init(renderer interface{}) {
 	fr.shaderProgram.RegisterAttributes("vert", "vertTexCoord")
 	fr.shaderProgram.RegisterUniforms("textColor", "resolution", "tex", "palAdd", "palMul", "palGray", "palHue", "palNeg")
 
-	fr.vao = r.gl.Call("createVertexArray")
-	fr.vbo = r.gl.Call("createBuffer")
-	r.gl.Call("bindVertexArray", fr.vao)
-	r.gl.Call("bindBuffer", r.c("ARRAY_BUFFER"), fr.vbo)
+	fr.vao = r.glc("createVertexArray")
+	fr.vbo = r.glc("createBuffer")
+	fr.vaoID = r.regJS(fr.vao)
+	fr.vboID = r.regJS(fr.vbo)
+	r.glc("bindVertexArray", fr.vao)
+	r.glc("bindBuffer", r.c("ARRAY_BUFFER"), fr.vbo)
 
 	// Pre-allocate for maximum batch size (6 vertices * 4 floats * 4 bytes per glyph)
-	r.gl.Call("bufferData", r.c("ARRAY_BUFFER"), MaxFontBatchSize*6*4*4, r.c("DYNAMIC_DRAW"))
+	r.glc("bufferData", r.c("ARRAY_BUFFER"), MaxFontBatchSize*6*4*4, r.c("DYNAMIC_DRAW"))
 
 	// Interleaved layout: vec2 vert, vec2 vertTexCoord (16-byte stride)
 	vLoc := fr.shaderProgram.attributes["vert"]
-	r.gl.Call("enableVertexAttribArray", vLoc)
-	r.gl.Call("vertexAttribPointer", vLoc, 2, r.c("FLOAT"), false, 16, 0)
+	r.glc("enableVertexAttribArray", vLoc)
+	r.glc("vertexAttribPointer", vLoc, 2, r.c("FLOAT"), false, 16, 0)
 	tLoc := fr.shaderProgram.attributes["vertTexCoord"]
-	r.gl.Call("enableVertexAttribArray", tLoc)
-	r.gl.Call("vertexAttribPointer", tLoc, 2, r.c("FLOAT"), false, 16, 8)
+	r.glc("enableVertexAttribArray", tLoc)
+	r.glc("vertexAttribPointer", tLoc, 2, r.c("FLOAT"), false, 16, 8)
 
-	r.gl.Call("bindVertexArray", js.Null())
-	r.gl.Call("bindBuffer", r.c("ARRAY_BUFFER"), js.Null())
+	r.glc("bindVertexArray", js.Null())
+	r.glc("bindBuffer", r.c("ARRAY_BUFFER"), js.Null())
 }
 
 // LoadFont loads the specified font at the given scale.
@@ -109,8 +113,13 @@ func (fr *FontRenderer_WebGL) SetFontPipeline() {
 
 	r.currentProgram = fr.shaderProgram
 	r.ChangeProgram(fr.shaderProgram)
-	r.gl.Call("bindVertexArray", fr.vao)
-	r.gl.Call("bindBuffer", r.c("ARRAY_BUFFER"), fr.vbo)
+	r.need(2)
+	r.emitI(wcBindVAO)
+	r.emitI(fr.vaoID)
+	// The old explicit ARRAY_BUFFER bind is intentionally dropped: buffer
+	// binding is only observed by bufferData/bufferSubData, and every such op
+	// in the command stream (wcVertexData/wcSubData) rebinds its own buffer
+	// first - so GL state is identical at every point where it is read.
 }
 
 // Printf draws a string to the screen, takes a list of arguments like printf
@@ -324,12 +333,26 @@ func (f *Font_WebGL) renderGlyphBatch(vertices []float32, atlasIndex int32) {
 
 	atlas := f.textures[atlasIndex].texture.(*Texture_WebGL)
 
-	r.gl.Call("bindBuffer", r.c("ARRAY_BUFFER"), fr.vbo)
-	r.gl.Call("bufferSubData", r.c("ARRAY_BUFFER"), 0, r.scratch.floats(vertices))
-
-	r.SetActiveTexture0()
-	r.gl.Call("bindTexture", r.c("TEXTURE_2D"), atlas.handle)
-	r.gl.Call("drawArrays", r.c("TRIANGLES"), 0, len(vertices)/4)
+	// bind + upload + bind atlas + draw, all through the command buffer
+	r.need(3 + len(vertices))
+	r.emitI(wcSubData)
+	r.emitI(fr.vboID)
+	r.emitI(int32(len(vertices)))
+	for _, v := range vertices {
+		r.emitF(v)
+	}
+	r.need(7)
+	r.emitI(wcActiveBind) // = activeTexture(TEXTURE0) + bindTexture, as before
+	r.emitI(0)
+	r.emitI(atlas.cmdID)
+	if len(r.texCacheTexSerial) > 0 { // keep the unit-0 cache reset SetActiveTexture0 did
+		r.texCacheTexSerial[0] = 0
+		r.texCacheLastUsed[0] = 0
+	}
+	r.emitI(wcDrawArrays)
+	r.emitI(int32(r.ci("TRIANGLES")))
+	r.emitI(0)
+	r.emitI(int32(len(vertices) / 4))
 }
 
 // Width returns the width of a piece of text in pixels

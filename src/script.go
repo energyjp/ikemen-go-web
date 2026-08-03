@@ -2100,7 +2100,6 @@ func systemScriptInit(l *lua.LState) {
 			sys.luaQueueLayerDraw(int(layerLocal), func() {
 				(&aSnap).Draw(layerLocal)
 			})
-			aSnap.Update(true)
 		})
 		return 0
 	})
@@ -2483,10 +2482,10 @@ func systemScriptInit(l *lua.LState) {
 		return 1
 	})
 	luaRegister(l, "endMatch", func(*lua.LState) int {
-		/*Signal that the current match should end (using menu fade-out settings).
+		/*Signal that the current match should end (using fight screen fade-out settings).
 		@function endMatch
 		function endMatch() end*/
-		sys.motif.PauseMenu["pause_menu"].FadeOut.FadeData.init(sys.motif.fadeOut, false)
+		sys.fightScreen.round.fadeOut.init(sys.fightScreen.round.fadeOut, false)
 		sys.uiResetTokenGuard()
 		sys.endMatch = true
 		return 0
@@ -3196,10 +3195,9 @@ func systemScriptInit(l *lua.LState) {
 				if winp, err = fight(); err != nil {
 					l.RaiseError(err.Error())
 				}
-				// Hard reset: drop the incomplete match stats and start a fresh one
+				// Hard reset: discard all stats from the abandoned attempt.
 				if winp == -2 {
-					sys.statsLog.abortMatch()
-					sys.statsLog.startMatch()
+					sys.statsLog.discardCurrentMatch()
 				}
 				// If a team won, and not going to the next character in turns mode, break
 				if winp < 0 ||
@@ -9340,7 +9338,17 @@ func triggerFunctions(l *lua.LState) {
 		return 1
 	})
 	luaRegister(l, "ikemenVersion", func(*lua.LState) int {
-		l.Push(lua.LNumber(sys.debugWC.gi().ikemenverF))
+		version := sys.debugWC.gi().ikemenver
+		switch strings.ToLower(strArg(l, 1)) {
+		case "major":
+			l.Push(lua.LNumber(version[0]))
+		case "minor":
+			l.Push(lua.LNumber(version[1]))
+		case "patch":
+			l.Push(lua.LNumber(version[2]))
+		default:
+			l.RaiseError("\nInvalid argument: %v\n", strArg(l, 1))
+		}
 		return 1
 	})
 	luaRegister(l, "inCustomAnim", func(*lua.LState) int {
@@ -9699,6 +9707,16 @@ func triggerFunctions(l *lua.LState) {
 		}
 		return 1
 	})
+	luaRegister(l, "motifIsInherited", func(l *lua.LState) int {
+		/*Returns whether a motif value was inherited from another motif parameter.
+		@function motifIsInherited
+		@tparam string key Motif key path.
+		@treturn boolean
+		function motifIsInherited(key) end*/
+		key := strings.ToLower(l.CheckString(1))
+		l.Push(lua.LBool(sys.motif.inheritedKeys[key]))
+		return 1
+	})
 	luaRegister(l, "motifVar", func(l *lua.LState) int {
 		value, err := sys.motif.GetValue(strArg(l, 1))
 		if err == nil {
@@ -9771,7 +9789,15 @@ func triggerFunctions(l *lua.LState) {
 		return 1
 	})
 	luaRegister(l, "mugenVersion", func(*lua.LState) int {
-		l.Push(lua.LNumber(sys.debugWC.gi().mugenverF))
+		version := sys.debugWC.gi().mugenver
+		switch strings.ToLower(strArg(l, 1)) {
+		case "major":
+			l.Push(lua.LNumber(version[0]))
+		case "minor":
+			l.Push(lua.LNumber(version[1]))
+		default:
+			l.RaiseError("\nInvalid argument: %v\n", strArg(l, 1))
+		}
 		return 1
 	})
 	// name also returns p1Name-p8Name variants and helperName
@@ -10645,10 +10671,16 @@ func triggerFunctions(l *lua.LState) {
 			l.Push(lua.LString(sys.stage.author))
 		case "info.displayname":
 			l.Push(lua.LString(sys.stage.displayname))
-		case "info.ikemenversion":
-			l.Push(lua.LNumber(sys.stage.ikemenverF))
-		case "info.mugenversion":
-			l.Push(lua.LNumber(sys.stage.mugenverF))
+		case "info.ikemenversion.major":
+			l.Push(lua.LNumber(sys.stage.ikemenver[0]))
+		case "info.ikemenversion.minor":
+			l.Push(lua.LNumber(sys.stage.ikemenver[1]))
+		case "info.ikemenversion.patch":
+			l.Push(lua.LNumber(sys.stage.ikemenver[2]))
+		case "info.mugenversion.major":
+			l.Push(lua.LNumber(sys.stage.mugenver[0]))
+		case "info.mugenversion.minor":
+			l.Push(lua.LNumber(sys.stage.mugenver[1]))
 		case "info.name":
 			l.Push(lua.LString(sys.stage.name))
 		case "camera.boundleft":

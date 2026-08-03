@@ -217,11 +217,11 @@ func ioReadFull(c *webrtcConn, buf []byte) (int, error) {
 	return got, nil
 }
 
-func (nc *NetConnection) Accept(port string) error {
+func (nc *NetConnection) Accept(port int) error {
 	return nc.webrtcStart(true)
 }
 
-func (nc *NetConnection) Connect(server, port string) {
+func (nc *NetConnection) Connect(server string, port int) {
 	nc.webrtcStart(false)
 }
 

@@ -310,6 +310,11 @@ func (nc *NetConnection) GetHostGuestRemap() (host, guest int) {
 	return
 }
 
+// Accept and Connect live in the platform files (netplay_desktop.go /
+// netplay_js.go): TCP listen/dial is desktop-only, the browser build tunnels
+// through the page's WebRTC bridge. Upstream v1.0.0 changed their signatures
+// to take the port as an int (config.Netplay.ListenPort is int now) - both
+// platform implementations follow that signature.
 func (nc *NetConnection) IsConnected() bool {
 	if nc == nil {
 		return false

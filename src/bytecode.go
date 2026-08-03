@@ -402,8 +402,11 @@ const (
 	OC_const_displayname
 	OC_const_stagevar_info_author
 	OC_const_stagevar_info_displayname
-	OC_const_stagevar_info_ikemenversion
-	OC_const_stagevar_info_mugenversion
+	OC_const_stagevar_info_ikemenversion_major
+	OC_const_stagevar_info_ikemenversion_minor
+	OC_const_stagevar_info_ikemenversion_patch
+	OC_const_stagevar_info_mugenversion_major
+	OC_const_stagevar_info_mugenversion_minor
 	OC_const_stagevar_info_name
 	OC_const_stagevar_camera_boundleft
 	OC_const_stagevar_camera_boundright
@@ -675,7 +678,9 @@ const (
 	OC_ex_movehitvar_spark_x
 	OC_ex_movehitvar_spark_y
 	OC_ex_movehitvar_uniqhit
-	OC_ex_ikemenversion
+	OC_ex_ikemenversion_major
+	OC_ex_ikemenversion_minor
+	OC_ex_ikemenversion_patch
 	OC_ex_incustomanim
 	OC_ex_incustomstate
 	OC_ex_isassertedchar
@@ -697,7 +702,8 @@ const (
 	OC_ex_lerp
 	OC_ex_memberno
 	OC_ex_movecountered
-	OC_ex_mugenversion
+	OC_ex_mugenversion_major
+	OC_ex_mugenversion_minor
 	OC_ex_pausetime
 	OC_ex_physics
 	OC_ex_playerno
@@ -2746,10 +2752,16 @@ func (be BytecodeExp) run_const(c *Char, i *int, oc *Char) {
 	case OC_const_stagevar_info_displayname:
 		nameStr := be.ReadPoolStringAt(i)
 		sys.bcStack.PushB(sys.stage.displaynameLow == nameStr)
-	case OC_const_stagevar_info_ikemenversion:
-		sys.bcStack.PushF(sys.stage.ikemenverF)
-	case OC_const_stagevar_info_mugenversion:
-		sys.bcStack.PushF(sys.stage.mugenverF)
+	case OC_const_stagevar_info_ikemenversion_major:
+		sys.bcStack.PushI(int32(sys.stage.ikemenver[0]))
+	case OC_const_stagevar_info_ikemenversion_minor:
+		sys.bcStack.PushI(int32(sys.stage.ikemenver[1]))
+	case OC_const_stagevar_info_ikemenversion_patch:
+		sys.bcStack.PushI(int32(sys.stage.ikemenver[2]))
+	case OC_const_stagevar_info_mugenversion_major:
+		sys.bcStack.PushI(int32(sys.stage.mugenver[0]))
+	case OC_const_stagevar_info_mugenversion_minor:
+		sys.bcStack.PushI(int32(sys.stage.mugenver[1]))
 	case OC_const_stagevar_info_name:
 		nameStr := be.ReadPoolStringAt(i)
 		sys.bcStack.PushB(sys.stage.nameLow == nameStr)
@@ -3320,8 +3332,12 @@ func (be BytecodeExp) run_ex(c *Char, i *int, oc *Char) {
 		*sys.bcStack.Top() = c.helperIndexExist(*sys.bcStack.Top())
 	case OC_ex_hitoverridden:
 		sys.bcStack.PushB(c.hoverIdx >= 0)
-	case OC_ex_ikemenversion:
-		sys.bcStack.PushF(c.gi().ikemenverF)
+	case OC_ex_ikemenversion_major:
+		sys.bcStack.PushI(int32(c.gi().ikemenver[0]))
+	case OC_ex_ikemenversion_minor:
+		sys.bcStack.PushI(int32(c.gi().ikemenver[1]))
+	case OC_ex_ikemenversion_patch:
+		sys.bcStack.PushI(int32(c.gi().ikemenver[2]))
 	case OC_ex_incustomanim:
 		sys.bcStack.PushB(c.animPN != c.playerNo)
 	case OC_ex_incustomstate:
@@ -3438,10 +3454,12 @@ func (be BytecodeExp) run_ex(c *Char, i *int, oc *Char) {
 		sys.bcStack.PushI(int32(c.memberNo) + 1)
 	case OC_ex_movecountered:
 		sys.bcStack.PushI(c.moveCountered())
-	case OC_ex_mugenversion:
-		sys.bcStack.PushF(c.gi().mugenverF)
+	case OC_ex_mugenversion_major:
+		sys.bcStack.PushI(int32(c.gi().mugenver[0]))
 		// Here the version is always checked directly in the character instead of the working state
 		// This is because in a custom state this trigger will be used to know the enemy's version rather than our own
+	case OC_ex_mugenversion_minor:
+		sys.bcStack.PushI(int32(c.gi().mugenver[1]))
 	case OC_ex_pausetime:
 		sys.bcStack.PushI(c.pauseTimeTrigger())
 	case OC_ex_physics:
@@ -3801,6 +3819,8 @@ func (be BytecodeExp) run_ex2(c *Char, i *int, oc *Char) {
 	case OC_ex2_explodvar_animelemtime:
 		fallthrough
 	case OC_ex2_explodvar_animplayerno:
+		fallthrough
+	case OC_ex2_explodvar_animtime:
 		fallthrough
 	case OC_ex2_explodvar_spriteplayerno:
 		fallthrough
@@ -6555,14 +6575,14 @@ func (sc modifyExplod) Run(c *Char, _ []int32) bool {
 	idx := int(-1)
 	rp := [2]int32{-1, 0}
 	remap := false
-	ptexists := false
+	posTypeFound := false
 	animPN := -1
 	spritePN := -1
 
 	// Mugen chars can only modify some parameters after defining PosType
 	// Ikemen chars don't have this restriction
-	paramlock := func() bool {
-		return c.stWgi().ikemenver[0] == 0 && c.stWgi().ikemenver[1] == 0 && !ptexists
+	paramLock := func() bool {
+		return c.stWgi().ikemenver[0] == 0 && c.stWgi().ikemenver[1] == 0 && !posTypeFound
 	}
 
 	var expls []*Explod
@@ -6605,9 +6625,10 @@ func (sc modifyExplod) Run(c *Char, _ []int32) bool {
 			}
 			switch paramID {
 			case explod_postype:
-				// In Mugen many explod parameters are defaulted when not being modified
+				// In Mugen, many explod parameters are defaulted when not being modified
 				// What possibly happens in Mugen is that all parameters are read first then only applied if PosType is defined
-				if paramlock() {
+				// However that would be a worse way to do things, so we'll handle each exception instead
+				if paramLock() {
 					eachExpl(func(e *Explod) {
 						e.offset = [3]float32{0, 0, 0}
 						e.setAllPosX(e.offset[0])
@@ -6622,14 +6643,20 @@ func (sc modifyExplod) Run(c *Char, _ []int32) bool {
 						}
 						e.space = Space_none
 						// Defaulting facing too makes some explods face the wrong way
-						//if e.trueFacing() >= 0 { // See below
-						//	e.relativef = 1
-						//}
+						// But not defaulting it is the cause of https://github.com/ikemen-engine/Ikemen-GO/issues/3813
+						// TODO: Check which explods face the wrong way and why
+						if e.trueFacing() >= 0 { // See explod_facing
+							e.relativef = 1
+						}
+						// Just for documentation's sake, because this is a no-op
+						if e.vfacing >= 0 { // See explod_vfacing
+							e.vfacing = 1
+						}
 					})
 				}
 				// Flag PosType as found
 				// From this point onward, Mugen chars can modify more parameters (Ikemen chars always could)
-				ptexists = true
+				posTypeFound = true
 				// Update actual PosType
 				pt := PosType(exp[0].evalI(c))
 				eachExpl(func(e *Explod) {
@@ -6637,17 +6664,17 @@ func (sc modifyExplod) Run(c *Char, _ []int32) bool {
 				})
 			case explod_space:
 				// For some reason Mugen also requires a PosType declaration to be able to modify space
-				if !paramlock() {
+				if !paramLock() {
 					spc := Space(exp[0].evalI(c))
 					eachExpl(func(e *Explod) {
 						e.space = spc
 					})
 				}
 			case explod_facing:
-				if !paramlock() {
+				if !paramLock() {
 					rf := exp[0].evalF(c)
 					eachExpl(func(e *Explod) {
-						// There's a bug in Mugen 1.1 where an explod that is facing left can't be flipped
+						// There's a bug in Mugen where an explod that is facing left can't be flipped
 						// https://github.com/ikemen-engine/Ikemen-GO/issues/1252
 						// Ikemen chars just work as supposed to
 						if c.stWgi().ikemenver[0] != 0 || c.stWgi().ikemenver[1] != 0 || e.trueFacing() >= 0 {
@@ -6656,10 +6683,10 @@ func (sc modifyExplod) Run(c *Char, _ []int32) bool {
 					})
 				}
 			case explod_vfacing:
-				if !paramlock() {
+				if !paramLock() {
 					vf := exp[0].evalF(c)
 					eachExpl(func(e *Explod) {
-						// There's a bug in Mugen 1.1 where an explod that is upside down can't be flipped
+						// There's a bug in Mugen where an explod that is upside down can't be flipped
 						// Ikemen chars just work as supposed to
 						if e.vfacing >= 0 || c.stWgi().ikemenver[0] != 0 || c.stWgi().ikemenver[1] != 0 {
 							e.vfacing = vf
@@ -6667,7 +6694,7 @@ func (sc modifyExplod) Run(c *Char, _ []int32) bool {
 					})
 				}
 			case explod_pos:
-				if !paramlock() {
+				if !paramLock() {
 					pos := exp[0].evalF(c) * redirscale
 					eachExpl(func(e *Explod) {
 						e.relativePos[0] = pos
@@ -6686,7 +6713,7 @@ func (sc modifyExplod) Run(c *Char, _ []int32) bool {
 					}
 				}
 			case explod_random:
-				if !paramlock() {
+				if !paramLock() {
 					rndx := (exp[0].evalF(c) / 2) * redirscale
 					rndx = RandF(-rndx, rndx)
 					eachExpl(func(e *Explod) {
@@ -6708,7 +6735,7 @@ func (sc modifyExplod) Run(c *Char, _ []int32) bool {
 					}
 				}
 			case explod_velocity:
-				if !paramlock() {
+				if !paramLock() {
 					vel := exp[0].evalF(c) * redirscale
 					eachExpl(func(e *Explod) {
 						e.velocity[0] = vel
@@ -6741,7 +6768,7 @@ func (sc modifyExplod) Run(c *Char, _ []int32) bool {
 					e.friction[2] = v3
 				})
 			case explod_accel:
-				if !paramlock() {
+				if !paramLock() {
 					accel := exp[0].evalF(c) * redirscale
 					eachExpl(func(e *Explod) {
 						e.accel[0] = accel
@@ -7130,7 +7157,7 @@ func (sc modifyExplod) Run(c *Char, _ []int32) bool {
 	})
 
 	// Update relative positions if postype was updated
-	if ptexists {
+	if posTypeFound {
 		eachExpl(func(e *Explod) {
 			e.setPos(crun)
 		})

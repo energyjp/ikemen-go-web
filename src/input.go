@@ -123,7 +123,7 @@ func OnKeyPressed(key Key, mk ModifierKey) {
 		sys.escPending = sys.escPending ||
 			key == KeyEscape && (mk&ModCtrlAlt) == 0
 		for k, v := range sys.shortcutScripts {
-			if sys.netConnection == nil && (sys.replayFile == nil || !v.DebugKey) &&
+			if !sys.motif.me.active && sys.netConnection == nil && (sys.replayFile == nil || !v.DebugKey) &&
 				//(!sys.paused || sys.frameStepFlag || v.Pause) &&
 				(sys.cfg.Debug.AllowDebugKeys || !v.DebugKey) {
 				v.ActivatePending = v.ActivatePending || k.Test(key, mk)

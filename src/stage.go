@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -1069,13 +1070,29 @@ func loadStage(def string, maindef bool) (*Stage, error) {
 					re := regexp.MustCompile("[0-9]+")
 					submatchall := re.FindAllString(k, -1)
 					if len(submatchall) == 1 {
-						if err := LoadFile(&v, []string{def, "", "data/"}, "stages/", func(filename string) error {
+						loadRound := func(filename string) error {
 							if sys.stageList[Atoi(submatchall[0])], err = loadStage(filename, false); err != nil {
 								return fmt.Errorf("failed to load %v:\n%v", filename, err)
 							}
 							return nil
-						}); err != nil {
-							return nil, err
+						}
+						if err := LoadFile(&v, []string{def, "", "data/"}, "stages/", loadRound); err != nil {
+							// Stage authors write round-def paths relative to a
+							// flat stages/ root ("stages/name1.def"); when the
+							// stage was imported into its own subfolder the
+							// companion defs sit NEXT TO the main def instead.
+							// Retry the bare filename in the referring def's
+							// directory before giving up.
+							alt := filepath.Join(filepath.Dir(def), filepath.Base(v))
+							if FileExist(alt) != "" {
+								err = loadRound(alt)
+							}
+							if err != nil {
+								// A missing round variant should not take the
+								// whole match down - warn and fall back to the
+								// main stage for that round.
+								LogMessage("Round stage def skipped (%v): %v", k, err)
+							}
 						}
 					}
 				}

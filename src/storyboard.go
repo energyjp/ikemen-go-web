@@ -337,10 +337,16 @@ func (s *Storyboard) loadFiles() {
 
 	LoadFile(&s.SceneDef.Model, []string{s.Def, "", "data/"}, "", func(filename string) error {
 		if filename != "" {
+			if !gfx.IsModelEnabled() {
+				LogMessage("Storyboard model skipped (renderer has no 3D support): %v", filename)
+				return nil
+			}
 			var err error
 			s.Model, err = loadglTFModel(filename)
 			if err != nil {
 				LogMessage("Failed to load %v: %v", filename, err)
+				s.Model = nil
+				return nil // storyboard still works without its model
 			}
 			sys.mainThreadTask <- func() {
 				gfx.SetModelVertexData(1, s.Model.vertexBuffer)

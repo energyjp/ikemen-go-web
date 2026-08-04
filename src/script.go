@@ -5073,6 +5073,11 @@ func systemScriptInit(l *lua.LState) {
 		@treturn Model model Model userdata.
 		function modelNew(filename) end*/
 		if !nilArg(l, 1) {
+			if !gfx.IsModelEnabled() {
+				LogMessage("modelNew skipped (renderer has no 3D support): %v", strArg(l, 1))
+				l.Push(lua.LNil)
+				return 1
+			}
 			mdl, err := loadglTFModel(strArg(l, 1))
 			if err != nil {
 				l.RaiseError("\nCan't load %v: %v\n", strArg(l, 1), err.Error())

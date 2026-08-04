@@ -1280,6 +1280,13 @@ func loadStage(def string, maindef bool) (*Stage, error) {
 			return nil, err
 		}
 		if err = sec.LoadFile("model", []string{def, "", "data/"}, "", func(filename string) error {
+			// Renderer without a 3D pipeline (the browser build): skip the
+			// model but keep the stage's 2D layers, instead of failing the
+			// whole stage load and taking the match down with it.
+			if !gfx.IsModelEnabled() {
+				LogMessage("Stage model skipped (renderer has no 3D support): %v", filename)
+				return nil
+			}
 			model, err := loadglTFModel(filename)
 			if err != nil {
 				return err

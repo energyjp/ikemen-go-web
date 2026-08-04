@@ -1157,7 +1157,11 @@ function main.f_commandLine()
 	end
 	loadStart(table.concat(t_params, ', '))
 	while loading() do
-		--do nothing
+		-- Pump the engine while waiting: on the single-threaded wasm build the
+		-- loader can only make progress when the main loop runs, so a bare
+		-- busy-wait here deadlocks the whole quick-match path. (The -ip wait
+		-- loop above already does this.)
+		refresh()
 	end
 	game()
 	if flags['-log'] ~= nil then

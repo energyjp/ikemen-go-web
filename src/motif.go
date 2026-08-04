@@ -2425,10 +2425,16 @@ func (m *Motif) loadFiles() {
 
 	LoadFile(&m.Files.Model, []string{m.Files.Model}, "", func(filename string) error {
 		if filename != "" {
+			if !gfx.IsModelEnabled() {
+				LogMessage("Motif model skipped (renderer has no 3D support): %v", filename)
+				return nil
+			}
 			var err error
 			m.Model, err = loadglTFModel(filename)
 			if err != nil {
 				LogMessage("Failed to load %v: %v", filename, err)
+				m.Model = nil
+				return nil // motif still works without its model
 			}
 			sys.mainThreadTask <- func() {
 				gfx.SetModelVertexData(1, m.Model.vertexBuffer)

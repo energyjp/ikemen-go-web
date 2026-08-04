@@ -10,6 +10,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -1778,9 +1779,13 @@ func SafeGo(f func()) {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
+				// Capture the goroutine's stack NOW - re-panicking on the main
+				// thread would otherwise report the forwarder's trivial frame
+				// and destroy the only evidence of where the panic came from.
+				stack := debug.Stack()
 				// Forward the panic to the main thread, where dialogs and shutdown are safe
 				sys.mainThreadTask <- func() {
-					panic(r)
+					panic(fmt.Sprintf("%v\n\nbackground goroutine stack:\n%s", r, stack))
 				}
 			}
 		}()

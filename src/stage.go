@@ -1327,8 +1327,10 @@ func loadStage(def string, maindef bool) (*Stage, error) {
 		sec.ReadBool("roundpos", &s.stageprops.roundpos)
 	}
 
-	// Model group
-	if sec, _ := getSection("model"); sec != nil {
+	// Model group. s.model is nil when the model file failed to load or the
+	// renderer has no 3D pipeline (browser build) - the section only
+	// configures the model, so with no model there is nothing to configure.
+	if sec, _ := getSection("model"); sec != nil && s.model != nil {
 		if str, ok := sec["offset"]; ok {
 			for k, v := range SplitAndTrim(str, ",") {
 				if k >= len(s.model.offset) {
@@ -1584,6 +1586,9 @@ func (s *Stage) getBg(id int32) (bg []*backGround) {
 }
 
 func (s *Stage) get3DBg(id uint32) (nodes []*Node) {
+	if s.model == nil {
+		return
+	}
 	if id >= 0 {
 		for _, n := range s.model.nodes {
 			if n.id == id {
@@ -1595,6 +1600,9 @@ func (s *Stage) get3DBg(id uint32) (nodes []*Node) {
 }
 
 func (s *Stage) get3DAnim(id uint32) (anims []*GLTFAnimation) {
+	if s.model == nil {
+		return
+	}
 	if id >= 0 {
 		for _, a := range s.model.animations {
 			if a.id == id {

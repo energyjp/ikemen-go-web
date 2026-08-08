@@ -9426,19 +9426,29 @@ func (c *Char) forceRemapPal(pfx *PalFX, dst [2]int32) {
 		pfx.remap[i] = i
 	}
 
-	// Only palettes in the SELECTABLE family (PalTable key group 1: the base
-	// palette and loaded .act slots) may be force-remapped. Mugen's remappal is
-	// documented to affect sprites sharing the character's palette; sprites
-	// with their own private palettes keep their colors. For SFF v1 and typical
-	// v2 characters every palette is keyed (1,n), so behavior is unchanged -
-	// but v2 characters that carry private palettes for overlay/scene art
-	// (keyed outside group 1) were having ALL of them force-remapped to the
-	// selected color whenever an ownpal helper/explod spawned, recoloring art
-	// that was never authored for the act's color layout.
+	// Exclude only PRIVATE palettes: ones carrying a PalTable key outside the
+	// selectable family (group 1 = base palette + loaded .act slots). Those are
+	// overlay/scene art keyed (2,n) or (0,n), authored for their own colors -
+	// force-remapping them to the selected .act repaints art the act was never
+	// drawn for.
+	//
+	// Everything NOT keyed private keeps upstream behavior, which matters: SFF
+	// v1 sprite palettes come from PaletteList.NewPal() and carry no PalTable
+	// key at all (src/image.go), so testing for "is keyed group 1" instead of
+	// "is not keyed private" silently stopped remapping every SFF v1
+	// character's ownpal helpers, explods and projectiles - they'd draw in
+	// their authored colors while the player wore a different palette.
 	selectable := make(map[int]bool, len(plist.PalTable))
 	for key, idx := range plist.PalTable {
 		if key[0] == 1 {
 			selectable[idx] = true
+		}
+	}
+	private := make(map[int]bool, len(plist.PalTable))
+	for key, idx := range plist.PalTable {
+		// A palette keyed both selectable and private stays remappable.
+		if key[0] != 1 && !selectable[idx] {
+			private[idx] = true
 		}
 	}
 
@@ -9446,7 +9456,7 @@ func (c *Char) forceRemapPal(pfx *PalFX, dst [2]int32) {
 	// https://github.com/ikemen-engine/Ikemen-GO/issues/2408
 	for i := 0; i < len(pfx.remap); i++ {
 		// Get the palette at this index
-		if i < len(plist.palettes) && plist.palettes[i] != nil && selectable[i] {
+		if i < len(plist.palettes) && plist.palettes[i] != nil && !private[i] {
 			srcDepth := len(plist.palettes[i])
 			if srcDepth == dstDepth {
 				pfx.remap[i] = di

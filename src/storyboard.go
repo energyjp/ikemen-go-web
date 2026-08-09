@@ -337,10 +337,16 @@ func (s *Storyboard) loadFiles() {
 
 	LoadFile(&s.SceneDef.Model, []string{s.Def, "", "data/"}, "", func(filename string) error {
 		if filename != "" {
+			if !gfx.IsModelEnabled() {
+				LogMessage("Storyboard model skipped (renderer has no 3D support): %v", filename)
+				return nil
+			}
 			var err error
 			s.Model, err = loadglTFModel(filename)
 			if err != nil {
 				LogMessage("Failed to load %v: %v", filename, err)
+				s.Model = nil
+				return nil // storyboard still works without its model
 			}
 			sys.mainThreadTask <- func() {
 				gfx.SetModelVertexData(1, s.Model.vertexBuffer)
@@ -467,7 +473,11 @@ func (s *Storyboard) reset() {
 			}
 			if layerProps.TextSpriteData != nil {
 				layerProps.TextSpriteData.Reset()
-				// Storyboard uses uses its own typewriter logic, so disable the internal TextSprite typing.
+				// Reset restores the full source string. Hide it until the storyboard typewriter reveals the first character.
+				if layerProps.TextDelay > 0 {
+					layerProps.TextSpriteData.text = ""
+				}
+				// Storyboard uses its own typewriter logic, so disable the internal TextSprite typing.
 				layerProps.TextSpriteData.textDelay = 0
 				// Apply layerall.pos so storyboard [layerall.pos] affects text too
 				layerProps.TextSpriteData.AddPos(sceneProps.Layerall.Pos[0], sceneProps.Layerall.Pos[1])

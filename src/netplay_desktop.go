@@ -20,8 +20,8 @@ func platformGGPOTransport() []transport.Connection {
 	return nil
 }
 
-func (nc *NetConnection) Accept(port string) error {
-	ln, err := net.Listen("tcp", ":"+port)
+func (nc *NetConnection) Accept(port int) error {
+	ln, err := net.Listen("tcp", net.JoinHostPort("", Itoa(port)))
 	if err != nil {
 		return err
 	}
@@ -86,7 +86,7 @@ func (nc *NetConnection) Accept(port string) error {
 	return nil
 }
 
-func (nc *NetConnection) Connect(server, port string) {
+func (nc *NetConnection) Connect(server string, port int) {
 	nc.host = false
 	nc.conn = nil // Make sure this is a new connection
 	nc.remIn, nc.locIn = nc.GetHostGuestRemap()
@@ -97,7 +97,7 @@ func (nc *NetConnection) Connect(server, port string) {
 			if nc.isClosing() {
 				return
 			}
-			tempConn, err := d.Dial("tcp", server+":"+port)
+			tempConn, err := d.Dial("tcp", net.JoinHostPort(server, Itoa(port)))
 			if err != nil {
 				time.Sleep(100 * time.Millisecond)
 				continue
@@ -141,7 +141,6 @@ func (nc *NetConnection) Connect(server, port string) {
 		}
 	})
 }
-
 
 // platformNetStats is a browser-overlay affordance (see netplay_js.go).
 func platformNetStats(pingMs int) {}

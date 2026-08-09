@@ -417,6 +417,7 @@ type FaceProperties struct {
 	} `ini:"done"`
 	Random   AnimationProperties `ini:"random"`  // only used by [Select Info]
 	Loading  AnimationProperties `ini:"loading"` // only used by [Select Info] and [VS Screen]
+	Slot     AnimationProperties `ini:"slot"`    // only used by [Select Info]
 	Velocity [2]float32          `ini:"velocity"`
 	MaxDist  [2]float32          `ini:"maxdist"`
 	Accel    [2]float32          `ini:"accel"`
@@ -691,6 +692,7 @@ type SelectInfoProperties struct {
 			SwitchTime int32 `ini:"switchtime"`
 		} `ini:"random"`
 		MapCell map[string]*CellOverrideProperties `ini:"map:^[0-9*]+-[0-9*]+$" lua:""`
+		Slot    AnimationProperties                `ini:"slot"`
 	} `ini:"cell"`
 	P1      PlayerSelectProperties `ini:"p1"`
 	P2      PlayerSelectProperties `ini:"p2"`
@@ -2016,11 +2018,6 @@ func (m *Motif) mergeWithInheritance(specs []InheritSpec) {
 	defs := m.DefaultOnlyIni
 	merged := m.IniFile
 
-	isPreviewAnim := func(dstKey string) bool {
-		l := strings.ToLower(dstKey)
-		return strings.HasSuffix(l, ".palmenu.preview.anim")
-	}
-
 	get := func(f *ini.File, sec, key string) (string, bool) {
 		if f == nil {
 			return "", false
@@ -2105,6 +2102,12 @@ func (m *Motif) mergeWithInheritance(specs []InheritSpec) {
 		for suf := range suffixes {
 			dstKey := sp.DstPrefix + suf
 			srcKey := sp.SrcPrefix + suf
+			// Skip palmenu.preview anim/spr inheritance
+			lowerDst := strings.ToLower(sp.DstPrefix)
+			if strings.Contains(lowerDst, ".palmenu.preview.") &&
+				(strings.EqualFold(suf, "anim") || strings.EqualFold(suf, "spr")) {
+				continue
+			}
 			lowerFull := strings.ToLower(dstKey)
 			if shouldSkip(lowerFull) {
 				continue
@@ -2118,18 +2121,6 @@ func (m *Motif) mergeWithInheritance(specs []InheritSpec) {
 						// Nothing to inherit here; keep the existing (possibly resolved) value.
 						continue
 					}
-				}
-			}
-
-			// palmenu.preview only inherits when palmenu.preview.anim is defined
-			if isPreviewAnim(dstKey) {
-				if v, ok := get(user, sp.DstSec, dstKey); ok {
-					tv := strings.TrimSpace(v)
-					if !IsInt(tv) || Atoi(tv) < 0 {
-						continue
-					}
-				} else {
-					continue
 				}
 			}
 
@@ -2156,18 +2147,16 @@ func (m *Motif) mergeWithInheritance(specs []InheritSpec) {
 			query := strings.ToLower(secPath + "." + dstKey)
 			if err := m.SetValueUpdate(query, val); err != nil {
 				//fmt.Printf("Warning: inheritance set failed for %s = %q: %v\n", query, val, err)
+				continue
 			}
 
-			// Remember only anim/spr values that were actually inherited into the destination.
+			// Remember only values that were actually inherited into the destination.
 			// Direct destination values from system.def must keep warning on missing sprites.
-			switch strings.ToLower(suf) {
-			case "anim", "spr":
-				switch src {
-				case srcUserSrc, srcDefSrc:
-					m.inheritedKeys[query] = true
-				default:
-					delete(m.inheritedKeys, query)
-				}
+			switch src {
+			case srcUserSrc, srcDefSrc:
+				m.inheritedKeys[query] = true
+			default:
+				delete(m.inheritedKeys, query)
 			}
 
 			// If a value comes from the user INI (directly or via src), copy it into m.UserIniFile
@@ -2228,12 +2217,20 @@ func (m *Motif) overrideParams() {
 		{SrcSec: "Option Info", SrcPrefix: "menu.", DstSec: "Option Info", DstPrefix: "keymenu."},
 		// [Select Info]
 		{SrcSec: "Select Info", SrcPrefix: "p1.face.", DstSec: "Select Info", DstPrefix: "p1.face.done."},
+		{SrcSec: "Select Info", SrcPrefix: "p1.face.", DstSec: "Select Info", DstPrefix: "p1.face.random."},
+		{SrcSec: "Select Info", SrcPrefix: "p1.face.", DstSec: "Select Info", DstPrefix: "p1.face.slot."},
 		{SrcSec: "Select Info", SrcPrefix: "p1.face.", DstSec: "Select Info", DstPrefix: "p1.face.loading."},
 		{SrcSec: "Select Info", SrcPrefix: "p1.face2.", DstSec: "Select Info", DstPrefix: "p1.face2.done."},
+		{SrcSec: "Select Info", SrcPrefix: "p1.face2.", DstSec: "Select Info", DstPrefix: "p1.face2.random."},
+		{SrcSec: "Select Info", SrcPrefix: "p1.face2.", DstSec: "Select Info", DstPrefix: "p1.face2.slot."},
 		{SrcSec: "Select Info", SrcPrefix: "p1.face2.", DstSec: "Select Info", DstPrefix: "p1.face2.loading."},
 		{SrcSec: "Select Info", SrcPrefix: "p2.face.", DstSec: "Select Info", DstPrefix: "p2.face.done."},
+		{SrcSec: "Select Info", SrcPrefix: "p2.face.", DstSec: "Select Info", DstPrefix: "p2.face.random."},
+		{SrcSec: "Select Info", SrcPrefix: "p2.face.", DstSec: "Select Info", DstPrefix: "p2.face.slot."},
 		{SrcSec: "Select Info", SrcPrefix: "p2.face.", DstSec: "Select Info", DstPrefix: "p2.face.loading."},
 		{SrcSec: "Select Info", SrcPrefix: "p2.face2.", DstSec: "Select Info", DstPrefix: "p2.face2.done."},
+		{SrcSec: "Select Info", SrcPrefix: "p2.face2.", DstSec: "Select Info", DstPrefix: "p2.face2.random."},
+		{SrcSec: "Select Info", SrcPrefix: "p2.face2.", DstSec: "Select Info", DstPrefix: "p2.face2.slot."},
 		{SrcSec: "Select Info", SrcPrefix: "p2.face2.", DstSec: "Select Info", DstPrefix: "p2.face2.loading."},
 		{SrcSec: "Select Info", SrcPrefix: "p1.face.", DstSec: "Select Info", DstPrefix: "p1.palmenu.preview."},
 		{SrcSec: "Select Info", SrcPrefix: "p2.face.", DstSec: "Select Info", DstPrefix: "p2.palmenu.preview."},
@@ -2428,10 +2425,16 @@ func (m *Motif) loadFiles() {
 
 	LoadFile(&m.Files.Model, []string{m.Files.Model}, "", func(filename string) error {
 		if filename != "" {
+			if !gfx.IsModelEnabled() {
+				LogMessage("Motif model skipped (renderer has no 3D support): %v", filename)
+				return nil
+			}
 			var err error
 			m.Model, err = loadglTFModel(filename)
 			if err != nil {
 				LogMessage("Failed to load %v: %v", filename, err)
+				m.Model = nil
+				return nil // motif still works without its model
 			}
 			sys.mainThreadTask <- func() {
 				gfx.SetModelVertexData(1, m.Model.vertexBuffer)
@@ -2662,6 +2665,10 @@ func (m *Motif) applyPostParsePosAdjustments() {
 		// Face.Random and Face2.Random
 		offsetAnims(ps.Face.Pos[0], ps.Face.Pos[1], ps.Face.Random.AnimData)
 		offsetAnims(ps.Face2.Pos[0], ps.Face2.Pos[1], ps.Face2.Random.AnimData)
+
+		// Face.Slot and Face2.Slot
+		offsetAnims(ps.Face.Pos[0], ps.Face.Pos[1], ps.Face.Slot.AnimData)
+		offsetAnims(ps.Face2.Pos[0], ps.Face2.Pos[1], ps.Face2.Slot.AnimData)
 	}
 
 	// Select Screen: Players
@@ -3075,7 +3082,8 @@ func (m *Motif) draw(layerno int16) {
 	}
 	// Draw black bars if fight aspect and motif aspect differ.
 	if layerno == 1 && sys.shouldPersistMotifAspect() &&
-		(!sys.middleOfMatch() || m.me.active || m.di.active) {
+		(!sys.middleOfMatch() || m.di.active ||
+			m.me.active && m.me.state != ME_OpeningOut && m.me.state != ME_ClosingIn) {
 		m.drawAspectBars()
 	}
 	if m.ch.active {
@@ -3276,21 +3284,28 @@ func (mo *Motif) sprintf(format string, args ...interface{}) string {
 	return fmt.Sprintf(fs, args...)
 }
 
+type MenuState int32
+
+const (
+	ME_OpeningOut MenuState = iota
+	ME_OpeningIn
+	ME_Open
+	ME_ClosingOut
+	ME_ClosingIn
+)
+
 type MotifMenu struct {
-	enabled        bool
-	active         bool
-	initialized    bool
-	counter        int32
-	endTimer       int32
-	closeRequested bool
-	reopenLock     bool
+	enabled     bool
+	active      bool
+	initialized bool
+	state       MenuState
+	reopenLock  bool
 }
 
 func (me *MotifMenu) reset(m *Motif) {
 	me.active = false
 	me.initialized = false
-	me.endTimer = -1
-	me.closeRequested = false
+	me.state = ME_OpeningOut
 	if err := sys.luaLState.DoString("menuReset()"); err != nil {
 		sys.luaLState.RaiseError("Error executing Lua code: %v\n", err.Error())
 	}
@@ -3303,19 +3318,20 @@ func (me *MotifMenu) menuOpenInputHeld(m *Motif) bool {
 		return true
 	}
 	// Also respect configured menu cancel/open bindings
-	if m != nil && m.PauseMenu != nil {
-		if pm := m.PauseMenu["pause_menu"]; pm != nil && pm.Enabled {
-			if sys.uiRawInput(pm.Menu.Cancel.Key, -1) {
-				return true
-			}
-		}
+	if pm := me.pauseMenu(m); pm != nil && pm.Enabled {
+		return sys.uiRawInput(pm.Menu.Cancel.Key, -1)
 	}
 	return false
 }
 
-func (me *MotifMenu) pauseMenuBase(m *Motif) *MenuInfoProperties {
+func (me *MotifMenu) pauseMenu(m *Motif) *MenuInfoProperties {
 	if m == nil || m.PauseMenu == nil {
 		return nil
+	}
+	if mode := strings.Join(strings.Fields(strings.ToLower(sys.gameMode)), "_"); mode != "" {
+		if pm := m.PauseMenu[mode+"_pause_menu"]; pm != nil {
+			return pm
+		}
 	}
 	if pm := m.PauseMenu["pause_menu"]; pm != nil {
 		return pm
@@ -3329,21 +3345,17 @@ func (me *MotifMenu) pauseMenuBase(m *Motif) *MenuInfoProperties {
 }
 
 func (me *MotifMenu) requestClose(m *Motif) {
-	if me.endTimer != -1 {
+	if !me.active || me.state >= ME_ClosingOut {
 		return
 	}
-	me.closeRequested = true
-	if !m.di.active {
-		sys.leaveMotifAspect()
+	if pm := me.pauseMenu(m); pm != nil {
+		pm.FadeOut.FadeData.init(m.fadeOut, false)
 	}
-	if pm := me.pauseMenuBase(m); pm != nil {
-		startFadeOut(pm.FadeOut.FadeData, m.fadeOut, false, m.fadePolicy)
-	}
-	me.endTimer = me.counter + m.fadeOut.timeRemaining
+	me.state = ME_ClosingOut
 }
 
 func (me *MotifMenu) init(m *Motif) {
-	pm := me.pauseMenuBase(m)
+	pm := me.pauseMenu(m)
 	if pm == nil || !pm.Enabled || !me.enabled {
 		me.initialized = true
 		return
@@ -3374,56 +3386,74 @@ func (me *MotifMenu) init(m *Motif) {
 		sys.endMatch = true
 		return
 	}
-	// If nothing requested opening, do nothing.
 	if !openPressed {
 		return
 	}
-	sys.enterMotifAspect()
 
-	if err := sys.luaLState.DoString("menuInit()"); err != nil {
-		sys.luaLState.RaiseError("Error executing Lua code: %v\n", err.Error())
-	}
-
-	pm.FadeIn.FadeData.init(m.fadeIn, true)
-	me.counter = 0
+	// Freeze the match first, then fade it to black before initializing the menu.
+	sys.paused = true
+	pm.FadeOut.FadeData.init(m.fadeOut, false)
 	me.active = true
 	me.initialized = true
-	me.closeRequested = false
-	me.endTimer = -1
+	me.state = ME_OpeningOut
 }
 
 func (me *MotifMenu) step(m *Motif) {
-	// Close only when requested by Lua (menuRun() returned false) or when ending the match.
-	if me.endTimer == -1 && (me.closeRequested || sys.endMatch) {
-		me.requestClose(m)
+	// Round state does not advance motif fades while the match is paused.
+	if m.fadeOut.isActive() {
+		m.fadeOut.step()
+	} else if m.fadeIn.isActive() {
+		m.fadeIn.step()
 	}
 
-	// Check if the sequence has ended
-	if me.endTimer != -1 && me.counter >= me.endTimer {
-		if m.fadeOut != nil {
-			m.fadeOut.reset()
+	pm := me.pauseMenu(m)
+	switch me.state {
+	case ME_OpeningOut:
+		if m.fadeOut.isActive() {
+			return
 		}
-		me.active = false
-		me.closeRequested = false
+		sys.enterMotifAspect()
+		if err := sys.luaLState.DoString("menuInit()"); err != nil {
+			sys.luaLState.RaiseError("Error executing Lua code: %v\n", err.Error())
+		}
+		if pm != nil {
+			pm.FadeIn.FadeData.init(m.fadeIn, true)
+		}
+		me.state = ME_OpeningIn
+	case ME_OpeningIn:
+		if !m.fadeIn.isActive() {
+			me.state = ME_Open
+		}
+	case ME_ClosingOut:
+		if m.fadeOut.isActive() {
+			return
+		}
+		if !m.di.active {
+			sys.leaveMotifAspect()
+		}
+		if pm != nil {
+			pm.FadeIn.FadeData.init(m.fadeIn, true)
+		}
+		me.state = ME_ClosingIn
+	case ME_ClosingIn:
+		if m.fadeIn.isActive() {
+			return
+		}
 		me.reopenLock = true
 		me.reset(m)
 		sys.paused = false
-		return
 	}
-
-	// Increment counter
-	me.counter++
 }
 
 // runLua executes the pause-menu Lua loop.
 func (me *MotifMenu) runLua(m *Motif) {
-	// Once closing has started, stop running the Lua menu loop so it can't keep drawing/flickering.
-	if me.endTimer != -1 {
+	// Draw the menu during its fade-in and fade-out, but not while the match is on screen.
+	if me.state == ME_OpeningOut || me.state == ME_ClosingIn {
 		return
 	}
 	if ok, err := ExecFunc(sys.luaLState, "menuRun"); err != nil {
 		sys.luaLState.RaiseError("Error executing Lua code: %v\n", err.Error())
-	} else if !ok {
+	} else if !ok && !sys.endMatch {
 		me.requestClose(m)
 	}
 }
@@ -3455,6 +3485,10 @@ func (ch *MotifChallenger) reset(m *Motif) {
 func (ch *MotifChallenger) init(m *Motif) {
 	if !m.ChallengerInfo.Enabled || !ch.enabled {
 		ch.initialized = true
+		return
+	}
+
+	if m.AttractMode.Enabled && sys.credits == 0 {
 		return
 	}
 
@@ -6521,11 +6555,13 @@ func victoryPortraitAnim(m *Motif, sc *SelectChar, slot string,
 		if len(a.anim.sff.palList.paletteMap) > 0 {
 			a = a.Copy()
 			isCopied = true
-			a.anim.sff.palList.paletteMap[0] = pal - 1
+			if idx, ok := a.anim.sff.palList.PalTable[[2]uint16{1, uint16(pal)}]; ok {
+				a.anim.sff.palList.paletteMap[0] = idx
+			}
 		}
 		//fmt.Printf("[Victory] slot=%s -> applied palette %d\n", slot, pal)
 	}
-
+	// Apply pn.lose.brightness
 	if brightness > 0 && brightness < 256 && a.anim != nil && a.anim.sff != nil {
 		if !isCopied {
 			a = a.Copy()

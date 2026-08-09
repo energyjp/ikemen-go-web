@@ -662,8 +662,9 @@ func (lb *LifeBar) draw(layerno int16, charpn int, lbr *LifeBar, f map[int]*Fnt)
 	redlife := float32(refChar.redLife) / float32(refChar.lifeMax)
 	redval := refChar.redLife - refChar.life
 
-	var MidPosX = (float32(sys.gameWidth-320) / 2)
-	var MidPosY = (float32(sys.gameHeight-240) / 2)
+	// Truncate to int32 first, like before PR #3575, to avoid an off-by-one error
+	var MidPosX = float32(int32(sys.gameWidth)-320) / 2
+	var MidPosY = float32(int32(sys.gameHeight)-240) / 2
 	// Calculates the clipping rectangle based on current bar settings
 	getBarClipRect := func(life float32) [4]int32 {
 		r := sys.scrrect
@@ -1101,8 +1102,9 @@ func (pb *PowerBar) draw(layerno int16, charpn int, pbr *PowerBar, f map[int]*Fn
 		power = float32(pbval)/1000 - Min(float32(level), float32(refChar.powerMax)/1000-1)
 	}
 
-	var MidPosX = (float32(sys.gameWidth-320) / 2)
-	var MidPosY = (float32(sys.gameHeight-240) / 2)
+	// Truncate to int32 first, like before PR #3575, to avoid an off-by-one error
+	var MidPosX = float32(int32(sys.gameWidth)-320) / 2
+	var MidPosY = float32(int32(sys.gameHeight)-240) / 2
 	getBarClipRect := func(power float32) [4]int32 {
 		r := sys.scrrect
 
@@ -1353,8 +1355,9 @@ func (gb *GuardBar) draw(layerno int16, charpn int, gbr *GuardBar, f map[int]*Fn
 		points = 1 - points
 	}
 
-	var MidPosX = (float32(sys.gameWidth-320) / 2)
-	var MidPosY = (float32(sys.gameHeight-240) / 2)
+	// Truncate to int32 first, like before PR #3575, to avoid an off-by-one error
+	var MidPosX = float32(int32(sys.gameWidth)-320) / 2
+	var MidPosY = float32(int32(sys.gameHeight)-240) / 2
 	getBarClipRect := func(points float32) [4]int32 {
 		r := sys.scrrect
 
@@ -1598,8 +1601,9 @@ func (sb *StunBar) draw(layerno int16, charpn int, sbr *StunBar, f map[int]*Fnt)
 		points = 1 - points
 	}
 
-	var MidPosX = (float32(sys.gameWidth-320) / 2)
-	var MidPosY = (float32(sys.gameHeight-240) / 2)
+	// Truncate to int32 first, like before PR #3575, to avoid an off-by-one error
+	var MidPosX = float32(int32(sys.gameWidth)-320) / 2
+	var MidPosY = float32(int32(sys.gameHeight)-240) / 2
 	getBarClipRect := func(points float32) [4]int32 {
 		r := sys.scrrect
 
@@ -3417,6 +3421,11 @@ func (ro *FightScreenRound) overTime() int32 {
 
 // Check is sys.intro timer should step
 func (ro *FightScreenRound) act() bool {
+	// Allow a pause-menu match exit to finish the regular fight fade.
+	if sys.endMatch && ro.fadeOut.isActive() {
+		ro.fadeOut.step()
+		return false
+	}
 	// Early exits
 	if (sys.paused && !sys.frameStepFlag) || sys.gsf(GSF_roundfreeze) {
 		return false
@@ -4595,9 +4604,7 @@ type FightScreen struct {
 	authorLow     string
 	localcoord    [2]int32
 	ikemenver     [3]uint16
-	ikemenverF    float32
 	mugenver      [2]uint16
-	mugenverF     float32
 	offsetX       float32
 	offsetY       float32
 	scale         float32
@@ -4750,14 +4757,8 @@ func loadFightScreen(def string) (*FightScreen, error) {
 			fs.nameLow = strings.ToLower(fs.name)
 			fs.author, _, _ = is.getText("author")
 			fs.authorLow = strings.ToLower(fs.author)
-			// Read MugenVersion
-			if str, ok := is["mugenversion"]; ok {
-				fs.mugenver, fs.mugenverF = ParseMugenVersion(str)
-			}
-			// Read IkemenVersion
-			if str, ok := is["ikemenversion"]; ok {
-				fs.ikemenver, fs.ikemenverF = ParseIkemenVersion(str)
-			}
+			fs.mugenver = ParseMugenVersion(is["mugenversion"])
+			fs.ikemenver = ParseIkemenVersion(is["ikemenversion"])
 			var b bool
 			is.ReadBool("doubleres", &b)
 			if b {
@@ -5575,7 +5576,7 @@ func (fs *FightScreen) visible() bool {
 		!sys.lifebarHide &&
 		!(sys.dialogueHideBars || sys.motif.di.active) &&
 		!(sys.motif.me.active && sys.motif.PauseMenu["pause_menu"].HideBars &&
-			(!sys.motif.me.closeRequested || sys.paused))
+			sys.motif.me.state != ME_ClosingIn)
 }
 
 func (fs *FightScreen) draw(layerno int16) {

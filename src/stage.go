@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -937,9 +938,7 @@ type Stage struct {
 	constants       map[string]float32
 	partnerspacing  int32
 	ikemenver       [3]uint16
-	ikemenverF      float32
 	mugenver        [2]uint16
-	mugenverF       float32
 	reload          bool
 	stageprops      StageProps
 	model           *Model
@@ -1031,17 +1030,8 @@ func loadStage(def string, maindef bool) (*Stage, error) {
 		s.nameLow = strings.ToLower(s.name)
 		s.displaynameLow = strings.ToLower(s.displayname)
 		s.authorLow = strings.ToLower(s.author)
-		// Clear then read MugenVersion
-		s.mugenver = [2]uint16{}
-		s.mugenverF = 0
-		if str, ok := sec["mugenversion"]; ok {
-			s.mugenver, s.mugenverF = ParseMugenVersion(str)
-		}
-		// Clear then read IkemenVersion
-		s.ikemenver = [3]uint16{}
-		if str, ok := sec["ikemenversion"]; ok {
-			s.ikemenver, s.ikemenverF = ParseIkemenVersion(str)
-		}
+		s.mugenver = ParseMugenVersion(sec["mugenversion"])
+		s.ikemenver = ParseIkemenVersion(sec["ikemenversion"])
 		// If the MUGEN version is lower than 1.0, default to camera pixel rounding (floor)
 		if s.ikemenver[0] == 0 && s.ikemenver[1] == 0 && s.mugenver[0] != 1 {
 			s.stageprops.roundpos = true
@@ -1080,13 +1070,29 @@ func loadStage(def string, maindef bool) (*Stage, error) {
 					re := regexp.MustCompile("[0-9]+")
 					submatchall := re.FindAllString(k, -1)
 					if len(submatchall) == 1 {
-						if err := LoadFile(&v, []string{def, "", "data/"}, "stages/", func(filename string) error {
+						loadRound := func(filename string) error {
 							if sys.stageList[Atoi(submatchall[0])], err = loadStage(filename, false); err != nil {
 								return fmt.Errorf("failed to load %v:\n%v", filename, err)
 							}
 							return nil
-						}); err != nil {
-							return nil, err
+						}
+						if err := LoadFile(&v, []string{def, "", "data/"}, "stages/", loadRound); err != nil {
+							// Stage authors write round-def paths relative to a
+							// flat stages/ root ("stages/name1.def"); when the
+							// stage was imported into its own subfolder the
+							// companion defs sit NEXT TO the main def instead.
+							// Retry the bare filename in the referring def's
+							// directory before giving up.
+							alt := filepath.Join(filepath.Dir(def), filepath.Base(v))
+							if FileExist(alt) != "" {
+								err = loadRound(alt)
+							}
+							if err != nil {
+								// A missing round variant should not take the
+								// whole match down - warn and fall back to the
+								// main stage for that round.
+								LogMessage("Round stage def skipped (%v): %v", k, err)
+							}
 						}
 					}
 				}
@@ -1117,8 +1123,7 @@ func loadStage(def string, maindef bool) (*Stage, error) {
 	} else if s.hires {
 		s.scale[1] *= 2
 	}
-	s.localscl = sys.gameWidth / float32(s.stageCamera.localcoord[0])
-	s.stageCamera.localscl = s.localscl
+	s.updateLocalScale(sys.gameWidth)
 	if s.stageCamera.localcoord[0] != 320 {
 		// Update default values to new localcoord. Like characters do
 		coordRatio := float32(s.stageCamera.localcoord[0]) / 320
@@ -1292,6 +1297,13 @@ func loadStage(def string, maindef bool) (*Stage, error) {
 			return nil, err
 		}
 		if err = sec.LoadFile("model", []string{def, "", "data/"}, "", func(filename string) error {
+			// Renderer without a 3D pipeline (the browser build): skip the
+			// model but keep the stage's 2D layers, instead of failing the
+			// whole stage load and taking the match down with it.
+			if !gfx.IsModelEnabled() {
+				LogMessage("Stage model skipped (renderer has no 3D support): %v", filename)
+				return nil
+			}
 			model, err := loadglTFModel(filename)
 			if err != nil {
 				return err
@@ -1315,8 +1327,10 @@ func loadStage(def string, maindef bool) (*Stage, error) {
 		sec.ReadBool("roundpos", &s.stageprops.roundpos)
 	}
 
-	// Model group
-	if sec, _ := getSection("model"); sec != nil {
+	// Model group. s.model is nil when the model file failed to load or the
+	// renderer has no 3D pipeline (browser build) - the section only
+	// configures the model, so with no model there is nothing to configure.
+	if sec, _ := getSection("model"); sec != nil && s.model != nil {
 		if str, ok := sec["offset"]; ok {
 			for k, v := range SplitAndTrim(str, ",") {
 				if k >= len(s.model.offset) {
@@ -1552,6 +1566,14 @@ func loadStage(def string, maindef bool) (*Stage, error) {
 	return s, nil
 }
 
+func (s *Stage) updateLocalScale(gameWidth float32) {
+	if s == nil || s.stageCamera.localcoord[0] <= 0 {
+		return
+	}
+	s.localscl = gameWidth / float32(s.stageCamera.localcoord[0])
+	s.stageCamera.localscl = s.localscl
+}
+
 func (s *Stage) getBg(id int32) (bg []*backGround) {
 	if id >= 0 {
 		for _, b := range s.bg {
@@ -1564,6 +1586,9 @@ func (s *Stage) getBg(id int32) (bg []*backGround) {
 }
 
 func (s *Stage) get3DBg(id uint32) (nodes []*Node) {
+	if s.model == nil {
+		return
+	}
 	if id >= 0 {
 		for _, n := range s.model.nodes {
 			if n.id == id {
@@ -1575,6 +1600,9 @@ func (s *Stage) get3DBg(id uint32) (nodes []*Node) {
 }
 
 func (s *Stage) get3DAnim(id uint32) (anims []*GLTFAnimation) {
+	if s.model == nil {
+		return
+	}
 	if id >= 0 {
 		for _, a := range s.model.animations {
 			if a.id == id {

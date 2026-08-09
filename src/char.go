@@ -9385,14 +9385,38 @@ func (c *Char) remapPal(pfx *PalFX, src [2]int32, dst [2]int32) {
 			plist.Remap(alias, di)
 		}
 
-		// For SFFv1, remapping 1,1 should also remap whatever palettes sprites 0,0 and 9000,0 use
-		// TODO: Because 9000,0 is not hardcoded in Ikemen, this might create trouble for custom portraits
-		if src[0] == 1 && src[1] == 1 && c.gi().sff.header.Version[0] == 1 {
+		// Remapping 1,1 also has to move the palette the character's own art is
+		// really indexed against, because 1,1 is not always that palette.
+		//
+		// SFFv1: always, as before.
+		//
+		// SFFv2: only when 1,1 was SYNTHESIZED from a def palN .act file.
+		// loadPalettes appends those past the SFF's own palettes (see
+		// targetIdx := len(palettes) above), so si is an index no sprite can
+		// carry - Remap(si, di) writes a slot nothing reads and the character's
+		// color picks do nothing whatsoever, in any slot. Old converted v2
+		// characters are overwhelmingly in this state: they key every palette
+		// 0,n and keep their alternates as .act files.
+		//
+		// Gating on "si is past the real palettes" rather than on the SFF
+		// version leaves every character whose file genuinely declares 1,1
+		// untouched - for them si is a real node index and this is skipped -
+		// which matters, because a few of them key 1,1 to a palette that is NOT
+		// sprite (0,0)'s and would change appearance if this ran for them.
+		//
+		// 9000,0 stays v1-only. Upstream's own TODO flags it as risky, and on
+		// SFFv2 the portrait routinely owns a private palette; remapping that
+		// onto the body's .act would repaint the portrait in body colors.
+		isV1 := c.gi().sff.header.Version[0] == 1
+		synthesized := !isV1 && si >= int(c.gi().sff.header.NumberOfPalettes)
+		if src[0] == 1 && src[1] == 1 && (isV1 || synthesized) {
 			if spr := c.gi().sff.GetSprite(0, 0); spr != nil {
 				plist.Remap(spr.palidx, di)
 			}
-			if spr := c.gi().sff.GetSprite(9000, 0); spr != nil {
-				plist.Remap(spr.palidx, di)
+			if isV1 {
+				if spr := c.gi().sff.GetSprite(9000, 0); spr != nil {
+					plist.Remap(spr.palidx, di)
+				}
 			}
 		}
 

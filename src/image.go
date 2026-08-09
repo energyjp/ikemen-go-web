@@ -1749,7 +1749,18 @@ func preloadSff(filename string, char bool, preloadSpr map[[2]uint16]bool) (*Sff
 			if err := read(gn_[:]); err != nil {
 				return nil, nil, err
 			}
-			if gn_[0] == 1 && gn_[1] == 1 {
+			// Keep the FIRST node keyed 1,1, not the last.
+			//
+			// An SFF may declare the same palette key more than once. PalTable
+			// keeps the first (loadPalettes dedups by key), and remapPal remaps
+			// that one plus its aliases - so the match uses the first. Letting
+			// this loop run on overwrote coloredPalette with the LAST one, and
+			// the select screen tags sprites against coloredPalette, so the two
+			// paths disagreed about which node wins: a character whose art sits
+			// on the first 1,1 recoloured correctly in a fight while its select
+			// portrait stayed frozen. Dr.Kira declares 1,1 at nodes 0 and 39
+			// with her body on 0, which is exactly that.
+			if gn_[0] == 1 && gn_[1] == 1 && coloredPalette < 0 {
 				coloredPalette = i
 			}
 		}

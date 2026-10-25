@@ -61,6 +61,19 @@ const (
 	wcTexParam    = 20 // pname, value    (on TEXTURE_2D of the bound texture)
 	wcActiveTex   = 21 // unit
 	wcUniform4fv8 = 22 // locID, 8 f      (uniform4fv with two vec4s)
+
+	// 3D model pipeline (render_webgl_model.go). A stage model draws hundreds
+	// of primitives a frame, each with ~11 attribute pointers, ~25 uniforms,
+	// up to 7 texture binds and a drawElements: one crossing per call would be
+	// thousands of crossings per frame.
+	wcUniformMat3  = 23 // locID, 9 f
+	wcAttribPtr    = 24 // index, size, type, normalized(0/1), stride, offset (vertexAttribPointer)
+	wcAttribOff    = 25 // index, f, f, f, f (disableVertexAttribArray + vertexAttrib4f)
+	wcDrawElements = 26 // mode, count, offset (UNSIGNED_INT indices)
+	wcActiveBindT  = 27 // unit, target, texID (activeTexture + bindTexture on any target)
+	wcFrontFace    = 28 // mode
+	wcAttribOn     = 29 // index (enableVertexAttribArray)
+	wcBindBuffer   = 30 // target, bufID
 )
 
 // The interpreter. Wrapped by the Function constructor at Init:
@@ -111,6 +124,19 @@ return function (n) {
 		case 20: gl.texParameteri(0x0DE1, i32[p++], i32[p++]); break;
 		case 21: gl.activeTexture(0x84C0 + i32[p++]); break;
 		case 22: gl.uniform4fv(T[i32[p++]], f32, p, 8); p += 8; break;
+		case 23: gl.uniformMatrix3fv(T[i32[p++]], false, f32, p, 9); p += 9; break;
+		case 24: gl.vertexAttribPointer(i32[p++], i32[p++], i32[p++], i32[p++] !== 0, i32[p++], i32[p++]); break;
+		case 25: {
+			var a25 = i32[p++];
+			gl.disableVertexAttribArray(a25);
+			gl.vertexAttrib4f(a25, f32[p++], f32[p++], f32[p++], f32[p++]);
+			break;
+		}
+		case 26: gl.drawElements(i32[p++], i32[p++], 0x1405, i32[p++]); break;
+		case 27: gl.activeTexture(0x84C0 + i32[p++]); gl.bindTexture(i32[p++], T[i32[p++]]); break;
+		case 28: gl.frontFace(i32[p++]); break;
+		case 29: gl.enableVertexAttribArray(i32[p++]); break;
+		case 30: gl.bindBuffer(i32[p++], T[i32[p++]]); break;
 		default: throw new Error("wglCmdBuf: bad opcode at " + (p - 1));
 		}
 	}
@@ -145,6 +171,15 @@ func (r *Renderer_WebGL) regJS(v js.Value) int32 {
 	r.cmd.nextID++
 	r.cmd.tables.SetIndex(id, v)
 	return int32(id)
+}
+
+// unregJS drops a table entry so the JS object it pinned can be collected.
+// The slot is not reused. Callers flush first (any glc does), so no pending
+// command still names the slot.
+func (r *Renderer_WebGL) unregJS(id int32) {
+	if id >= 0 && int(id) < r.cmd.nextID {
+		r.cmd.tables.SetIndex(int(id), js.Null())
+	}
 }
 
 // regLoc registers a uniform location, or returns -1 for an invalid one

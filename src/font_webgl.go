@@ -278,7 +278,7 @@ func (f *Font_WebGL) Printf(x, y float32, xscl, yscl float32, spacingXAdd float3
 	}
 
 	// Disable scissor just in case
-	r.DisableScissor()
+	r.flushScissorDisable()
 
 	return nil
 }

@@ -18,6 +18,8 @@ var palDebugEnabled = os.Getenv("IKEMEN_PALDEBUG") != ""
 
 var palDebugSeen = map[[3]int]bool{}
 
+var palDebugTicks int
+
 func palDebugGroupWanted(g uint16) bool {
 	// Sakura scene/overlay bands + protected registry bands under study
 	return (g >= 7000 && g <= 7999) ||

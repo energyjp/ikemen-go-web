@@ -149,7 +149,7 @@ type Config struct {
 		GameHeight               int32    `ini:"GameHeight" sync:"strict"`
 		WindowWidth              int      `ini:"WindowWidth"`
 		WindowHeight             int      `ini:"WindowHeight"`
-		Framerate                int      `ini:"Framerate" sync:"strict"`
+		Framerate                int      `ini:"Framerate"` // TODO: test if we need strict/host here
 		VSync                    int      `ini:"VSync"`
 		Fullscreen               bool     `ini:"Fullscreen"`
 		Borderless               bool     `ini:"Borderless"`
@@ -200,7 +200,13 @@ type Config struct {
 		} `ini:"survival"`
 	} `ini:"Arcade"`
 	Netplay struct {
-		ListenPort      int                `ini:"ListenPort"`
+		ListenPort int `ini:"ListenPort"`
+		// Display name for online play, set in-game (NETWORK > PLAYER NAME) and
+		// used to label a player to an opponent, a queue or a scoreboard.
+		// Deliberately carries NO sync tag: sync-tagged settings are verified
+		// against the peer and a mismatch is a problem, but two players having
+		// different names is the entire point of a name.
+		PlayerName      string             `ini:"PlayerName"`
 		RollbackNetcode bool               `ini:"RollbackNetcode" sync:"strict"`
 		IP              map[string]string  `ini:"IP" insensitivekeys:"false"`
 		Rollback        RollbackProperties `ini:"Rollback"`

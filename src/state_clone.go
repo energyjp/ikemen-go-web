@@ -207,10 +207,31 @@ func (ai *AfterImage) Clone(a *arena.Arena, gsp *GameStatePool) *AfterImage {
 		copy(result.palfx, ai.palfx)
 	}
 
-	// Deep copy Animations
+	// Share each entry's frame data instead of materialising it.
+	//
+	// This loop used to call the full Animation.Clone, which rebuilds the frames
+	// slice one AnimFrame at a time. That was ~95-98% pure waste: recAfterImg
+	// records a ring entry with a SHALLOW struct copy (char.go, *img.anim =
+	// *sd.anim), so all L entries already point at the character's single live
+	// frame array - the deep clone turned one array into L byte-identical
+	// independent ones. And char frame data is immutable: the only four writes
+	// into an Animation's frames anywhere in the engine are stage backgrounds
+	// and motif AnimLayouts (bytecode.go:15068-15069, common.go:1335,
+	// stage.go:295), never a char, explod or projectile.
+	//
+	// Cost measured on the wasm target: full clone is ~0.30us x ringLength x
+	// frameCount, i.e. ~452us for a 20-slot trail over a 73-frame hyper anim -
+	// about 16 helper-clones, and rollback pays the whole snapshot up to 10x per
+	// DISPLAYED frame. Two players in hyper reached ~9ms of a 16.67ms budget.
+	// With CloneState that becomes ~20us, a 92% cut, with no behavioural change
+	// whatsoever. Field symptom this fixes: CVS/SF-Alpha style hyper modes
+	// hitching rollback while active and clearing when the move ends
+	// (field-hit 2026-08-11); the cost is allocation RATE pulling a 35-40ms wasm
+	// GC pause into the match, since platformIdleGC opts out for netplay
+	// sessions (platform_js.go).
 	for i := range ai.imgs {
 		if ai.imgs[i].anim != nil {
-			result.imgs[i].anim = ai.imgs[i].anim.Clone(a, gsp)
+			result.imgs[i].anim = ai.imgs[i].anim.CloneState(a)
 		}
 	}
 

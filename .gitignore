@@ -71,6 +71,7 @@ build/android-apk/
 # Binaries
 build/android-deps/
 build/libxmp-src/
+build/libvpx-src/
 build/sdl2-src/
 build/ffmpeg-src/
 build/ffmpeg/
@@ -86,5 +87,11 @@ build/winres/
 *.dll
 external/script/version
 
-# Build output - build with the command in README-WEB.md
+# Built engine + its stamp. Regenerate with tools/build-engine.sh.
+# Tracking a 24 MB binary made every rebuild a merge conflict, and a tracked
+# binary is also how an engine came to be shipped that nobody could attribute
+# to a source state. The stamp records that attribution instead.
+bin/ikemen-v2.wasm
+bin/ikemen-v2.wasm.build.txt
+# Any other engine build (the retired v1 name included) - build with the command in README-WEB.md
 bin/*.wasm

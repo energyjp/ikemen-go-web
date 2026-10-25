@@ -488,7 +488,7 @@ function start.f_setStage(num, assigned)
 		local sel = start.p[2] and start.p[2].t_selected and start.p[2].t_selected[1]
 		local charData = sel and sel.ref and start.f_getCharData(sel.ref)
 		if charData and charData.stage and #charData.stage > 0 and not (gameMode('training') and gameOption('Config.TrainingStage')) then --stage assigned as character param
-			num = start.stageShuffleBag(charData.ref, charData.stage)
+			num = start.stageShuffleBag('char:' .. sel.ref, charData.stage)
 		elseif charData and main.stageOrder and main.t_orderStages[charData.order] then --stage assigned as stage order param
 			num = start.stageShuffleBag(charData.order, main.t_orderStages[charData.order])
 		elseif gameMode('training') and gameOption('Config.TrainingStage') ~= '' then --training stage
@@ -850,6 +850,7 @@ end
 
 local function drawPortraitLayer(t_portraits, side, t, subname, last, dataField)
 	local lastIdx = #t_portraits
+	local skipField = dataField == 'face2_data' and 'skipCurrentFace2' or 'skipCurrentFace'
 	-- "next player replaces previous one" case
 	local idx = clamp(t_portraitPriority[side] or 1, 1, lastIdx)
 	local paramsSide, params = getParams(side, idx, t, subname)
@@ -858,7 +859,7 @@ local function drawPortraitLayer(t_portraits, side, t, subname, last, dataField)
 	if paramsSide.num == 1 and last then
 		local v = t_portraits[idx]
 		local data, drawParams, skipOffset = getPortraitDrawData(v, side, idx, params, dataField)
-		if not v.skipCurrent and data ~= nil then
+		if not v[skipField] and data ~= nil then
 			main.f_animPosDraw(
 				data,
 				f_portraitsXCalc(side, 1, paramsSide, drawParams, skipOffset, offsetKey),
@@ -887,7 +888,7 @@ local function drawPortraitLayer(t_portraits, side, t, subname, last, dataField)
 		local pn = 2 * (member - 1) + side
 		local offsetKey = 'select_info.p' .. pn .. '.face.offset'
 		local data, drawParams, skipOffset = getPortraitDrawData(v, side, member, params, dataField)
-		if member <= paramsSide.num and not v.skipCurrent and data ~= nil then
+		if member <= paramsSide.num and not v[skipField] and data ~= nil then
 			main.f_animPosDraw(
 				data,
 				f_portraitsXCalc(side, member, paramsSide, drawParams, skipOffset, offsetKey),
@@ -904,7 +905,8 @@ function start.f_drawPortraits(t_portraits, side, t, subname, last, iconDone)
 	end
 	-- reset skip flags
 	for m = 1, #t_portraits do
-		t_portraits[m].skipCurrent = false
+		t_portraits[m].skipCurrentFace = false
+		t_portraits[m].skipCurrentFace2 = false
 	end
 	-- draw random portraits (per member; required for co-op)
 	for m = 1, #t_portraits do
@@ -914,7 +916,7 @@ function start.f_drawPortraits(t_portraits, side, t, subname, last, iconDone)
 			local pData = f_getMotifP(t, pn, side)
 			-- face2 layer random portrait
 			if pData.face2.random and drawPortraitRandom(pData.face2.random, side, m, paramsSide, 'select_info.p' .. pn .. '.face2.random.offset') then
-				t_portraits[m].skipCurrent = true
+				t_portraits[m].skipCurrentFace2 = true
 			end
 			-- primary face random portrait
 			local baseFace = pData
@@ -922,7 +924,7 @@ function start.f_drawPortraits(t_portraits, side, t, subname, last, iconDone)
 				baseFace = baseFace[subname]
 			end
 			if baseFace.random and drawPortraitRandom(baseFace.random, side, m, paramsSide, 'select_info.p' .. pn .. '.face.random.offset') then
-				t_portraits[m].skipCurrent = true
+				t_portraits[m].skipCurrentFace = true
 			end
 		end
 	end
@@ -1101,7 +1103,7 @@ function start.f_getCursorData(pn)
 end
 
 -- Reset cursor animation for a specific slot only
-local function resetCursorData(pn, store, param)
+local function resetCursorData(pn, param)
 	local pData = start.f_getCursorData(pn)
 	local cursorCfg = pData.cursor[param]
 	local key = start.c[pn].selX .. '-' .. start.c[pn].selY
@@ -1109,25 +1111,10 @@ local function resetCursorData(pn, store, param)
 	if cursorCfg[key] then
 		cursorParams = cursorCfg[key]
 	end
-	local src = cursorParams.AnimData
-	if not src then
-		return
-	end
-	store[pn] = store[pn] or {}
-	local cd = store[pn]
-	cd.animCache = cd.animCache or {}
-	local cache = cd.animCache[param]
-	if cache == nil or cache.src ~= src then
-		cache = {src = src, anim = animCopy(src)}
-		cd.animCache[param] = cache
-		if cache.anim then
-			animReset(cache.anim)
-			animUpdate(cache.anim)
-		end
-	end
-	if cache.anim then
-		animReset(cache.anim)
-		animUpdate(cache.anim)
+	local anim = cursorParams.AnimData
+	if anim then
+		animReset(anim)
+		animUpdate(anim)
 	end
 end
 
@@ -1294,16 +1281,6 @@ function start.f_drawCursor(pn, x, y, param, done)
 		params = pData.cursor[param][key]
 	end
 	local a = params.AnimData
-	cd.animCache = cd.animCache or {}
-	local cache = cd.animCache[param]
-	if cache == nil or cache.src ~= a then
-		cache = {src = a, anim = animCopy(a)}
-		cd.animCache[param] = cache
-		if cache.anim then
-			animReset(cache.anim)
-		end
-	end
-	a = cache.anim
 	animSetFacing(a, getCellFacing(params.facing, x, y))
 	local scale = getCellTransform(x, y, "scale", params.scale)
 	animSetScale(a, scale[1], scale[2])
@@ -1313,7 +1290,6 @@ function start.f_drawCursor(pn, x, y, param, done)
 	animSetYAngle(a, getCellTransform(x, y, "yangle", params.yangle))
 	animSetProjection(a, getCellTransform(x, y, "projection", params.projection))
 	animSetFocalLength(a, getCellTransform(x, y, "focallength", params.focallength))
-	animUpdate(a)
 	main.f_animPosDraw(a, cd.currentPos[1], cd.currentPos[2], getCellFacing(params.facing, x, y))
 end
 
@@ -1396,6 +1372,21 @@ function start.f_clearTimeText(text, totalSec)
 	return text:gsub('%%h', h):gsub('%%m', m):gsub('%%s', s):gsub('%%x', x)
 end
 
+local function getCharDefByName(name)
+	-- First, try the direct key
+	if main.t_charDef[name] ~= nil then
+		return main.t_charDef[name]
+	end
+	-- Search by the .def filename
+	for charDef, charIndex in pairs(main.t_charDef) do
+		local defName = charDef:match('([^/\\]+)%.def$')
+		if defName ~= nil and defName:lower() == name:lower() then
+			return charIndex
+		end
+	end
+	return nil
+end
+
 --returns formatted record text table
 function start.f_getRecordText()
 	local text = motif.select_info.record.text[gameMode()]
@@ -1415,8 +1406,9 @@ function start.f_getRecordText()
 	text = text:gsub('%%r', tostring(t.win))
 	--char name
 	local name = '?' --in case character being removed from roster
-	if main.t_charDef[t.chars[1]] ~= nil then
-		name = start.f_getCharData(main.t_charDef[t.chars[1]]).name
+	local charDef = getCharDefByName(t.chars[1])
+	if charDef ~= nil then
+		name = start.f_getCharData(charDef).name
 	end
 	text = text:gsub('%%c', name)
 	--player name
@@ -2261,9 +2253,13 @@ function launchFight(data)
 			end
 			cnt = cnt + 1
 			local ref = start.f_getCharRef(v)
+			local pal = t.p1pal
+			if type(pal) == 'table' then
+				pal = pal[cnt]
+			end
 			table.insert(start.p[1].t_selected, {
 				ref = ref,
-				pal = t.p1pal or start.f_selectPal(ref),
+				pal = pal or start.f_selectPal(ref),
 				pn = start.f_getPlayerNo(1, #start.p[1].t_selected + 1),
 				--cursor = {},
 			})
@@ -2281,9 +2277,13 @@ function launchFight(data)
 		for _, v in main.f_sortKeys(t.p2char) do
 			cnt = cnt + 1
 			local ref = start.f_getCharRef(v)
+			local pal = t.p2pal
+			if type(pal) == 'table' then
+				pal = pal[cnt]
+			end
 			table.insert(start.p[2].t_selected, {
 				ref = ref,
-				pal = t.p2pal or start.f_selectPal(ref),
+				pal = pal or start.f_selectPal(ref),
 				pn = start.f_getPlayerNo(2, #start.p[2].t_selected + 1),
 				--cursor = {},
 			})
@@ -2404,6 +2404,9 @@ function launchFight(data)
 		start.f_game(common)
 		clearColor(motif.selectbgdef.bgclearcolor[1], motif.selectbgdef.bgclearcolor[2], motif.selectbgdef.bgclearcolor[3])
 		if start.exit or start.characterchange then
+			if start.characterchange then
+				start.f_selectReset(false)
+			end
 			start.characterchange = false
 			break
 		-- here comes a new challenger
@@ -2635,6 +2638,19 @@ local function tickScreenDelay(side)
 	return false
 end
 
+-- Reset stage portrait animation data
+local function resetStagePortraitAnim(stageNo, subname)
+	local st = main.t_selStages[stageNo]
+	if not st then
+		return
+	end
+	local anim = st[subname]
+	if anim then
+		animReset(anim)
+		animUpdate(anim)
+	end
+end
+
 start.needUpdateDrawList = false
 function start.f_selectScreen()
 	if (not main.selectMenu[1] and not main.selectMenu[2]) or selScreenEnd then
@@ -2655,6 +2671,11 @@ function start.f_selectScreen()
 	local counter = 0 - motif.select_info.fadein.time
 	local timerReset = false
 	local stageTextData = motif.select_info.stage.active.TextSpriteData
+	local stageRef = main.t_selectableStages[stageListNo]
+
+	-- Reset stage portrait animation if it was already seen when entering the select screen
+	resetStagePortraitAnim(stageRef, 'anim_data')
+
 	-- generate team mode items table
 	for side = 1, 2 do
 		-- read display names for the current gameMode (or default)
@@ -2726,9 +2747,71 @@ function start.f_selectScreen()
 			animUpdate(item.anim)
 		end
 		batchDraw(staticDrawList)
-		--draw done cursors
+		--team and select menu
+		if blinkCount < motif.select_info.p2.cursor.switchtime then
+			blinkCount = blinkCount + 1
+		else
+			blinkCount = 0
+		end
+		local screenDelayInterrupted = false
 		for side = 1, 2 do
-			local persist = motif.select_info['p' .. side].cursor.persist 
+			if not start.p[side].teamEnd then
+				start.f_teamMenu(side, t_teamMenu[side])
+			elseif not start.p[side].selEnd then
+				--for each player with active controls
+				for k, v in ipairs(start.p[side].t_selCmd) do
+					local member = main.f_tableLength(start.p[side].t_selected) + k
+					local activeMember = true
+					if main.coop and (side == 1 or gameMode('versuscoop')) then
+						member = k
+						if motif.select_info.coopqueue then
+							activeMember = (k == main.f_tableLength(start.p[side].t_selected) + 1)
+						end
+					end
+					--member selection
+					local drawUpdateFlag
+					if activeMember then
+						v.selectState, drawUpdateFlag = start.f_selectMenu(side, v.cmd, v.player, member, v.selectState)
+					end
+					if drawUpdateFlag then
+						start.needUpdateDrawList = true
+					end
+					--draw active cursor
+					if activeMember then
+						if side == 2 and motif.select_info.p2.cursor.blink then
+							local sameCell = false
+							for _, v2 in ipairs(start.p[1].t_selCmd) do							
+								if start.c[v.player].cell == start.c[v2.player].cell and v.selectState == 0 and v2.selectState == 0 then
+									if blinkCount == 0 then
+										start.c[v.player].blink = not start.c[v.player].blink
+									end
+									sameCell = true
+									break
+								end
+							end
+							if not sameCell then
+								start.c[v.player].blink = false
+							end
+						end
+						local cursorState = 'active'
+						if v.selectState > 0 and motif.select_info.paletteselect > 0 then
+							local cursorData = motif.select_info['p' .. side].cursor
+							if cursorData.preview and cursorData.preview.default and 
+							(cursorData.preview.default.anim ~= -1 or cursorData.preview.default.spr[1] ~= -1) then
+							--cursorState when palmenu is active
+								cursorState = 'preview'
+							else
+								cursorState = 'done'
+							end
+						end
+						if v.selectState < 4 and start.f_selGrid(start.c[v.player].cell + 1).hidden ~= 1 and not start.c[v.player].blink then
+							start.f_drawCursor(v.player, start.c[v.player].selX, start.c[v.player].selY, cursorState, false)
+						end
+					end
+				end
+			end
+			--draw done cursors
+			local persist = motif.select_info['p' .. side].cursor.persist
 			local totalSelected = #start.p[side].t_selected
 			local drawnCells = {} -- Track drawn cells to avoid duplicates
 			for k, v in pairs(start.p[side].t_selected) do
@@ -2763,74 +2846,9 @@ function start.f_selectScreen()
 					end
 				end
 			end
-		end
-		--team and select menu
-		if blinkCount < motif.select_info.p2.cursor.switchtime then
-			blinkCount = blinkCount + 1
-		else
-			blinkCount = 0
-		end
-		local screenDelayInterrupted = false
-		for side = 1, 2 do
-			if not start.p[side].teamEnd then
-				start.f_teamMenu(side, t_teamMenu[side])
-			elseif not start.p[side].selEnd then
-				--for each player with active controls
-				for k, v in ipairs(start.p[side].t_selCmd) do
-					local member = main.f_tableLength(start.p[side].t_selected) + k
-					if main.coop and (side == 1 or gameMode('versuscoop')) then
-						member = k
-					end
-					--member selection
-					local drawUpdateFlag
-					v.selectState, drawUpdateFlag = start.f_selectMenu(side, v.cmd, v.player, member, v.selectState)
-					if drawUpdateFlag then
-						start.needUpdateDrawList = true
-					end
-					--draw active cursor
-					if side == 2 and motif.select_info.p2.cursor.blink then
-						local sameCell = false
-						for _, v2 in ipairs(start.p[1].t_selCmd) do							
-							if start.c[v.player].cell == start.c[v2.player].cell and v.selectState == 0 and v2.selectState == 0 then
-								if blinkCount == 0 then
-									start.c[v.player].blink = not start.c[v.player].blink
-								end
-								sameCell = true
-								break
-							end
-						end
-						if not sameCell then
-							start.c[v.player].blink = false
-						end
-					end
-					local cursorState = 'active'
-					if v.selectState > 0 and motif.select_info.paletteselect > 0 then
-						local cursorData = motif.select_info['p' .. side].cursor
-						if cursorData.preview and cursorData.preview.default and 
-						(cursorData.preview.default.anim ~= -1 or cursorData.preview.default.spr[1] ~= -1) then
-						--cursorState when palmenu is active
-							cursorState = 'preview'
-						else
-							cursorState = 'done'
-						end
-					end
-					if v.selectState < 4 and start.f_selGrid(start.c[v.player].cell + 1).hidden ~= 1 and not start.c[v.player].blink then
-						start.f_drawCursor(v.player, start.c[v.player].selX, start.c[v.player].selY, cursorState, false)
-					end
-				end
-			end
 			--delayed screen transition for the duration of face_done_anim or selection sound
 			if tickScreenDelay(side) then
 				screenDelayInterrupted = true
-			end
-			--exit select screen
-			for _, v in ipairs(start.p[side].t_selCmd) do
-				if not start.escFlag and (esc() or (getInput(v.cmd, motif.select_info.cancel.key) and not start.p[side].inPalMenu)) then
-					sndPlay(motif.Snd, motif.select_info.cancel.snd[1], motif.select_info.cancel.snd[2])
-					fadeOutInit(motif.select_info.fadeout.FadeData)
-					fadeOutStarted = true
-					start.escFlag = true
-				end
 			end
 			if start.p[side].inPalMenu then
 				local palActive = false
@@ -2844,6 +2862,17 @@ function start.f_selectScreen()
 				end
 				if not palActive then
 					start.p[side].inPalMenu = false
+				end
+			end
+		end
+		--exit select screen
+		for side = 1, 2 do
+			for _, v in ipairs(start.p[side].t_selCmd) do
+				if not start.escFlag and (esc() or (not start.p[side].inPalMenu and getInput(v.cmd, motif.select_info.cancel.key))) then
+					sndPlay(motif.Snd, motif.select_info.cancel.snd[1], motif.select_info.cancel.snd[2])
+					fadeOutInit(motif.select_info.fadeout.FadeData)
+					fadeOutStarted = true
+					start.escFlag = true
 				end
 			end
 		end
@@ -2893,7 +2922,7 @@ function start.f_selectScreen()
 					main.f_animPosDraw(motif.select_info.stage.portrait.random.AnimData)
 				--draw stage portrait loaded from stage SFF
 				else
-					local stageRef = main.t_selectableStages[stageListNo]
+					stageRef = main.t_selectableStages[stageListNo]
 					local portrait = motif.select_info.stage.portrait
 					local anim = main.t_selStages[stageRef].anim_data
 					local loadingPortrait = false
@@ -3449,6 +3478,7 @@ function start.f_palMenu(side, cmd, player, member, selectState)
 		selectState = 0
 		st.currentIdx = nil
 		st.validPals = nil
+		t_reservedChars[side][charRef] = nil
 		start.p[side].t_selTemp[member].slotConfirmed = false
 		sndPlay(motif.Snd, motif.select_info['p' .. side].palmenu.cancel.snd[1], motif.select_info['p' .. side].palmenu.cancel.snd[2])
 	end
@@ -3564,7 +3594,7 @@ function start.f_selectMenu(side, cmd, player, member, selectState)
 					start.p[side].t_selTemp[member].face_anim = pCfg.face.anim
 					start.p[side].t_selTemp[member].face2_anim = pCfg.face2.anim
 					if start.f_getCursorData(player).cursor.reset then
-						resetCursorData(player, cursorActive, 'active')
+						resetCursorData(player, 'active')
 					end
 					updateAnim = true
 				end
@@ -3640,11 +3670,14 @@ function start.f_selectMenu(side, cmd, player, member, selectState)
 						start.f_playWave(start.c[player].selRef, 'cursor', motif.select_info['p' .. side].select.snd[1], motif.select_info['p' .. side].select.snd[2])
 					end
 					if motif.select_info.paletteselect > 0 then
-						resetCursorData(player, cursorActive, 'done')
+						resetCursorData(player, 'done')
 					end
 					start.p[side].t_selTemp[member].pal = main.f_btnPalNo(cmd)
 					start.p[side].t_selTemp[member].inRandom = false
 					start.p[side].t_selTemp[member].slotConfirmed = true
+					if not gameOption('Options.Team.Duplicates') then
+						t_reservedChars[side][start.c[player].selRef] = true
+					end
 					if start.p[side].t_selTemp[member].pal == nil or start.p[side].t_selTemp[member].pal == 0 then
 						start.p[side].t_selTemp[member].pal = 1
 					end
@@ -3988,6 +4021,9 @@ function start.f_selectVersus(active, t_orderSelect, loadStartArg)
 	local readyToLeave = not bgLoading
 	local wantSkip = false
 	local wantDone = false
+	
+	-- Reset stage portrait animation if it was already seen when entering the VS screen
+	resetStagePortraitAnim(selStageNo, 'vs_anim_data')
 
 	-- Background loading: start async loader immediately.
 	if bgLoading then

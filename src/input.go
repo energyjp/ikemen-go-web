@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"strings"
-
 )
 
 var ModAlt ModifierKey
@@ -112,6 +111,49 @@ func OnKeyReleased(key Key, mk ModifierKey) {
 	}
 }
 
+// allowShortcut reports whether a registered hotkey may fire right now.
+// Extracted from the key handler so the netplay invariant below is assertable
+// in a test rather than only readable in a loop condition.
+//
+// ROLLBACK MUST BE BLOCKED HERE TOO. `netConnection` is the DELAY
+// netcode's connection and is nil under rollback, so this guard let
+// every debug hotkey through in a rollback match - and rollback is
+// the default netcode. Every script in debug.lua mutates game state
+// on ONE peer only: F4 is `resetRound()`, which resets the timer to
+// maxRoundTime, restores both lives, sends both chars to state 5900
+// and zeroes the score, while the opponent keeps playing. That is an
+// instant, total, unrecoverable desync, and it is exactly what the
+// 2026-08-28 Kira-vs-Kira dumps showed: one peer at rs0 with
+// crt=5940 and sp=0/0, the other still in the win pose at rs4.
+//
+// F4 is not the only one. SPACE restores full life, F1/F2 kill
+// players, F3 maxes power, F5 zeroes the timer, and F9/F10/PAUSE/
+// SCROLLLOCK (loadState/saveState/togglePause/frameStep) are
+// debugOnly=false, so AllowDebugKeys does not gate them at all -
+// this guard was their ONLY protection.
+//
+// Worse, the win-pose skip is disabled under rollback (system.go),
+// so players mash keys through exactly the transition window where
+// these fire. That is why it kept landing on "round over / win pose".
+//
+// replayFile is left as it was: a replay viewer legitimately wants
+// pause and frame-step, and it has no peer to desync from.
+func (s *System) allowShortcut(v *ShortcutScript) bool {
+	if s.motif.me.active {
+		return false
+	}
+	// ANY live peer session. netConnection is DELAY only; rollback.session is
+	// the rollback one and is the default netcode.
+	if s.netConnection != nil || s.rollback.session != nil {
+		return false
+	}
+	if s.replayFile != nil && v.DebugKey {
+		return false
+	}
+	//if s.paused && !s.frameStepFlag && !v.Pause { return false }
+	return s.cfg.Debug.AllowDebugKeys || !v.DebugKey
+}
+
 func OnKeyPressed(key Key, mk ModifierKey) {
 	if key != KeyUnknown {
 		// Treat sys.keyInput as edge-triggered. Ignore repeats.
@@ -120,12 +162,18 @@ func OnKeyPressed(key Key, mk ModifierKey) {
 		}
 		sys.keyState[key] = true
 		sys.keyInput = key
-		sys.escPending = sys.escPending ||
-			key == KeyEscape && (mk&ModCtrlAlt) == 0
+		escPressed := key == KeyEscape && (mk&ModCtrlAlt) == 0
+		// Browser key events land between frames, so this only LATCHES:
+		// eventUpdate() turns the latch into sys.esc once per frame. A direct
+		// write here would be reset before anything read it.
+		sys.escPending = sys.escPending || escPressed
+		// Upstream #2131: an Esc that lands on a non-tick frame would otherwise
+		// be cleared before the tick-gated fight code reads it, so it is also
+		// deferred to the next UI tick (uiAction). Its own field on purpose -
+		// upstream called it escPending too, with the semantics above.
+		sys.escDeferred = sys.escDeferred || (sys.gameRunning && escPressed)
 		for k, v := range sys.shortcutScripts {
-			if !sys.motif.me.active && sys.netConnection == nil && (sys.replayFile == nil || !v.DebugKey) &&
-				//(!sys.paused || sys.frameStepFlag || v.Pause) &&
-				(sys.cfg.Debug.AllowDebugKeys || !v.DebugKey) {
+			if sys.allowShortcut(v) {
 				v.ActivatePending = v.ActivatePending || k.Test(key, mk)
 			}
 		}

@@ -135,7 +135,7 @@ type backGround struct {
 	layerno               int32
 	autoresizeparallax    bool
 	autoresizeparallaxSet bool
-	notmaskwindow         int32
+	hasMaskwindow         bool
 	startrect             [4]int32
 	windowdelta           [2]float32
 	scalestart            [2]float32
@@ -192,6 +192,7 @@ func readBackGround(is IniSection, link *backGround,
 	case 'V', 'v':
 		bg._type = BG_Video
 		bg.video = &bgVideo{}
+		bg.anim.mask = 0
 	case 'D', 'd':
 		bg._type = BG_Dummy
 	default:
@@ -281,7 +282,7 @@ func readBackGround(is IniSection, link *backGround,
 				bg.anim = a
 				hasAnim = true
 			} else {
-				return nil, Error(fmt.Sprint("Missing action: %d", bg.actionno))
+				return nil, Error(fmt.Sprintf("Invalid BG action: %d", bg.actionno))
 			}
 		}
 		if hasAnim {
@@ -433,17 +434,12 @@ func readBackGround(is IniSection, link *backGround,
 			}
 		}
 	}
-	if is.readI32ForStage("window", &bg.startrect[0], &bg.startrect[1],
+	// Unusually, Mugen only accepts these when they do have at least 4 values
+	is.readI32ForStageMinLength("window", &bg.startrect[0], &bg.startrect[1],
+		&bg.startrect[2], &bg.startrect[3])
+	if is.readI32ForStageMinLength("maskwindow", &bg.startrect[0], &bg.startrect[1],
 		&bg.startrect[2], &bg.startrect[3]) {
-		bg.startrect[2] = Max(0, bg.startrect[2]+1-bg.startrect[0])
-		bg.startrect[3] = Max(0, bg.startrect[3]+1-bg.startrect[1])
-		bg.notmaskwindow = 1
-	}
-	if is.readI32ForStage("maskwindow", &bg.startrect[0], &bg.startrect[1],
-		&bg.startrect[2], &bg.startrect[3]) {
-		bg.startrect[2] = Max(0, bg.startrect[2]-bg.startrect[0])
-		bg.startrect[3] = Max(0, bg.startrect[3]-bg.startrect[1])
-		bg.notmaskwindow = 0
+		bg.hasMaskwindow = true
 	}
 	is.readF32ForStage("windowdelta", &bg.windowdelta[0], &bg.windowdelta[1])
 	is.ReadI32("id", &bg.id)
@@ -613,7 +609,18 @@ func (bg backGround) draw(pos [2]float32, drawscl, bgscl, stglscl float32,
 	}
 	// Calculate Y scaling based on vertical scroll position and delta
 	ys2 := bg.scaledelta[1] * pos[1] * bg.delta[1] * bgscl / drawscl / stgscl[1]
-	ys := ((100-(pos[1]-positiveBoundhigh)*bg.yscaledelta)*bgscl/bg.yscalestart)*bg.scalestart[1] + ys2
+	// MUGEN calculates stages yscaledelta using a reciprocal scale factor.
+	// The previous linear formula caused noticeable vertical scaling differences
+	// at certain camera positions, especially at 4:3 resolutions.
+	// https://github.com/ikemen-engine/Ikemen-GO/issues/1054
+	ysdelta := bg.yscalestart + bg.yscaledelta*(pos[1]-positiveBoundhigh)
+
+	// Prevent yscaledelta from flipping the sign of yscalestart
+	if bg.yscalestart*ysdelta < 0 {
+		ysdelta = -ysdelta
+	}
+
+	ys := (100/ysdelta)*bg.scalestart[1]*bgscl + ys2
 	xs := bg.scaledelta[0] * pos[0] * bg.delta[0] * bgscl / stgscl[0]
 	x *= bgscl
 
@@ -641,14 +648,27 @@ func (bg backGround) draw(pos [2]float32, drawscl, bgscl, stglscl float32,
 		}
 	}
 
-	// Calculate window top left corner position
-	rect := bg.startrect
+	// Convert the window's raw (x1,y1,x2,y2) corners into (x1,y1,width,height)
+	// With "window" (x2,y2) is inclusive, but with "maskwindow" it's exclusive
+	rect := NormalizeRect(bg.startrect)
+	if !bg.hasMaskwindow {
+		rect[2] = Max(0, rect[2]-rect[0]+1)
+		rect[3] = Max(0, rect[3]-rect[1]+1)
+	} else {
+		rect[2] = Max(0, rect[2]-rect[0])
+		rect[3] = Max(0, rect[3]-rect[1])
+	}
 
-	startrect0 := float32(rect[0]) - (pos[0])/stgscl[0]*bg.windowdelta[0] +
-		(sys.gameWidth/2/sclx - float32(bg.notmaskwindow)*(sys.gameWidth/2)*(1/lscl[0]))
+	// "window" is relative to top-left of screen. "maskwindow" to top-center
+	startrect0 := float32(rect[0]) - pos[0]/stgscl[0]*bg.windowdelta[0] + sys.gameWidth/2/sclx
+	if !bg.hasMaskwindow {
+		startrect0 -= sys.gameWidth / 2 / lscl[0]
+	}
+
 	startrect0 *= sys.widthScale * wscl[0]
+
+	// Motif x coordinates start from left edge of screen
 	if !isStage && wscl[0] == 1 {
-		// Screenpacks X coordinates start from left edge of screen
 		startrect0 += float32(sys.gameWidth-320) / 2 * sys.widthScale
 	}
 
@@ -667,6 +687,16 @@ func (bg backGround) draw(pos [2]float32, drawscl, bgscl, stglscl float32,
 	rect[1] = int32(math.Floor(float64(startrect1)))
 	rect[2] = int32(math.Floor(float64(startrect0 + (float32(rect[2]) * sys.widthScale * wscl[0]) - float32(rect[0]))))
 	rect[3] = int32(math.Floor(float64(startrect1 + (float32(rect[3]) * sys.heightScale * wscl[1]) - float32(rect[1]))))
+
+	// Stage BG windows are relative to the fight viewport.
+	// Offset and clip them when composing at full resolution.
+	if isStage {
+		if viewport, ok := sys.fightDrawClip(); ok {
+			rect[0] += viewport[0] - sys.scrrect[0]
+			rect[1] += viewport[1] - sys.scrrect[1]
+			rect = intersectRect(rect, viewport)
+		}
+	}
 
 	// Render background if it's within the screen area
 	if rect[0] < sys.scrrect[2] && rect[1] < sys.scrrect[3] && rect[0]+rect[2] > 0 && rect[1]+rect[3] > 0 {
@@ -706,17 +736,20 @@ func (bg backGround) draw(pos [2]float32, drawscl, bgscl, stglscl float32,
 			xsoffset /= bg.rot.angle
 		}
 
-		// Choose render origin: top-left for screenpack/storyboard videos, center for everything else
+		// Choose render origin: top-left for motif/storyboard videos, center for everything else
 		var rcx float32
 		if bg._type != BG_Video || isStage {
 			rcx = sys.gameWidth / 2
 		}
 
+		stackedPfx := bg.palfx.withStacked(sys.bgPalFX, bg.anim.transType,
+			[2]int32{int32(bg.anim.srcAlpha), int32(bg.anim.dstAlpha)})
+
 		bg.anim.Draw(&rect, x-xsoffset, y, sclx, scly,
 			bg.xscale[0]*bgscl*(scalestartX+xs)*xs3,
 			xbs*bgscl*(scalestartX+xs)*xs3,
 			ys*ys3, xras*x/(Abs(ys*ys3)*lscl[1]*float32(bg.anim.spr.Size[1])*bg.scalestart[1])*sclx_recip*bg.scalestart[1]-bg.xshear,
-			bg.rot, rcx, bg.palfx, 1, [2]float32{1, 1}, int32(bg.projection), bg.fLength, 0, false, CustomShaderRenderData{})
+			bg.rot, rcx, stackedPfx, 1, [2]float32{1, 1}, int32(bg.projection), bg.fLength, 0, false, CustomShaderRenderData{})
 	}
 }
 
@@ -935,6 +968,7 @@ type Stage struct {
 	music           Music
 	bgmState        BGMState
 	bgmratio        float32
+	bgmtrigger      int32
 	constants       map[string]float32
 	partnerspacing  int32
 	ikemenver       [3]uint16
@@ -961,6 +995,7 @@ func newStage(def string) *Stage {
 		stageCamera:    *newStageCamera(),
 		music:          make(Music),
 		bgmratio:       0.3,
+		bgmtrigger:     0,
 		constants:      make(map[string]float32),
 		partnerspacing: 25,
 	}
@@ -977,6 +1012,30 @@ func newStage(def string) *Stage {
 	s.p[1].startx = 70
 	s.stageprops = newStageProps()
 	return s
+}
+
+// stageSectionText returns one section of a stage file - its header and the
+// lines up to the next header - as text of its own, for a parser that should
+// not see the rest of the file. Section names compare case-insensitively.
+func stageSectionText(lines []string, name string) string {
+	var b strings.Builder
+	in := false
+	for _, ln := range lines {
+		trimmed := strings.TrimSpace(ln)
+		if strings.HasPrefix(trimmed, "[") {
+			if in {
+				break
+			}
+			if end := strings.Index(trimmed, "]"); end > 0 && strings.EqualFold(strings.TrimSpace(trimmed[1:end]), name) {
+				in = true
+			}
+		}
+		if in {
+			b.WriteString(ln)
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
 }
 
 func loadStage(def string, maindef bool) (*Stage, error) {
@@ -1264,20 +1323,30 @@ func loadStage(def string, maindef bool) (*Stage, error) {
 
 	// Music group
 	if sec, secName := getSection("music"); sec != nil {
-		iniFile, err := LoadINIText(str, ini.LoadOptions{
+		sec.ReadF32("bgmratio", &s.bgmratio)
+		sec.ReadI32("bgmtrigger", &s.bgmtrigger)
+		// The INI library reads only the [Music] section's own lines. Handed the
+		// whole stage file it applied its rules to every other section too, and
+		// a line MUGEN shrugs off - name = """; in [Info] opens a triple-quoted
+		// value that never closes - failed the entire stage load. And whatever
+		// the library still cannot read costs the stage its music list, never
+		// the stage.
+		iniFile, err := LoadINIText(stageSectionText(lines, secName), ini.LoadOptions{
 			Insensitive:             true,
 			SkipUnrecognizableLines: true,
 		})
-
 		if err != nil {
-			fmt.Printf("Failed to load INI file: %v\n", err)
-			return nil, err
+			sys.appendToConsole(s.warn() + fmt.Sprintf("[%s] could not be read, stage music ignored: %v", secName, err))
+		} else {
+			s.music = parseMusicSection(iniFile.Section(secName))
+			s.music.DebugDump(fmt.Sprintf("Stage %s [%s]", def, secName))
 		}
-
-		sec.ReadF32("bgmratio", &s.bgmratio)
-		s.music = parseMusicSection(iniFile.Section(secName))
-		s.music.DebugDump(fmt.Sprintf("Stage %s [%s]", def, secName))
 	}
+
+	// Set when the def names a model the stage plays without (below): the
+	// renderer cannot draw one, or the model file failed to load. The stage
+	// still needs the ground line the model would have given it.
+	modelSkipped := false
 
 	// BGDef group
 	if sec, _ := getSection("bgdef"); sec != nil {
@@ -1297,27 +1366,38 @@ func loadStage(def string, maindef bool) (*Stage, error) {
 			return nil, err
 		}
 		if err = sec.LoadFile("model", []string{def, "", "data/"}, "", func(filename string) error {
-			// Renderer without a 3D pipeline (the browser build): skip the
+			// 3D models were not available before Ikemen 1.0, therefore we assume that's the minimum correct version for the stage.
+			// Set before the model loads, so it is the same whether or not
+			// this renderer draws it: characters read it (StageVar
+			// info.ikemenversion), and two netplay peers must agree.
+			if s.ikemenver[0] == 0 && s.ikemenver[1] == 0 {
+				s.ikemenver[0] = 1
+				s.ikemenver[1] = 0
+			}
+			// Renderer without a 3D pipeline (3D Model off, or a browser whose
+			// WebGL could not set the model pipeline up): skip the
 			// model but keep the stage's 2D layers, instead of failing the
 			// whole stage load and taking the match down with it.
 			if !gfx.IsModelEnabled() {
 				LogMessage("Stage model skipped (renderer has no 3D support): %v", filename)
+				modelSkipped = true
 				return nil
 			}
+			// A model that cannot be loaded (missing file, broken glTF, an
+			// image that does not decode) is skipped the same way: the stage
+			// plays on its 2D layers. Upstream fails the whole stage load
+			// here, which in the browser is an engine panic.
 			model, err := loadglTFModel(filename)
 			if err != nil {
-				return err
+				LogMessage("Stage model failed to load, skipped: %v: %v", filename, err)
+				modelSkipped = true
+				return nil
 			}
 			s.model = &Model{}
 			*s.model = *model
 			s.model.pfx = newPalFX()
 			s.model.pfx.clear()
 			s.model.pfx.time = -1
-			// 3D models were not available before Ikemen 1.0, therefore we assume that's the minimum correct version for the stage
-			if s.ikemenver[0] == 0 && s.ikemenver[1] == 0 {
-				s.ikemenver[0] = 1
-				s.ikemenver[1] = 0
-			}
 			return nil
 		}); err != nil {
 			return nil, err
@@ -1327,24 +1407,42 @@ func loadStage(def string, maindef bool) (*Stage, error) {
 		sec.ReadBool("roundpos", &s.stageprops.roundpos)
 	}
 
-	// Model group. s.model is nil when the model file failed to load or the
-	// renderer has no 3D pipeline (browser build) - the section only
-	// configures the model, so with no model there is nothing to configure.
-	if sec, _ := getSection("model"); sec != nil && s.model != nil {
+	// The camera of a stage that names a model. The def's zoffset is a
+	// placeholder on such a stage: the engine derives the real one from
+	// [Model] offset and the camera's fov and yshift. Upstream does that only
+	// once the model has loaded; a model stage without its model then kept
+	// the placeholder, and the fighters stood 180 px under the bottom edge of
+	// a 480-high stage whose def says zoffset = 660. Computed here from the
+	// def alone, for a model drawn, skipped by the renderer or failed to load
+	// alike: zoffset is simulation state (the camera, StageVar
+	// stageinfo.zoffset), so two netplay peers must agree whatever their
+	// renderers do. Only when the offset and fov give it a depth to work with
+	// (upstream divides by zero there); otherwise the def's own zoffset stays.
+	var modelOffset [3]float32
+	if sec, _ := getSection("model"); sec != nil && (s.model != nil || modelSkipped) {
 		if str, ok := sec["offset"]; ok {
 			for k, v := range SplitAndTrim(str, ",") {
-				if k >= len(s.model.offset) {
+				if k >= len(modelOffset) {
 					break
 				}
-				if v, err := strconv.ParseFloat(v, 32); err == nil {
-					s.model.offset[k] = float32(v)
+				if f, err := strconv.ParseFloat(v, 32); err == nil {
+					modelOffset[k] = float32(f)
 				} else {
 					break
 				}
 			}
 		}
-		posMul := float32(math.Tan(float64(s.stageCamera.fov*math.Pi/180)/2)) * -s.model.offset[2] / (float32(s.stageCamera.localcoord[1]) / 2)
-		s.stageCamera.zoffset = int32(float32(s.stageCamera.localcoord[1])/2 - s.model.offset[1]/posMul - s.stageCamera.yshift*float32(sys.scrrect[3]/2)/float32(sys.gameHeight)*float32(s.stageCamera.localcoord[1])/sys.heightScale)
+		posMul := float32(math.Tan(float64(s.stageCamera.fov*math.Pi/180)/2)) * -modelOffset[2] / (float32(s.stageCamera.localcoord[1]) / 2)
+		if posMul != 0 {
+			s.stageCamera.zoffset = int32(float32(s.stageCamera.localcoord[1])/2 - modelOffset[1]/posMul - s.stageCamera.yshift*float32(sys.scrrect[3]/2)/float32(sys.gameHeight)*float32(s.stageCamera.localcoord[1])/sys.heightScale)
+		}
+	}
+
+	// Model group. s.model is nil when the model file failed to load or the
+	// renderer has no 3D pipeline (see the model LoadFile above) - the section only
+	// configures the model, so with no model there is nothing to configure.
+	if sec, _ := getSection("model"); sec != nil && s.model != nil {
+		s.model.offset = modelOffset
 		if str, ok := sec["scale"]; ok {
 			for k, v := range SplitAndTrim(str, ",") {
 				if k >= len(s.model.scale) {
@@ -1358,9 +1456,13 @@ func loadStage(def string, maindef bool) (*Stage, error) {
 			}
 		}
 		if err = sec.LoadFile("environment", []string{def, "", "data/"}, "", func(filename string) error {
+			// An environment that cannot be loaded leaves the model without
+			// environment lighting (unlit unless it has lights), instead of
+			// failing the stage load.
 			env, err := loadEnvironment(filename)
 			if err != nil {
-				return err
+				LogMessage("Stage environment failed to load, skipped: %v: %v", filename, err)
+				return nil
 			}
 			var intensity float32
 			if sec.ReadF32("environmentintensity", &intensity) {
@@ -1382,8 +1484,13 @@ func loadStage(def string, maindef bool) (*Stage, error) {
 		var r, g, b int32
 		sec.readI32ForStage("color", &r, &g, &b)
 		r, g, b = Clamp(r, 0, 255), Clamp(g, 0, 255), Clamp(b, 0, 255)
-		// Disable color parameter specifically in Mugen 1.1 stages
-		if s.ikemenver[0] == 0 && s.ikemenver[1] == 0 && s.mugenver[0] == 1 && s.mugenver[1] == 1 {
+		// MUGEN 1.1 reads [Shadow] color and then ignores it: a 1.1 stage gets its
+		// shadow from intensity alone. Almost no stage from a 1.1 build declares
+		// mugenversion, and without that line the color is subtracted from the
+		// floor instead - 80,80,80 (or the 256,256,256 several packs ship) turns
+		// the shadow into a hard black slab. Only a stage that names a pre-1.1
+		// MUGEN keeps the parameter.
+		if s.ikemenver[0] == 0 && s.ikemenver[1] == 0 && (s.mugenver[0] != 1 || s.mugenver[1] >= 1) {
 			r, g, b = 0, 0, 0
 		}
 		s.sdw.color = uint32(r<<16 | g<<8 | b)
@@ -1406,6 +1513,7 @@ func loadStage(def string, maindef bool) (*Stage, error) {
 			}
 		}
 		sec.readF32ForStage("offset", &s.sdw.offset[0], &s.sdw.offset[1])
+		// TODO: This should probably require 4 values
 		sec.readF32ForStage("window", &s.sdw.window[0], &s.sdw.window[1], &s.sdw.window[2], &s.sdw.window[3])
 		sec.ReadF32("ydelta", &s.sdw.ydelta)
 		// Shadow group warnings
@@ -1448,6 +1556,7 @@ func loadStage(def string, maindef bool) (*Stage, error) {
 			}
 		}
 		sec.readF32ForStage("offset", &s.reflection.offset[0], &s.reflection.offset[1])
+		// TODO: This should probably require 4 values
 		sec.readF32ForStage("window", &s.reflection.window[0], &s.reflection.window[1], &s.reflection.window[2], &s.reflection.window[3])
 		sec.ReadF32("ydelta", &s.reflection.ydelta)
 	}
@@ -1477,7 +1586,14 @@ func loadStage(def string, maindef bool) (*Stage, error) {
 		}
 	}
 
+	// A [BGCtrl] above the first [BGCtrlDef] still belongs to a group in MUGEN:
+	// the implicit one, which - like a [BGCtrlDef] without ctrlID - controls every
+	// background element. Starting from an empty group made such a controller
+	// control nothing. Stage packs use exactly that, a lone PosSet before [BGDef],
+	// to lift the whole background into place; without it the art sits hundreds
+	// of pixels low and the fighters stand above the floor painted for them.
 	bgcdef := *newBgCtrl()
+	bgcdef.bg = append(bgcdef.bg, s.bg...)
 	lnidx := 0
 	for lnidx < len(lines) {
 		is, name, _ := ReadIniSection(lines, &lnidx)
@@ -1815,7 +1931,7 @@ func (s *Stage) action() {
 		s.bga.action(true)
 
 		if s.model != nil {
-			s.model.step(sys.turbo)
+			s.model.step()
 		}
 	}
 
@@ -1861,50 +1977,20 @@ func (s *Stage) action() {
 // Currently this function only exists so that the stage update sequence is similar to others. In the future it could run more tasks
 // Doing this allows characters to see "stageTime = 0"
 func (s *Stage) tick() {
+	if s.paused() {
+		return
+	}
 
 	// Update BG elements
+	// These are from the stage BG's own PalFX, so we'll make them respect stage pause
 	for _, b := range s.bg {
 		b.palfx.step()
-
-		// BGPalFX can step even if the stage is paused
-		if sys.bgPalFX.enable {
-			// TODO: Finish proper synthesization of bgPalFX into PalFX from bg element
-			// (Right now, bgPalFX just overrides all unique parameters from BG Elements' PalFX)
-			// for j := 0; j < 3; j++ {
-			// if sys.bgPalFX.invertall {
-			// b.palfx.eAdd[j] = -b.palfx.add[j] * (b.palfx.mul[j]/256) + 256 * (1-(b.palfx.mul[j]/256))
-			// b.palfx.eMul[j] = 256
-			// }
-			// b.palfx.eAdd[j] = int32((float32(b.palfx.eAdd[j])) * sys.bgPalFX.eColor)
-			// b.palfx.eMul[j] = int32(float32(b.palfx.eMul[j]) * sys.bgPalFX.eColor + 256*(1-sys.bgPalFX.eColor))
-			// }
-			// b.palfx.synthesize(sys.bgPalFX)
-			b.palfx.eAdd = sys.bgPalFX.eAdd
-			b.palfx.eMul = sys.bgPalFX.eMul
-			b.palfx.eColor = sys.bgPalFX.eColor
-			b.palfx.eHue = sys.bgPalFX.eHue
-			b.palfx.eInvertall = sys.bgPalFX.eInvertall
-			b.palfx.eInvertblend = sys.bgPalFX.eInvertblend
-			b.palfx.eAllowNeg = sys.bgPalFX.eAllowNeg
-		}
 	}
 
 	// Update model PalFX
+	// This seems to be unused right now. But it can still stack with BGPalFX later
 	if s.model != nil {
 		s.model.pfx.step()
-		if sys.bgPalFX.enable {
-			s.model.pfx.eAdd = sys.bgPalFX.eAdd
-			s.model.pfx.eMul = sys.bgPalFX.eMul
-			s.model.pfx.eColor = sys.bgPalFX.eColor
-			s.model.pfx.eHue = sys.bgPalFX.eHue
-			s.model.pfx.eInvertall = sys.bgPalFX.eInvertall
-			s.model.pfx.eInvertblend = sys.bgPalFX.eInvertblend
-			s.model.pfx.eAllowNeg = sys.bgPalFX.eAllowNeg
-		}
-	}
-
-	if s.paused() {
-		return
 	}
 
 	// Stage time must be incremented after updating BGCtrl's
@@ -1955,12 +2041,18 @@ func (s *Stage) draw(layer int32, x, y, scl float32) {
 		}
 	}
 	pos[0] += ofs[0] / scl2
-	if !sys.cam.ZoomEnable {
-		for i, p := range pos {
-			pos[i] = float32(math.Ceil(float64(p - 0.5)))
-		}
-	}
+
+	// Mugen doesn't seem to do this sort of snapping
+	// Perhaps this was trying to emulate Winmugen's low resolution
+	// https://github.com/ikemen-engine/Ikemen-GO/issues/2878
+	//if !sys.cam.zoomEnabled() {
+	//	for i, p := range pos {
+	//		pos[i] = float32(math.Ceil(float64(p - 0.5)))
+	//	}
+	//}
+
 	s.drawModel(pos, ofs[1], scl, layer)
+
 	for _, b := range s.bg {
 		// Draw only when visible and enabled.
 		if b.layerno == layer && b.visible && b.enabled && (b.anim.spr != nil || b._type == BG_Video) {

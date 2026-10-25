@@ -73,6 +73,7 @@ LIBDIR="lib"         # runtime libs live here at repo root
 BUILDDIR="build"
 DELAYLIB_DIR="$BUILDDIR/delaylib"
 FFMPEG_SRCDIR="$BUILDDIR/ffmpeg-src"
+LIBVPX_SRCDIR="$BUILDDIR/libvpx-src"
 
 # Screenpack assets
 SCREENPACK_REPO="${SCREENPACK_REPO:-https://github.com/ikemen-engine/Ikemen-GO-Screenpack.git}"
@@ -92,6 +93,9 @@ FFMPEG_REV="${FFMPEG_REV:-release/7.1}"
 # Always default to build/ffmpeg under the repo root (absolute path).
 FFMPEG_PREFIX="${FFMPEG_PREFIX:-$REPO_ROOT/$BUILDDIR/ffmpeg}"
 BUILD_FFMPEG="${BUILD_FFMPEG:-auto}"   # auto|yes|no
+LIBVPX_REV="${LIBVPX_REV:-v1.15.2}"
+LIBVPX_PREFIX="${LIBVPX_PREFIX:-$FFMPEG_PREFIX}"
+FFMPEG_REBUILT=0
 
 # ---- App metadata (overridden by CI)
 APP_VERSION="${APP_VERSION:-nightly}"
@@ -456,7 +460,7 @@ function varAndroid() {
 	export ANDROID_DEPS_PATH="$REPO_ROOT/build/android-deps"
 	# Force pkg-config to ONLY look at the Android libraries
 	export PKG_CONFIG_LIBDIR="$ANDROID_DEPS_PATH/lib/pkgconfig"
-	export PKG_CONFIG_SYSROOT_DIR="$ANDROID_DEPS_PATH"
+	unset PKG_CONFIG_SYSROOT_DIR
 	# Ensure we don't pick up host libraries by clearing this
 	export PKG_CONFIG_PATH=""
 	binName="libmain.so"
@@ -466,6 +470,11 @@ function varAndroid() {
 function have_ffmpeg_pc() {
 	local pc="${PKG_CONFIG:-pkg-config}"
 	$pc --exists libavformat libavcodec libavutil libswresample libswscale libavfilter 2>/dev/null
+}
+
+function have_libvpx_pc() {
+	local pc="${PKG_CONFIG:-pkg-config}"
+	$pc --exists vpx 2>/dev/null
 }
 
 function ensure_pkg_config_path() {
@@ -478,10 +487,93 @@ function ensure_pkg_config_path() {
 	fi
 }
 
+function build_libvpx() {
+	local prefix="$LIBVPX_PREFIX"
+	if [[ "$GOOS" == "android" ]]; then
+		prefix="$ANDROID_DEPS_PATH"
+	fi
+
+	if [[ -f "$prefix/lib/pkgconfig/vpx.pc" ]]; then
+		#echo "==> Found local libvpx in $prefix"
+		if [[ "$GOOS" != "android" ]]; then
+			export PKG_CONFIG_PATH="$prefix/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+		fi
+		return 0
+	fi
+
+	echo "==> Building decoder-only libvpx $LIBVPX_REV to $prefix"
+	if [[ ! -d "$LIBVPX_SRCDIR/.git" ]]; then
+		rm -rf "$LIBVPX_SRCDIR"
+		git clone --depth=1 -b "$LIBVPX_REV" https://github.com/webmproject/libvpx.git "$LIBVPX_SRCDIR"
+	fi
+
+	local arch="${GOARCH:-amd64}"
+	local target
+	case "$GOOS/$arch" in
+		windows/amd64) target="x86_64-win64-gcc" ;;
+		windows/386) target="x86-win32-gcc" ;;
+		darwin/amd64) target="x86_64-darwin20-gcc" ;;
+		darwin/arm64) target="arm64-darwin20-gcc" ;;
+		linux/amd64) target="x86_64-linux-gcc" ;;
+		linux/arm64) target="arm64-linux-gcc" ;;
+		android/arm64) target="arm64-android-gcc" ;;
+		*)
+			echo "ERROR: Unsupported libvpx target: $GOOS/$arch" >&2
+			return 1
+			;;
+	esac
+
+	local build_dir="$LIBVPX_SRCDIR/build-$GOOS-$arch"
+	rm -rf "$build_dir"
+	mkdir -p "$build_dir"
+	pushd "$build_dir" >/dev/null
+
+	local configure_args=(
+		"--prefix=$prefix"
+		"--target=$target"
+		"--enable-pic"
+		"--enable-static" "--disable-shared"
+		"--disable-examples" "--disable-tools" "--disable-docs" "--disable-unit-tests"
+		"--disable-install-bins" "--disable-install-docs"
+		"--disable-vp8-encoder" "--disable-vp9-encoder"
+		"--enable-vp8-decoder" "--enable-vp9-decoder"
+		"--disable-webm-io"
+	)
+
+	if [[ "$GOOS" == "android" ]]; then
+		CC="$CC" CXX="$CXX" \
+			AR="$TOOLCHAIN/bin/llvm-ar" LD="$CC" STRIP="$TOOLCHAIN/bin/llvm-strip" \
+			../configure "${configure_args[@]}"
+	else
+		CC="${CC:-cc}" CXX="${CXX:-c++}" ../configure "${configure_args[@]}"
+	fi
+
+	make -j"$(getconf _NPROCESSORS_ONLN || echo 2)"
+	make install
+	popd >/dev/null
+
+	if [[ "$GOOS" != "android" ]]; then
+		export PKG_CONFIG_PATH="$prefix/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+	fi
+	if ! have_libvpx_pc; then
+		echo "ERROR: libvpx pkg-config file is not visible after build." >&2
+		return 1
+	fi
+}
+
 function build_ffmpeg() {
-	# check $FFMPEG_SRCDIR first so we don't build if sources are already there (e.g. from a previous build or manual clone)
-	if [[ -d "$FFMPEG_SRCDIR" ]]; then
-		echo "==> FFmpeg sources already exist in $FFMPEG_SRCDIR, skipping clone and build (delete that directory to force rebuild)"
+	# WebM alpha is stored as a second VP8/VP9 payload. FFmpeg's libvpx
+	# wrappers decode that payload; the native vp8/vp9 decoders do not.
+	build_libvpx
+
+	local ffmpeg_pc="$FFMPEG_PREFIX/lib/pkgconfig/libavcodec.pc"
+	if [[ "$GOOS" == "android" ]]; then
+		ffmpeg_pc="$ANDROID_DEPS_PATH/lib/pkgconfig/libavcodec.pc"
+	fi
+	if [[ -f "$ffmpeg_pc" && -f "$FFMPEG_SRCDIR/config_components.h" ]] &&
+		grep -q '^#define CONFIG_LIBVPX_VP8_DECODER 1' "$FFMPEG_SRCDIR/config_components.h" &&
+		grep -q '^#define CONFIG_LIBVPX_VP9_DECODER 1' "$FFMPEG_SRCDIR/config_components.h"; then
+		#echo "==> Alpha-capable FFmpeg already exists in $FFMPEG_PREFIX, skipping rebuild"
 		ensure_pkg_config_path
 		return 0
 	fi
@@ -519,9 +611,10 @@ function build_ffmpeg() {
 			"--disable-autodetect"
 			"--enable-avformat" "--enable-avcodec" "--enable-avutil" "--enable-swresample" "--enable-swscale"
 			"--enable-avfilter" "--enable-filter=buffer,buffersink,format,scale,pad,crop"
+			"--enable-libvpx"
 			"--enable-protocol=file"
 			"--enable-demuxer=matroska,webm"
-			"--enable-decoder=vp8,vp9,opus,vorbis"
+			"--enable-decoder=libvpx_vp8,libvpx_vp9,opus,vorbis"
 			"--enable-parser=vp8,vp9,opus,vorbis"
 			"--enable-jni" "--enable-mediacodec"
 			"--pkg-config=$(which pkg-config)"
@@ -536,9 +629,10 @@ function build_ffmpeg() {
 			"--disable-autodetect"
 			"--enable-avformat" "--enable-avcodec" "--enable-avutil" "--enable-swresample" "--enable-swscale"
 			"--enable-avfilter" "--enable-filter=buffer,buffersink,format,scale,pad,crop"
+			"--enable-libvpx"
 			"--enable-protocol=file"
 			"--enable-demuxer=matroska,webm"
-			"--enable-decoder=vp8,vp9,opus,vorbis"
+			"--enable-decoder=libvpx_vp8,libvpx_vp9,opus,vorbis"
 			"--enable-parser=vp8,vp9,opus,vorbis"
 	)
 	fi
@@ -550,6 +644,7 @@ function build_ffmpeg() {
 	local _rev_sha; _rev_sha="$(git rev-parse HEAD 2>/dev/null || true)"
 	{
 		echo "Revision: ${FFMPEG_REV}${_rev_sha:+ (commit ${_rev_sha})}"
+		echo "libvpx revision: ${LIBVPX_REV}"
 		echo -n "Configured with:"
 		printf " %s" "${configure_args[@]}"
 		echo
@@ -557,10 +652,26 @@ function build_ffmpeg() {
 	} > BUILDINFO.txt
 
 	./configure "${configure_args[@]}"
+
+	# By default FFmpeg only warns when an explicitly requested external decoder cannot be built.
+	if ! grep -q '^#define CONFIG_LIBVPX_VP8_DECODER 1' config_components.h ||
+	   ! grep -q '^#define CONFIG_LIBVPX_VP9_DECODER 1' config_components.h; then
+		echo "ERROR: FFmpeg configured without the required libvpx VP8/VP9 decoders." >&2
+		echo "libvpx pkg-config flags:" >&2
+		"${PKG_CONFIG:-pkg-config}" --cflags --libs vpx >&2 || true
+		echo "Relevant FFmpeg configure diagnostics:" >&2
+		grep -E \
+			'libvpx_vp[89]_decoder|vpx_codec_vp[89]_dx|ERROR|error:' \
+			ffbuild/config.log >&2 || true
+		popd >/dev/null
+		return 1
+	fi
+
 	echo "==> Configure complete. Starting make..."
 	make -j"$(getconf _NPROCESSORS_ONLN || echo 2)"
 	echo "==> Build complete. Installing..."
 	make install
+	FFMPEG_REBUILT=1
 	# sanity: show the produced pkg-config files so we can see them in logs
 	local pcdir="$FFMPEG_PREFIX/lib/pkgconfig"
 	if [[ "$GOOS" == "android" ]]; then
@@ -931,6 +1042,8 @@ function maybe_build_ffmpeg() {
 		ensure_pkg_config_path
 		if have_ffmpeg_pc; then
 			echo "==> Using system FFmpeg (BUILD_FFMPEG=no)."
+			echo "WARNING: WebM alpha requires FFmpeg to select the libvpx VP8/VP9 decoder." >&2
+			echo "         Use BUILD_FFMPEG=yes if the system build selects the native decoder." >&2
 			return 0
 		fi
 		echo "ERROR: FFmpeg dev libraries not found (pkg-config)."
@@ -939,12 +1052,8 @@ function maybe_build_ffmpeg() {
 		exit 1
 		;;
 	auto|*)
-		ensure_pkg_config_path
-		if have_ffmpeg_pc; then
-			echo "==> Found FFmpeg via pkg-config; using it."
-			return 0
-		fi
-		echo "==> FFmpeg not found via pkg-config; building a minimal local copy."
+		# Auto mode uses our libvpx-only FFmpeg build to preserve WebM alpha; BUILD_FFMPEG=no opts into system FFmpeg.
+		#echo "==> Ensuring an alpha-capable local FFmpeg build."
 		build_ffmpeg
 		ensure_pkg_config_path
 		if ! have_ffmpeg_pc; then
@@ -1005,7 +1114,7 @@ function build() {
 		if [[ "$GOOS" == "linux" ]]; then
 			export CGO_LDFLAGS="${deps_libs} -lpthread -lm -ldl -lz -Wl,-rpath,\$ORIGIN -Wl,-rpath,\$ORIGIN/lib ${CGO_LDFLAGS:-}"
 		elif [[ "$GOOS" == "darwin" ]]; then
-			export CGO_LDFLAGS="${deps_libs} ${CGO_LDFLAGS:-} -Wl,-rpath,@executable_path -Wl,-rpath,@executable_path/../Frameworks"
+			export CGO_LDFLAGS="${deps_libs} ${CGO_LDFLAGS:-} -Wl,-rpath,@executable_path/../lib -Wl,-rpath,@executable_path/../Frameworks"
 		fi		
 	fi
 
@@ -1027,6 +1136,7 @@ function build() {
 
 	# bundle libs
 	bundle_shared_libs
+	fix_macos_dylib_paths
 
 	# For Android, optionally build the APK via ikemen-droid
 	build_android_apk
@@ -1192,15 +1302,14 @@ EOF
 # Copy FFmpeg shared libs next to produced binary for easy runtime
 function bundle_shared_libs() {
 	local dest_lib="$LIBDIR"
-	#check dest_lib first so we don't re-copy if already done (e.g. from a previous build)
-	if compgen -G "$dest_lib/*" > /dev/null 2>/dev/null; then
-		echo "==> Shared libs already bundled in $dest_lib, skipping copy (delete that directory to force re-copy)"
+	if [[ "$FFMPEG_REBUILT" != "1" ]] && compgen -G "$dest_lib/*" > /dev/null 2>&1; then
 		return 0
 	fi
 	mkdir -p "$dest_lib"
+    #echo "==> Refreshing bundled runtime libraries in $dest_lib"
 	if [[ -d "$FFMPEG_PREFIX/bin" ]]; then
 		# Windows
-		cp -av "$FFMPEG_PREFIX"/bin/*.dll "$dest_lib/" 2>/dev/null || true
+		cp -afv "$FFMPEG_PREFIX"/bin/*.dll "$dest_lib/" 2>/dev/null || true
 		# MSYS2 runtime dep
 		#cp -av /mingw64/bin/libwinpthread-1.dll "$dest_lib/" 2>/dev/null || true
 		for d in \
@@ -1213,8 +1322,8 @@ function bundle_shared_libs() {
 		done
 	elif [[ -d "$FFMPEG_PREFIX/lib" && "$GOOS" != "android" ]]; then
 		# Linux & macOS
-		cp -av "$FFMPEG_PREFIX"/lib/lib*.so* "$dest_lib/" 2>/dev/null || true
-		cp -av "$FFMPEG_PREFIX"/lib/lib*.dylib "$dest_lib/" 2>/dev/null || true
+        cp -afv "$FFMPEG_PREFIX"/lib/lib*.so* "$dest_lib/" 2>/dev/null || true
+        cp -afv "$FFMPEG_PREFIX"/lib/lib*.dylib "$dest_lib/" 2>/dev/null || true
 	fi
 	# Bundle MoltenVK on macOS
 	if [[ "$GOOS" == "darwin" ]]; then
@@ -1226,29 +1335,55 @@ function bundle_shared_libs() {
 				[[ -f "$d" ]] && { mvk="$d"; break; }
 			done
 		fi
-		[[ -n "$mvk" ]] && cp -av "$mvk" "$dest_lib/" 2>/dev/null || true
+		[[ -n "$mvk" ]] && cp -Lfv "$mvk" "$dest_lib/" 2>/dev/null || true
 	fi
 	# Android specific bundling
 	if [[ "$GOOS" == "android" ]]; then
 		echo "==> Bundling Android dependencies from $ANDROID_DEPS_PATH..."
 		cp -av "$ANDROID_DEPS_PATH"/lib/*.so* "$dest_lib/" 2>/dev/null || true
 	fi
-	# Always try to bundle libxmp for portable runtime on Linux/macOS.
+	# Always try to bundle libxmp and SDL for portable runtime on Linux/macOS.
 	# (Windows and Android were handled above.)
 	if [[ "$GOOS" != "windows" && "$GOOS" != "android" ]]; then
 		# Prefer pkg-config to locate the correct lib directory.
-		local pc libdir libdir_sdl2
+		local pc libdir libdir_sdl2 libdir_sdl3
 		pc="${PKG_CONFIG:-pkg-config}"
 		libdir="$($pc --variable=libdir libxmp 2>/dev/null || true)"
 		if [[ -n "$libdir" && -d "$libdir" ]]; then
 			cp -av "${libdir}"/libxmp*.so*   "$dest_lib/" 2>/dev/null || true
-			cp -av "${libdir}"/libxmp*.dylib "$dest_lib/" 2>/dev/null || true
+			cp -Lfv "${libdir}"/libxmp*.dylib "$dest_lib/" 2>/dev/null || true
 		fi
 		libdir_sdl2="$($pc --variable=libdir sdl2 2>/dev/null || true)"
 		if [[ -n "$libdir_sdl2" && -d "$libdir_sdl2" ]]; then
 			cp -av "${libdir_sdl2}"/libSDL2*.so*   "$dest_lib/" 2>/dev/null || true
-			cp -av "${libdir_sdl2}"/libSDL2*.dylib "$dest_lib/" 2>/dev/null || true
+			cp -Lfv "${libdir_sdl2}"/libSDL2*.dylib "$dest_lib/" 2>/dev/null || true
 		fi
+		# Homebrew's SDL2 compatibility library loads SDL3 at runtime.
+		libdir_sdl3="$($pc --variable=libdir sdl3 2>/dev/null || true)"
+		if [[ -n "$libdir_sdl3" && -d "$libdir_sdl3" ]]; then
+			cp -Lfv "${libdir_sdl3}"/libSDL3*.dylib "$dest_lib/" 2>/dev/null || true
+		fi
+	fi
+}
+
+# Use bundled libraries instead of Homebrew paths in the macOS binary.
+function fix_macos_dylib_paths() {
+	[[ "$GOOS" != "darwin" ]] && return 0
+
+	local binary="$OUTDIR/$binName"
+	local dependency dependencies filename changed=0
+	dependencies="$(otool -L "$binary" | awk 'NR > 1 { sub(/^[[:space:]]+/, ""); sub(/ \(compatibility version.*$/, ""); print }')"
+	while IFS= read -r dependency; do
+		filename="${dependency##*/}"
+		if [[ -n "$dependency" && "$dependency" != @* && -e "$LIBDIR/$filename" ]]; then
+			install_name_tool -change "$dependency" "@rpath/$filename" "$binary"
+			changed=1
+		fi
+	done <<< "$dependencies"
+
+	# install_name_tool invalidates the ad-hoc signature required on Apple Silicon.
+	if ((changed)); then
+		codesign --force --sign - "$binary"
 	fi
 }
 

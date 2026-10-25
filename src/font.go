@@ -290,8 +290,8 @@ func loadFntV1(filename string) (*Fnt, error) {
 						} else {
 							fci.w = f.Size[0]
 						}
+						ofs += f.Size[0]
 					}
-					ofs += f.Size[0]
 				}
 			}
 		case "def":
@@ -603,14 +603,15 @@ func (f *Fnt) Print(txt string, x, y, xscl, yscl, rxadd float32, rot Rotation, p
 		if f.Type == "truetype" {
 			f.DrawTtf(txt, x, y, xscl, yscl, rxadd, rot, projectionMode, fLength, align, true, window, frgba, palfx, 0)
 		} else {
-			f.DrawText(txt, x, y, xscl, yscl, rxadd, rot, projectionMode, fLength, bank, align, window, palfx, frgba[3], 0)
+			f.DrawText(txt, x, y, xscl, yscl, rxadd, rot, projectionMode, fLength, bank, align, window, frgba, palfx, 0)
 		}
 	}
 }
 
 // DrawText prints on screen a specified text with the current font sprites
 func (f *Fnt) DrawText(txt string, x, y, xscl, yscl, rxadd float32,
-	rot Rotation, projectionMode int32, fLength float32, bank, align int32, window *[4]int32, palfx *PalFX, alpha float32, spacingXAdd int32) {
+	rot Rotation, projectionMode int32, fLength float32, bank, align int32, window *[4]int32,
+	frgba [4]float32, palfx *PalFX, spacingXAdd int32) {
 
 	if len(txt) == 0 || xscl == 0 || yscl == 0 {
 		return
@@ -668,13 +669,17 @@ func (f *Fnt) DrawText(txt string, x, y, xscl, yscl, rxadd float32,
 		f.lastPalBase = nil
 	}
 
+	alpha := frgba[3]
+	alphaVal := int32(255 * sys.brightness * alpha)
+
 	// Set the trans type
 	tt := TT_none
 	if alpha < 1.0 {
 		tt = TT_add
 	}
 
-	alphaVal := int32(255 * sys.brightness * alpha)
+	// Sprite fonts can't use frgba like TTF can, so we will leverage PalFX.mul to apply color
+	pfxCopy := palfx.withStackedColor(frgba[0], frgba[1], frgba[2])
 
 	// Initialize common render parameters
 	rp := RenderParams{
@@ -696,12 +701,12 @@ func (f *Fnt) DrawText(txt string, x, y, xscl, yscl, rxadd float32,
 		blendMode:      tt,
 		blendAlpha:     [2]int32{alphaVal, 255 - alphaVal},
 		mask:           0,
-		pfx:            palfx,
+		pfx:            pfxCopy,
 		window:         window,
 		rcx:            rcx,
 		rcy:            rcy,
 		projectionMode: projectionMode,
-		fLength:        fLength,
+		fLength:        fLength * sys.heightScale,
 		xOffset:        0,
 		yOffset:        0,
 	}
@@ -780,8 +785,7 @@ type TextSprite struct {
 	layerno        int16
 	palfx          *PalFX
 	frgba          [4]float32 // ttf fonts
-	forcecolor     bool
-	removetime     int32 // text sctrl
+	removetime     int32      // text sctrl
 	elapsedTicks   float32
 	textSpacing    [2]float32
 	textDelay      float32
@@ -933,30 +937,38 @@ func (ts *TextSprite) SetWindow(window [4]float32) {
 		return
 	}
 	ts.windowInit = window
+	ts.window = ts.drawWindow()
+}
+
+func (ts *TextSprite) drawWindow() [4]int32 {
+	if ts.windowInit == [4]float32{0, 0, 0, 0} {
+		return ts.window
+	}
+	// Pixel bounds depend on the aspect state selected for this draw pass.
+	window := ts.windowInit
 	x := window[0]*ts.localScale + float32(ts.offsetX)
 	y := window[1] * ts.localScale
 	w := (window[2] - window[0]) * ts.localScale
 	h := (window[3] - window[1]) * ts.localScale
-	ts.window[0] = int32((x + float32(sys.gameWidth-320)/2) * sys.widthScale)
+	drawWindow := [4]int32{}
+	drawWindow[0] = int32((x + float32(sys.gameWidth-320)/2) * sys.widthScale)
 	// TODO: test if this truetype adjustment is needed
-	//ts.window[1] = int32((y + float32(sys.gameHeight-240)) * sys.heightScale)
+	//drawWindow[1] = int32((y + float32(sys.gameHeight-240)) * sys.heightScale)
 	// Keep scissor Y consistent with the respective draw paths:
 	//  - Sprite fonts (DrawText) add +(sys.gameHeight-240) to Y
 	//  - TTF fonts (DrawTtf) do NOT add that offset
 	if ts.fnt != nil && ts.fnt.Type == "truetype" {
-		ts.window[1] = int32(y * sys.heightScale)
+		drawWindow[1] = int32(y * sys.heightScale)
 	} else {
-		ts.window[1] = int32((y + float32(sys.gameHeight-240)) * sys.heightScale)
+		drawWindow[1] = int32((y + float32(sys.gameHeight-240)) * sys.heightScale)
 	}
-	ts.window[2] = int32(w*sys.widthScale + 0.5)
-	ts.window[3] = int32(h*sys.heightScale + 0.5)
+	drawWindow[2] = int32(w*sys.widthScale + 0.5)
+	drawWindow[3] = int32(h*sys.heightScale + 0.5)
+	return drawWindow
 }
 
 func (ts *TextSprite) SetColor(r, g, b, a int32) {
-	ts.forcecolor = true
-	ts.palfx.setColor(r, g, b)
-	ts.frgba = [...]float32{float32(r) / 255, float32(g) / 255,
-		float32(b) / 255, float32(a) / 255}
+	ts.frgba = [4]float32{float32(r) / 255, float32(g) / 255, float32(b) / 255, float32(a) / 255}
 }
 
 func (ts *TextSprite) SetTextSpacing(xs, ys float32) {
@@ -1387,18 +1399,27 @@ func (ts *TextSprite) updateVel() {
 func (ts *TextSprite) Update() {
 	ts.elapsedTicks++
 	ts.updateVel()
-	if ts.palfx != nil && !ts.forcecolor {
+	if ts.palfx != nil {
 		ts.palfx.step()
 	}
 }
 
 func (ts *TextSprite) Draw(ln int16) {
+	ts.draw(ln, nil)
+}
+
+func (ts *TextSprite) draw(ln int16, clip *[4]int32) {
 	if sys.frameSkip || ts.layerno != ln || ts.fnt == nil || len(ts.text) == 0 {
 		return
 	}
 
 	if ts.hidewithbars && sys.shouldHideWithBars() {
 		return
+	}
+
+	window := ts.drawWindow()
+	if clip != nil {
+		window = intersectRect(window, *clip)
 	}
 
 	// Preprocess (tab-expand, \n-decode, line split) once per distinct string.
@@ -1446,15 +1467,11 @@ func (ts *TextSprite) Draw(ln int16) {
 
 		// Draw the visible line
 		if ts.fnt.Type == "truetype" {
-			var ttfPalFX *PalFX
-			if !ts.forcecolor {
-				ttfPalFX = ts.palfx
-			}
 			ts.fnt.DrawTtf(line[:charsToShow], ts.x+ts.vel[0]-xsoffset+phantomX, newY+ts.vel[1], ts.xscl, ts.yscl,
-				xshear, ts.rot, ts.projection, ts.fLength, ts.align, true, &ts.window, ts.frgba, ttfPalFX, float32(spacingXAdd))
+				xshear, ts.rot, ts.projection, ts.fLength, ts.align, true, &window, ts.frgba, ts.palfx, float32(spacingXAdd))
 		} else {
 			ts.fnt.DrawText(line[:charsToShow], ts.x+ts.vel[0]-xsoffset+phantomX, newY+ts.vel[1], ts.xscl, ts.yscl,
-				xshear, ts.rot, ts.projection, ts.fLength, ts.bank, ts.align, &ts.window, ts.palfx, ts.frgba[3], spacingXAdd)
+				xshear, ts.rot, ts.projection, ts.fLength, ts.bank, ts.align, &window, ts.frgba, ts.palfx, spacingXAdd)
 		}
 
 		totalCharsShown += charsToShow

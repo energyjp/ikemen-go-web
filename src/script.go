@@ -1600,6 +1600,15 @@ func systemScriptInit(l *lua.LState) {
 		palIdx := a.anim.palettedata.SelectablePalIndex(palNum)
 		if len(a.anim.palettedata.paletteMap) > 0 {
 			a.anim.palettedata.paletteMap[0] = palIdx
+			// SFFv1 may have duplicate base palettes mapped to palette 1.
+			if a.anim.sff.header.Version[0] == 1 && len(a.anim.palettedata.paletteMap) > 1 {
+				for _, spr := range a.anim.sff.sprites {
+					if spr != nil && spr.sffv1BasePal {
+						a.anim.palettedata.paletteMap[1] = palIdx
+						break
+					}
+				}
+			}
 		}
 		l.Push(newUserData(l, a))
 		return 1
@@ -2158,7 +2167,8 @@ func systemScriptInit(l *lua.LState) {
 		if !nilArg(l, 5) {
 			scl = float32(numArg(l, 5))
 		}
-		// BGDef.Draw mutates BGDef state (time/BGCtrl/anim). Copying BGDef makes those updates happen on the copy only. Keep a pointer to the live BGDef.
+		bg.step()
+		// Keep a pointer to the live BGDef for deferred drawing.
 		bgLocal := bg
 		layerLocal := layer
 		xLocal, yLocal, sclLocal := x, y, scl
@@ -2524,6 +2534,56 @@ func systemScriptInit(l *lua.LState) {
 
 		return 0
 	})
+	luaRegister(l, "netReportResult", func(l *lua.LState) int {
+		/*Report a finished matchmade result to the leaderboard.
+		@function netReportResult
+		@tparam int winSide Winning side (`1` or `2`); `0` for a draw.
+		@tparam string myChar Character this player used.
+		@tparam string oppChar Character the opponent used.
+		Browser builds only, and a no-op unless the session came from the
+		casual-match queue (the page needs a verified identity to sign the
+		report). Fire-and-forget: never raises, never blocks the match.
+		function netReportResult(winSide, myChar, oppChar) end*/
+		platformReportResult(int(numArg(l, 1)), strArg(l, 2), strArg(l, 3))
+		return 0
+	})
+	luaRegister(l, "netWinTeam", func(*lua.LState) int {
+		/*Winning side of the finished match.
+		@function netWinTeam
+		@treturn int side `1` or `2` once the match is decided, `0` for a draw,
+		  `-1` while a match is still in progress. Both peers of a lockstep
+		  netplay session compute this identically, which is what lets each
+		  side report the same result independently.
+		function netWinTeam() end*/
+		if sys.winTeam < 0 {
+			l.Push(lua.LNumber(-1))
+		} else {
+			l.Push(lua.LNumber(sys.winTeam + 1))
+		}
+		return 1
+	})
+	luaRegister(l, "netOnlineNames", func(*lua.LState) int {
+		/*Verified online display names for the current netplay session.
+		@function netOnlineNames
+		@treturn string "p1name\np2name" once a matchmade session has paired
+		  (host is always side 1), or an empty string in every other case
+		  (offline, friend match, not yet paired).
+		function netOnlineNames() end*/
+		l.Push(lua.LString(platformOnlineNames()))
+		return 1
+	})
+	luaRegister(l, "netRankStatus", func(*lua.LState) int {
+		/*The local player's ranked standing, for NETWORK > YOUR RANK.
+		@function netRankStatus
+		@treturn string display text (first line is the player name), or an
+		  empty string when there is nothing to show - no identity, no
+		  leaderboard configured, or the first fetch has not landed yet.
+		  Never blocks: the page keeps it cached and refreshes in the
+		  background, so a menu can call this every frame if it likes.
+		function netRankStatus() end*/
+		l.Push(lua.LString(platformRankStatus()))
+		return 1
+	})
 	luaRegister(l, "enterReplay", func(*lua.LState) int {
 		/*Enter replay playback mode from a replay file.
 		@function enterReplay
@@ -2532,9 +2592,6 @@ func systemScriptInit(l *lua.LState) {
 		  `false` otherwise.
 		function enterReplay(path) end*/
 		sys.sessionWarning = ""
-		if sys.cfg.Video.VSync >= 0 {
-			sys.window.SetSwapInterval(1) // broken frame skipping when set to 0
-		}
 		sys.chars = [len(sys.chars)][]*Char{}
 		sys.replayFile = OpenReplayFile(strArg(l, 1))
 		if sys.replayFile != nil {
@@ -2590,9 +2647,6 @@ func systemScriptInit(l *lua.LState) {
 		function exitReplay() end*/
 		if err := sys.endSyncSessionOverride(); err != nil {
 			l.RaiseError(err.Error())
-		}
-		if sys.cfg.Video.VSync >= 0 {
-			sys.window.SetSwapInterval(sys.cfg.Video.VSync)
 		}
 		if sys.replayFile != nil {
 			sys.replayFile.Close()
@@ -2997,6 +3051,7 @@ func systemScriptInit(l *lua.LState) {
 		sys.keyInput = KeyUnknown
 		sys.luaDiscardDrawQueue()
 		sys.gameRunning = true
+		sys.escDeferred = false
 		sys.motif.fadeIn.reset()
 		sys.motif.fadeOut.reset()
 		sys.endMatch = false
@@ -3139,14 +3194,21 @@ func systemScriptInit(l *lua.LState) {
 				// Match loop
 				if sys.runMatch() {
 					// Match is restarting
+					for _, reload := range sys.reloadCharSlot {
+						if reload {
+							sys.releaseReloadingCharFx()
+							break
+						}
+					}
 					for i, reload := range sys.reloadCharSlot {
 						if !reload {
 							continue
 						}
-						if sys.cgi[i].sff != nil && !sys.cfg.Debug.KeepSpritesOnReload {
-							// removeSFFCache(sys.cgi[i].sff.filename)
+						// Drop sprites and sounds so that the cache systems won't reuse them
+						if !sys.cfg.Debug.KeepSpritesOnReload {
 							sys.cgi[i].sff = nil
 						}
+						sys.cgi[i].snd = nil
 						sys.cgi[i].customShaders = nil
 						if sys.reloadPreserveVars[i] {
 							sys.saveCharVars(i)
@@ -3237,6 +3299,7 @@ func systemScriptInit(l *lua.LState) {
 			// If not restarting match
 			if winp != -2 {
 				sys.esc = false
+				sys.escDeferred = false
 				sys.keyInput = KeyUnknown
 				if sys.gameMode == "challenger" {
 					sys.statsLog.discardCurrentMatch()
@@ -3273,6 +3336,7 @@ func systemScriptInit(l *lua.LState) {
 				sys.consoleText = []string{}
 				sys.stageLoopNo = 0
 				sys.paused = false
+				sys.uiFrameCounter++
 				sys.gameRunning = false
 				sys.clearSpriteData()
 				sys.motif.fadeIn.reset()
@@ -4304,6 +4368,7 @@ func systemScriptInit(l *lua.LState) {
 		@tparam[opt=1.0] float32 scale Uniform scale applied to debug text (both X and Y).
 		function loadDebugFont(filename, scale) end*/
 		ts := NewTextSprite()
+		ts.palfx.ignoreAllPalFX = true
 		f, err := loadFnt(strArg(l, 1), -1)
 		if err != nil {
 			l.RaiseError("\nCan't load %v: %v\n", strArg(l, 1), err.Error())
@@ -5058,6 +5123,16 @@ func systemScriptInit(l *lua.LState) {
 		sys.debugWC.mapSet(strArg(l, 1), float32(numArg(l, 2)), scType)
 		return 0
 	})
+	luaRegister(l, "motifIsInherited", func(l *lua.LState) int {
+		/*Returns whether a motif value was inherited from another motif parameter.
+		@function motifIsInherited
+		@tparam string key Motif key path.
+		@treturn boolean
+		function motifIsInherited(key) end*/
+		key := strings.ToLower(l.CheckString(1))
+		l.Push(lua.LBool(sys.motif.inheritedKeys[key]))
+		return 1
+	})
 	luaRegister(l, "storyboardCanceled", func(l *lua.LState) int {
 		/*Check whether the most recent storyboard was canceled by the player.
 		@function storyboardCanceled
@@ -5072,23 +5147,28 @@ func systemScriptInit(l *lua.LState) {
 		@tparam string filename glTF model file path.
 		@treturn Model model Model userdata.
 		function modelNew(filename) end*/
-		if !nilArg(l, 1) {
-			if !gfx.IsModelEnabled() {
-				LogMessage("modelNew skipped (renderer has no 3D support): %v", strArg(l, 1))
-				l.Push(lua.LNil)
-				return 1
-			}
-			mdl, err := loadglTFModel(strArg(l, 1))
-			if err != nil {
-				l.RaiseError("\nCan't load %v: %v\n", strArg(l, 1), err.Error())
-			}
-			sys.mainThreadTask <- func() {
-				gfx.SetModelVertexData(1, mdl.vertexBuffer)
-				gfx.SetModelIndexData(1, mdl.elementBuffer...)
-			}
-			sys.runMainThreadTask()
-			l.Push(newUserData(l, mdl))
+		if nilArg(l, 1) {
+			l.Push(lua.LNil)
+			return 1
 		}
+		// No 3D on this renderer (3D Model off, or a browser whose WebGL could
+		// not set the model pipeline up): a nil model, not an error,
+		// so a screenpack that names one still boots.
+		if !gfx.IsModelEnabled() {
+			LogMessage("modelNew skipped (renderer has no 3D support): %v", strArg(l, 1))
+			l.Push(lua.LNil)
+			return 1
+		}
+		mdl, err := loadglTFModel(strArg(l, 1))
+		if err != nil {
+			l.RaiseError("\nCan't load %v: %v\n", strArg(l, 1), err.Error())
+		}
+		sys.mainThreadTask <- func() {
+			gfx.SetModelVertexData(1, mdl.vertexBuffer)
+			gfx.SetModelIndexData(1, mdl.elementBuffer...)
+		}
+		sys.runMainThreadTask()
+		l.Push(newUserData(l, mdl))
 		return 1
 	})
 	luaRegister(l, "modifyGameOption", func(l *lua.LState) int {
@@ -5217,6 +5297,28 @@ func systemScriptInit(l *lua.LState) {
 		@treturn boolean active `true` if netplay is currently active.
 		function netPlay() end*/
 		l.Push(lua.LBool(sys.netplay()))
+		return 1
+	})
+	luaRegister(l, "netInRollback", func(*lua.LState) int {
+		/*Check whether the engine is currently RE-SIMULATING an already-simulated
+		frame inside a rollback correction. Always `false` on the frame the player
+		is about to see, in delay netplay, and offline.
+
+		This exists for per-frame Lua (hook.add 'loop') that must run exactly once
+		per displayed frame: rollback re-runs simulateFrame() - and with it
+		uiAction()'s Common Lua block - for every corrected frame, a count that
+		differs per peer, and
+		Lua state is never saved or restored by rollback snapshots. Guarding with
+		`if netInRollback() then return end` keeps such hooks idempotent without
+		giving up on rollback entirely.
+
+		Deliberately NOT sys.isSpeculativeFrame(): that returns false whenever no
+		rollback session exists, i.e. on every frame of a DELAY match, which would
+		be the wrong polarity for this use.
+		@function netInRollback
+		@treturn boolean rollback `true` only while a rollback correction re-runs a past frame.
+		function netInRollback() end*/
+		l.Push(lua.LBool(sys.inRollback()))
 		return 1
 	})
 	luaRegister(l, "netLoadingReady", func(l *lua.LState) int {
@@ -5833,6 +5935,7 @@ func systemScriptInit(l *lua.LState) {
 			sys.motif.fadeIn.step()
 		}
 		sys.stepCommandLists()
+		sys.uiFrameCounter++
 		if !sys.update() {
 			l.RaiseError("<game end>")
 		}
@@ -5898,12 +6001,11 @@ func systemScriptInit(l *lua.LState) {
 				sys.rollback.session.recording.Close()
 				sys.rollback.session.recording = nil
 			}
-		} else {
-			if sys.netConnection != nil && sys.netConnection.recording != nil {
-				sys.netConnection.recording.Close()
-				sys.netConnection.recording = nil
-				sys.netConnection.headerWritten = false
-			}
+		}
+		if sys.netConnection != nil && sys.netConnection.recording != nil {
+			sys.netConnection.recording.Close()
+			sys.netConnection.recording = nil
+			sys.netConnection.headerWritten = false
 		}
 		return 0
 	})
@@ -6851,10 +6953,6 @@ func systemScriptInit(l *lua.LState) {
 		sys.fightScreen.winCounts[tn-1].wins = int32(numArg(l, 2))
 		return 0
 	})
-	//luaRegister(l, "sffCacheDelete", func(l *lua.LState) int {
-	//	removeSFFCache(strArg(l, 1))
-	//	return 0
-	//})
 	luaRegister(l, "sffNew", func(l *lua.LState) int {
 		/*Load an SFF file or create an empty SFF.
 		@function sffNew
@@ -7799,7 +7897,26 @@ func systemScriptInit(l *lua.LState) {
 		if !nilArg(l, 4) {
 			max = uint32(numArg(l, 4))
 		}
-		w, err := loadFromSnd(strArg(l, 1), int32(numArg(l, 2)), int32(numArg(l, 3)), max)
+		// RESOLVED THE WAY THE CHARACTER LOADER RESOLVES IT.
+		//
+		// loadFromSnd -> LoadSndFiltered -> OpenFile opens the path verbatim,
+		// with none of the case-insensitive fallback FileExist provides
+		// (common.go:554-563). The character's OWN sound file goes through
+		// LoadFile/SearchFile first (char.go:4303) and therefore tolerates a def
+		// that misspells its own paths - which is normal, not broken, because
+		// characters are authored on a case-insensitive filesystem (GRAIL 4.13).
+		//
+		// start.lua:1447 hands this binding `dir .. sound` straight from the
+		// def, so RyuDX - whose def says `sound = data/ryuDX.snd` while the
+		// files are `Data/RyuDX.snd`, differing in BOTH segments - opened fine
+		// in a match and killed the select screen. On Windows os.Open hides it;
+		// in the browser VFS the lookup is case-sensitive and it is fatal, via
+		// the RaiseError below.
+		//
+		// SearchFile returns its input unchanged when nothing matches, so a
+		// genuinely missing file still errors exactly as before.
+		sndPath := SearchFile(strArg(l, 1), nil)
+		w, err := loadFromSnd(sndPath, int32(numArg(l, 2)), int32(numArg(l, 3)), max)
 		if err != nil {
 			l.RaiseError(err.Error())
 		}
@@ -9712,16 +9829,6 @@ func triggerFunctions(l *lua.LState) {
 		}
 		return 1
 	})
-	luaRegister(l, "motifIsInherited", func(l *lua.LState) int {
-		/*Returns whether a motif value was inherited from another motif parameter.
-		@function motifIsInherited
-		@tparam string key Motif key path.
-		@treturn boolean
-		function motifIsInherited(key) end*/
-		key := strings.ToLower(l.CheckString(1))
-		l.Push(lua.LBool(sys.motif.inheritedKeys[key]))
-		return 1
-	})
 	luaRegister(l, "motifVar", func(l *lua.LState) int {
 		value, err := sys.motif.GetValue(strArg(l, 1))
 		if err == nil {
@@ -9954,6 +10061,8 @@ func triggerFunctions(l *lua.LState) {
 	luaRegister(l, "p2StateNo", func(*lua.LState) int {
 		if p2 := sys.debugWC.p2(); p2 != nil {
 			l.Push(lua.LNumber(p2.ss.no))
+		} else {
+			l.Push(lua.LNumber(-1))
 		}
 		return 1
 	})

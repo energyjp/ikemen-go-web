@@ -144,3 +144,14 @@ func (nc *NetConnection) Connect(server string, port int) {
 
 // platformNetStats is a browser-overlay affordance (see netplay_js.go).
 func platformNetStats(pingMs int) {}
+
+// platformOnlineNames is a browser matchmaking affordance (see
+// netplay_js.go); desktop netplay has no verified-name source.
+// No web bridge on desktop, so there is no cached standing to report.
+func platformRankStatus() string { return "" }
+
+func platformOnlineNames() string { return "" }
+
+// platformReportResult is likewise browser-only: there is no leaderboard
+// endpoint to report to from a desktop build.
+func platformReportResult(winSide int, p1Char, p2Char string) {}

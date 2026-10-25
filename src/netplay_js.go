@@ -113,7 +113,82 @@ func (nc *NetConnection) webrtcStart(host bool) error {
 		mode = "host"
 	}
 	bridge.Call("start", mode)
+	nc.webrtcAwait(bridge, host)
+	return nil
+}
+
+// Matchmaking queue: the server decides who hosts, so unlike webrtcStart the
+// host/guest fields can only be filled in AFTER the bridge reports a pairing
+// (queueRole()). Everything from the DataChannel wait onward is the shared
+// path.
+//
+// `mode` selects WHICH queue - "queue" (ranked) or "casual". It is passed
+// straight to the page bridge, which puts it on the matchmaking socket; the
+// server buckets on it, so the two queues are separate pools that never pair
+// with each other. Everything below this line is identical for both: the same
+// role assignment, the same transport, and therefore the same desync
+// behaviour, which is the point - casual gets the rollback fixes for free
+// because they live in the engine and the netcode, not in ranked.
+func (nc *NetConnection) webrtcStartQueue(mode string) error {
+	bridge := js.Global().Get("ikemenNet")
+	if bridge.IsUndefined() {
+		return Error("webrtc bridge (ikemenNet) missing from page")
+	}
+	nc.ln = &webrtcCloser{bridge: bridge}
+	nc.conn = nil
+	bridge.Call("start", mode)
 	SafeGo(func() {
+		// Queue waits are open-ended by design (an empty queue sits at
+		// "1 player waiting" until someone shows up); only a closing
+		// engine (Esc) ends the wait early.
+		deadline := time.Now().Add(2 * time.Hour)
+		for {
+			if nc.isClosing() || time.Now().After(deadline) {
+				return
+			}
+			role := bridge.Call("queueRole").String()
+			if role != "" {
+				nc.host = role == "host"
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if nc.host {
+			nc.locIn, nc.remIn = nc.GetHostGuestRemap()
+		} else {
+			nc.remIn, nc.locIn = nc.GetHostGuestRemap()
+		}
+		// enterNetPlay ran with the placeholder address 'webrtc-queue',
+		// which preset the rollback session as guest-of-'webrtc-queue'.
+		// Both halves of that are wrong once the real role arrives:
+		//  - as host, session.host must be EMPTY (preMatchSetup branches
+		//    on that to init as P1);
+		//  - as guest, session.host is the REMOTE ADDRESS handed to
+		//    InitP2, and the transport stamps every incoming datagram
+		//    with webrtcPeerIP - leaving 'webrtc-queue' here made GGPO
+		//    drop 100% of remote inputs (field: hard stutter for a few
+		//    seconds, then the session dies).
+		if sys.cfg.Netplay.RollbackNetcode && sys.rollback.session != nil {
+			if nc.host {
+				sys.rollback.session.host = ""
+			} else {
+				sys.rollback.session.host = webrtcPeerIP
+			}
+		}
+		nc.webrtcAwaitBody(bridge, nc.host)
+	})
+	return nil
+}
+
+// webrtcAwait runs the DataChannel wait + IKEMENGO handshake in the
+// background; webrtcAwaitBody is the same thing on the caller's goroutine
+// (the queue path is already inside a SafeGo of its own).
+func (nc *NetConnection) webrtcAwait(bridge js.Value, host bool) {
+	SafeGo(func() { nc.webrtcAwaitBody(bridge, host) })
+}
+
+func (nc *NetConnection) webrtcAwaitBody(bridge js.Value, host bool) {
+	{
 		// Wait for the DataChannel to open. Transient ICE 'failed'/
 		// 'disconnected' states are NORMAL during NAT traversal over the
 		// real internet and often recover, so we do NOT abandon the
@@ -201,8 +276,7 @@ func (nc *NetConnection) webrtcStart(host bool) error {
 		}
 		nc.conn = conn
 		hlog("conn established; entering synchronize")
-	})
-	return nil
+	}
 }
 
 func ioReadFull(c *webrtcConn, buf []byte) (int, error) {
@@ -222,7 +296,58 @@ func (nc *NetConnection) Accept(port int) error {
 }
 
 func (nc *NetConnection) Connect(server string, port int) {
+	// Two matchmaking queues, selected by the placeholder address the Lua
+	// passes to main.f_connect. The server assigns host/guest for both.
+	//   'webrtc-queue'  -> RANKED: rated, reported, first-to-N set
+	//   'webrtc-casual' -> CASUAL: endless, never reported, never rated
+	// Anything else is the classic join flow: this side is the guest.
+	if server == "webrtc-queue" {
+		nc.webrtcStartQueue("queue")
+		return
+	}
+	if server == "webrtc-casual" {
+		nc.webrtcStartQueue("casual")
+		return
+	}
 	nc.webrtcStart(false)
+}
+
+// platformOnlineNames feeds the in-match name plates (Lua binding
+// netOnlineNames). Only a queue match carries verified names; the friend
+// flows return "" and the plates fall back to their local-name logic.
+// platformRankStatus feeds NETWORK > YOUR RANK (Lua binding netRankStatus).
+// The page keeps the standing cached and returns it synchronously, so this
+// never blocks a menu: an empty string simply means "nothing to show yet".
+func platformRankStatus() string {
+	bridge := js.Global().Get("ikemenNet")
+	if bridge.IsUndefined() {
+		return ""
+	}
+	fn := bridge.Get("rankStatus")
+	if fn.Type() != js.TypeFunction {
+		return "" // older page script: the menu says so rather than crashing
+	}
+	return bridge.Call("rankStatus").String()
+}
+
+func platformOnlineNames() string {
+	bridge := js.Global().Get("ikemenNet")
+	if bridge.Truthy() && !bridge.Get("queueNames").IsUndefined() {
+		return bridge.Call("queueNames").String()
+	}
+	return ""
+}
+
+// platformReportResult hands a finished matchmade result to the page, which
+// signs it with this player's identity and posts it to the leaderboard.
+// The two character names are ENGINE SIDES 1 and 2 (identical on both peers);
+// the page picks its own out of them by role.
+// Fire-and-forget: a failed report must never disturb the game.
+func platformReportResult(winSide int, p1Char, p2Char string) {
+	bridge := js.Global().Get("ikemenNet")
+	if bridge.Truthy() && !bridge.Get("reportResult").IsUndefined() {
+		bridge.Call("reportResult", winSide, p1Char, p2Char)
+	}
 }
 
 // ---------------------------------------------------------------------------

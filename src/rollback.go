@@ -32,7 +32,7 @@ type RollbackProperties struct {
 }
 
 // TODO: Merge with system.go
-func (rs *RollbackSystem) hijackRunMatch(s *System) bool {
+func (rs *RollbackSystem) hijackRunMatch() bool {
 	// Shared part up until this point already handled by sys.runMatch()
 
 	// Reset variables
@@ -45,7 +45,8 @@ func (rs *RollbackSystem) hijackRunMatch(s *System) bool {
 	var running bool
 
 	// Loop until end of match
-	for !s.endMatch {
+	// Not "sys.keepMatchRunning()" because rollback loop ends earlier than local loop
+	for !sys.endMatch {
 		rs.session.now = time.Now().UnixMilli()
 		err := rs.session.backend.Idle(
 			int(math.Max(0, float64(rs.session.next-rs.session.now-1))))
@@ -54,29 +55,32 @@ func (rs *RollbackSystem) hijackRunMatch(s *System) bool {
 		}
 
 		// Desync/disconnect callbacks may request a session abort outside the normal input path.
-		if s.esc {
+		if sys.esc {
 			break
 		}
 
 		// Sync speculative inputs and run a speculative frame
-		running = rs.runFrame(s)
+		running = rs.runFrame()
 
-		if s.fightLoopEnd && !s.postMatchFlg {
+		if sys.fightLoopEnd && !sys.postMatchFlg {
 			break
 		}
 
 		rs.session.next = rs.session.now + 1000/60
 
-		if s.esc || !running {
+		if sys.esc || !running {
 			break
 		}
 
-		s.renderFrame()
+		// These are outside runFrame(), so they won't be needlessly executed during a rollback
+		sys.tickSound()
+		sys.cueDraw()
+		sys.renderFrame()
 
 		//rs.session.loopTimer.usToWaitThisLoop()
-		running = s.update()
+		running = sys.update()
 
-		if s.esc || !running {
+		if sys.esc || !running {
 			break
 		}
 	}
@@ -153,11 +157,11 @@ func (rs *RollbackSystem) postMatchSetup() {
 
 // Called once per frame by the main game loop
 // Responsible for collecting local inputs and driving the GGPO backend forward
-func (rs *RollbackSystem) runFrame(s *System) bool {
+func (rs *RollbackSystem) runFrame() bool {
 	var buffer []byte
 	var ggpoerr error
 
-	if s.esc {
+	if sys.esc {
 		return false
 	}
 
@@ -203,7 +207,7 @@ func (rs *RollbackSystem) runFrame(s *System) bool {
 			}
 
 			// Commit this frame to GGPO even if this frame exits gameplay.
-			keepRunning := rs.simulateFrame(s)
+			keepRunning := rs.simulateFrame()
 
 			defer func() {
 				if re := recover(); re != nil {
@@ -219,7 +223,7 @@ func (rs *RollbackSystem) runFrame(s *System) bool {
 			if err != nil {
 				panic(err)
 			}
-			if s.esc || !keepRunning {
+			if sys.esc || !keepRunning {
 				return false
 			}
 		}
@@ -230,8 +234,8 @@ func (rs *RollbackSystem) runFrame(s *System) bool {
 
 // Contains the logic for a single frame of the game
 // Called by both runFrame for speculative execution, and AdvanceFrame for confirmed execution
-func (rs *RollbackSystem) simulateFrame(s *System) bool {
-	s.frameStepFlag = false
+func (rs *RollbackSystem) simulateFrame() bool {
+	sys.frameStepFlag = false
 
 	// If next round
 	if !sys.runNextRound() {
@@ -239,40 +243,43 @@ func (rs *RollbackSystem) simulateFrame(s *System) bool {
 	}
 
 	// Update game state
-	s.action()
+	sys.action()
 
-	// if rs.handleFlags(s) {
+	// Update motif state
+	sys.uiAction()
+
+	// if rs.handleFlags() {
 	//	return true
 	// }
 
-	if !rs.updateEvents(s) {
+	if !rs.updateEvents() {
 		return false
 	}
 
 	// Break if finished
-	if s.fightLoopEnd && !s.postMatchFlg {
+	if sys.fightLoopEnd && !sys.postMatchFlg {
 		return false
 	}
 
 	// Update system; break if update returns false (game ended)
-	//if !s.update() {
+	//if !sys.update() {
 	//	return false
 	//}
 
 	// If end match selected from menu/end of attract mode match/etc
-	if s.endMatch {
-		s.esc = true
+	if sys.endMatch {
+		sys.esc = true
 		return false
-	} else if s.esc {
-		s.endMatch = s.netConnection != nil
+	} else if sys.esc {
+		sys.endMatch = sys.netConnection != nil
 		return false
 	}
 	return true
 }
 
-func (rs *RollbackSystem) updateEvents(s *System) bool {
-	if !s.addFrameTime(s.turbo) {
-		if !s.eventUpdate() {
+func (rs *RollbackSystem) updateEvents() bool {
+	if !sys.addFrameTime(sys.turbo) {
+		if !sys.eventUpdate() {
 			return false
 		}
 		return false
@@ -283,7 +290,7 @@ func (rs *RollbackSystem) updateEvents(s *System) bool {
 func getAIInputs(player int) []byte {
 	var ib InputBits
 	ib.SetInputAI(player)
-	return writeI32(int32(ib))
+	return append(encodeInputs(ib), make([]byte, 6)...)
 }
 
 func (ib *InputBits) SetInputAI(in int) {
@@ -418,6 +425,47 @@ func (g *RollbackLogger) logState(action string, stateIdx int, state *GameState)
 	fmt.Fprintf(&g.currentLog, "%s\n", state.String())
 }
 
+func (g *RollbackLogger) logRoundSkipCheck(fadeoutStart int32, anyButton, roundnotskip, skipEligible, matchEndDialogue bool) {
+	if sys.rollback.session == nil || !sys.rollback.session.config.LogsEnabled {
+		return
+	}
+	var inputs [2]InputBits
+	copy(inputs[:], sys.rollback.ggpoInputs)
+	fadeoutActive := false
+	fadeoutRemain := int32(0)
+	if sys.fightScreen.round != nil && sys.fightScreen.round.fadeOut != nil {
+		fadeoutActive = sys.fightScreen.round.fadeOut.isActive()
+		fadeoutRemain = sys.fightScreen.round.fadeOut.timeRemaining
+	}
+	fmt.Fprintf(&g.currentLog,
+		"RoundSkipCheck MatchTime:%d InRollback:%t RoundState:%d Inputs:[%d/0x%04x %d/0x%04x] "+
+			"Intro:%d WinPoseTime:%d WinWaitTime:%d WinSkipped:%t AnyButton:%t "+
+			"RoundNotSkip:%t RoundNotOver:%t MatchEndDialogue:%t FadeoutStart:%d "+
+			"FadeOutActive:%t FadeOutRemaining:%d SkipEligible:%t\n",
+		sys.matchTime, sys.inRollback(), sys.roundState(),
+		int16(inputs[0]), uint16(inputs[0]), int16(inputs[1]), uint16(inputs[1]),
+		sys.intro, sys.winposetime, sys.winwaittime, sys.winskipped, anyButton,
+		roundnotskip, sys.gsf(GSF_roundnotover), matchEndDialogue, fadeoutStart,
+		fadeoutActive, fadeoutRemain, skipEligible)
+}
+
+func (g *RollbackLogger) logRoundAdvanceCheck(roundOver, tickFrame, motifEndActive, fightLoopEnd, holdPostMatch, canAdvance bool) {
+	if sys.rollback.session == nil || !sys.rollback.session.config.LogsEnabled {
+		return
+	}
+	fmt.Fprintf(&g.currentLog,
+		"RoundAdvanceCheck MatchTime:%d InRollback:%t RoundState:%d Intro:%d "+
+			"RoundOver:%t TickFrame:%t MotifEndActive:%t FightLoopEnd:%t "+
+			"HoldPostMatch:%t CanAdvance:%t "+
+			"TickCount:%d OldTickCount:%d TickCountF:%v NextAddTime:%v "+
+			"FrameStep:%t Paused:%t RoundFreeze:%t DialogueActive:%t\n",
+		sys.matchTime, sys.inRollback(), sys.roundState(), sys.intro,
+		roundOver, tickFrame, motifEndActive, fightLoopEnd, holdPostMatch, canAdvance,
+		sys.tickCount, sys.oldTickCount, sys.tickCountF, sys.nextAddTime,
+		sys.frameStepFlag, sys.paused, sys.gsf(GSF_roundfreeze),
+		sys.motif.di.active)
+}
+
 func (g *RollbackLogger) Write(p []byte) (n int, err error) {
 	g.currentLog.WriteString(string(p))
 	return len(p), nil
@@ -472,6 +520,7 @@ type RollbackSession struct {
 	config              RollbackProperties
 	log                 RollbackLogger
 	timestamp           string
+	checksumHistory     []checksumSnap
 	netTime             int32
 	replayInputs        [][REPLAY_NUM_INPUTS]InputBits
 	replayAnalogInputs  [][REPLAY_NUM_INPUTS][6]int8
@@ -718,7 +767,7 @@ func (r *RollbackSession) AdvanceFrame(flags int) {
 			r.netTime++
 		}
 		// As in runFrame(): commit rollback re-simulated frames to GGPO even if this frame exits gameplay.
-		_ = sys.rollback.simulateFrame(&sys)
+		_ = sys.rollback.simulateFrame()
 		defer func() {
 			if re := recover(); re != nil {
 				if r.config.DesyncTest {
@@ -772,7 +821,39 @@ func (r *RollbackSession) OnEvent(info *ggpo.Event) {
 		log.Printf("Rollback desync detected")
 		sys.esc = true
 		r.SaveReplay()
-		sys.sessionWarning = sys.motif.WarningInfo.Text.Text["desync"]
+		// Itemise the mismatching frame from the snapshot ring. Each player's
+		// screen shows their OWN side's raw values; comparing the two screens
+		// line by line identifies which hashed field diverged. The prev-frame
+		// seed line shows whether the RNG was churning at the boundary.
+		detail := fmt.Sprintf("frame %d", info.NumFrameOfDesync)
+		detail += fmt.Sprintf("\ncrcL=%d", info.LocalChecksum)
+		detail += fmt.Sprintf("\ncrcR=%d", info.RemoteChecksum)
+		if sn := r.checksumSnapFor(info.NumFrameOfDesync); sn != nil {
+			detail += "\n" + formatChecksumSnap(sn)
+			if prev := r.checksumSnapFor(info.NumFrameOfDesync - 1); prev != nil {
+				detail += fmt.Sprintf("\nprev seed=%d", prev.randseed)
+			}
+		} else {
+			detail += "\n(state history expired)"
+		}
+		fmt.Println("DESYNC DETAIL\n" + detail)
+		// LATCH THE FIRST MISMATCH, NOT THE LAST. EventCodeDesync fires once per
+		// mismatching frame, so an unguarded assignment here overwrites the
+		// message every time and the player ends up reading the LAST divergent
+		// frame - by which point the two simulations can be arbitrarily far
+		// apart. The 2026-08-28 Kira dump showed the two peers a WHOLE ROUND
+		// apart (rs4 vs rs0, one with a freshly reset round timer), which
+		// confirmed a desync happened and could say nothing at all about what
+		// caused it. The first divergent frame is the only one where the fields
+		// still differ by a little, and it is the only one where `rngm` names a
+		// statedef block worth reading.
+		//
+		// Same guard the disconnect handler ~30 lines above already uses. The
+		// console Println stays unconditional: the full per-frame sequence is
+		// still worth having in the browser log.
+		if sys.sessionWarning == "" {
+			sys.sessionWarning = sys.motif.WarningInfo.Text.Text["desync"] + "\n" + detail
+		}
 	case ggpo.EventCodeConnectionInterrupted:
 		fmt.Println("EventCodeconnectionInterrupted")
 	case ggpo.EventCodeConnectionResumed:
@@ -793,6 +874,11 @@ func NewRollbackSession(config RollbackProperties) RollbackSession {
 	r.replayAnalogInputs = make([][REPLAY_NUM_INPUTS][6]int8, 0)
 	r.inputs = make(map[int][MaxPlayerNo]InputBits)
 	r.analogInputs = make(map[int][MaxPlayerNo][6]int8)
+	// Frame -1 marks "never recorded" so ring slot 0 can't false-match frame 0.
+	r.checksumHistory = make([]checksumSnap, checksumHistorySize)
+	for i := range r.checksumHistory {
+		r.checksumHistory[i].frame = -1
+	}
 	return r
 
 }
@@ -801,11 +887,235 @@ func encodeInputs(inputs InputBits) []byte {
 	return writeI16(int16(inputs))
 }
 
+// --- Desync diagnostics ----------------------------------------------------
+//
+// LiveChecksum folds a handful of state fields into ONE crc per frame, and the
+// peers exchange only that crc - so when they disagree, the error can't say
+// WHICH field diverged. This ring keeps the raw components for recent frames,
+// keyed by the same frame numbers the checksum exchange uses, so the desync
+// event (which carries NumFrameOfDesync) can print the actual numbers on each
+// player's error screen. Two screenshots, compared line by line, identify the
+// diverging field - which is the difference between a diagnosis and a shrug.
+//
+// Fixed-size structs in a preallocated ring: no per-frame allocation, so this
+// adds no GC pressure to the netplay path. Overwrites per frame mirror the
+// pendingChecksums.Set(frame, ...) semantics in ggpo's AdvanceFrame - during a
+// rollback re-simulation the corrected values replace the speculative ones,
+// same as the checksum itself.
+//
+// NOTE: if LiveChecksum ever hashes a new field, mirror it here and in
+// recordChecksumSnap, or the dump will say "everything matches" while the crc
+// disagrees. Selection-phase hashes (roundState 1: stage/char names) are
+// deliberately not itemised - a selection mismatch identifies itself.
+
+const checksumHistorySize = 1024 // ~17s at 60fps; detection lag is far below this
+
+type checksumSnap struct {
+	frame        int32
+	roundState   int32
+	randseed     int32
+	matchTime    int32
+	curRoundTime int32
+	score        [2]float32
+	combo        [2]int32
+	present      [MaxPlayerNo]bool
+	life         [MaxPlayerNo]int32
+	redLife      [MaxPlayerNo]int32
+	dizzy        [MaxPlayerNo]int32
+	guard        [MaxPlayerNo]int32
+	power        [MaxPlayerNo]int32
+	animNo       [MaxPlayerNo]int32
+	stateNo      [MaxPlayerNo]int32
+	// Live helper count per slot. LiveChecksum hashes sys.chars[i][0] and
+	// nothing else, so every helper a character spawns is invisible to it -
+	// and characters branch on NumHelper() constantly. A helper divergence
+	// therefore stays silent until it changes which triggers evaluate, which
+	// changes how many times Random() is called, which finally shows up as a
+	// seed mismatch. By then the seed is the messenger and the helper is the
+	// culprit. Recording the count is cheap and names it directly.
+	helpers [MaxPlayerNo]int32
+	// Round timeline. NEITHER sys.intro NOR sys.winposetime is hashed by
+	// LiveChecksum at any round state, yet system.go's roundState-4 readiness
+	// freeze writes sys.intro from character state that is ALSO unhashed
+	// (ss.no, SCF_over_ko - c.ss.no is hashed at NO round state). That freeze is
+	// the only character-gated write to the round timeline, so a one-frame skew
+	// in it is permanent and completely silent. winposetime then drives
+	// inputWait(), which drives BufReset, which re-arms every press-edge test in
+	// the engine - including the fast-recovery RandI at char.go:12604, which
+	// stays permanently armed on a KO'd char lying in 5150 because
+	// down_recovertime only decrements in state 5110 and the dead leave it at
+	// once.
+	intro       int32
+	winposetime int32
+	// Round-transition CONSTANTS, not live state. fadeoutStart is what the
+	// RoundNotOver pin compares sys.intro against with an EQUALITY, and it is
+	// derived from fadeOut.duration() - which returns the fade ANIM's length
+	// when the anim is loaded and falls back to fa.time when it is not
+	// (rect.go: duration/animLength/colorFadeTime). If two peers disagree on
+	// that, fadeoutStart differs by a CONSTANT, the pin engages on one peer and
+	// not the other, and sys.intro carries a fixed offset for the rest of the
+	// session - which is exactly the field pattern: a constant 20-frame delta
+	// that persists, in sessions that desync from the start while others never
+	// do at all. Diagnostic only; neither value is hashed.
+	fadeoutStart int32
+	fadeDuration int32
+	// Per-frame Random() attribution, drained from sys each snap.
+	//
+	// "The peers are one draw apart" never said WHO drew. These do: total draws
+	// that frame, split by player, and split by statedef block (-4/-3/-2/-1/0).
+	// Comparing two dumps of the same desync localises the extra draw directly
+	// instead of inferring it from the seed.
+	rngDraws    int32
+	rngByPlayer [MaxPlayerNo]int32
+	rngByMinus  [6]int32
+}
+
+func (rs *RollbackSession) recordChecksumSnap() {
+	if rs.checksumHistory == nil {
+		return
+	}
+	// SyncTest sessions have their own frame-by-frame comparison machinery;
+	// only a real peer session exposes the frame the checksum is keyed to.
+	frame := -1
+	if p, ok := rs.backend.(*ggpo.Peer); ok {
+		frame = p.CurrentFrame()
+	}
+	if frame < 0 {
+		return
+	}
+	sn := &rs.checksumHistory[frame%checksumHistorySize]
+	*sn = checksumSnap{} // clear stale slots from the frame this overwrites
+	sn.frame = int32(frame)
+	state := sys.roundState()
+	sn.roundState = state
+	sn.randseed = sys.randseed
+	sn.matchTime = sys.matchTime
+	sn.curRoundTime = sys.curRoundTime
+	for i := range sys.scorePoints {
+		sn.score[i] = sys.scorePoints[i]
+		sn.combo[i] = sys.comboCount[i]
+	}
+	// RECORD CHARACTER STATE AT EVERY ROUND STATE, not only 2 and 3.
+	//
+	// LiveChecksum itself only HASHES character data during 2/3, and this ring
+	// originally mirrored that. The consequence showed up the first time a real
+	// desync was captured: it fired at roundState 4, where the crc covers just
+	// five system fields, so the dump carried no per-character lines at all and
+	// could only say "the RNG seed diverged" - true, but the seed was the
+	// messenger, not the culprit.
+	//
+	// The ring is a diagnostic, not the checksum: it is free to record MORE
+	// than is hashed, and recording character state at 1 and 4 costs a handful
+	// of array writes into an already-allocated slot. When a divergence shows
+	// up in the seed at round-over, the accompanying state and anim numbers are
+	// what turn "some RNG call differed" into "this character was in a
+	// different state on the two machines".
+	//
+	// stateNo is new here for the same reason: animNo alone says what is being
+	// drawn, while ss.no says which state the character is actually IN, which
+	// is what decides whether a `random` trigger gets evaluated.
+	for i := range sys.chars {
+		if len(sys.chars[i]) == 0 {
+			continue
+		}
+		c := sys.chars[i][0]
+		sn.present[i] = true
+		sn.life[i] = c.life
+		sn.redLife[i] = c.redLife
+		sn.dizzy[i] = c.dizzyPoints
+		sn.guard[i] = c.guardPoints
+		sn.power[i] = c.power
+		sn.animNo[i] = c.animNo
+		sn.stateNo[i] = c.ss.no
+		// index 0 is the root; everything after it is a helper
+		sn.helpers[i] = int32(len(sys.chars[i]) - 1)
+	}
+	sn.intro = sys.intro
+	sn.winposetime = sys.winposetime
+	sn.fadeDuration = sys.fightScreen.round.fadeOut.duration()
+	sn.fadeoutStart = -sys.fightScreen.round.over_waittime - 2 -
+		sys.fightScreen.round.overTime() + sn.fadeDuration
+	// Drain the draw counters into this frame's slot. A rollback re-simulates
+	// these frames and overwrites the slot, so what survives is the FINAL
+	// accepted simulation - which is exactly what the peer compared against.
+	sn.rngDraws = sys.rngDraws
+	sn.rngByPlayer = sys.rngByPlayer
+	sn.rngByMinus = sys.rngByMinus
+	sys.rngDraws = 0
+	sys.rngByPlayer = [MaxPlayerNo]int32{}
+	sys.rngByMinus = [6]int32{}
+}
+
+func (r *RollbackSession) checksumSnapFor(frame int) *checksumSnap {
+	if r.checksumHistory == nil || frame < 0 {
+		return nil
+	}
+	sn := &r.checksumHistory[frame%checksumHistorySize]
+	if int(sn.frame) != frame {
+		return nil // ring has wrapped past it, or it was never recorded
+	}
+	return sn
+}
+
+// SHORT LINES ON PURPOSE. This is read off a screenshot of the warning screen,
+// which does not wrap - the first field-captured dump ran off the right edge
+// and lost a value. Nothing here should exceed roughly 40 characters.
+func formatChecksumSnap(sn *checksumSnap) string {
+	s := fmt.Sprintf("seed=%d rs%d", sn.randseed, sn.roundState)
+	s += fmt.Sprintf("\nmt=%d crt=%d", sn.matchTime, sn.curRoundTime)
+	s += fmt.Sprintf("\nsp=%.0f/%.0f cc=%d/%d",
+		sn.score[0], sn.score[1], sn.combo[0], sn.combo[1])
+	for i := 0; i < MaxPlayerNo; i++ {
+		if !sn.present[i] {
+			continue
+		}
+		// Two short lines per player rather than one long one, same reason.
+		s += fmt.Sprintf("\np%d st=%d anim=%d life=%d",
+			i+1, sn.stateNo[i], sn.animNo[i], sn.life[i])
+		s += fmt.Sprintf("\np%d rl=%d dz=%d pw=%d hlp=%d",
+			i+1, sn.redLife[i], sn.dizzy[i], sn.power[i], sn.helpers[i])
+	}
+	// MERGED onto the intro line, deliberately: the warning screen CLIPS at the
+	// bottom and the rngm line below has never once been visible in a field
+	// capture. A new line here would push this one off too. fs sits beside the
+	// value it explains, and intro= has been fully visible in every dump so far.
+	s += fmt.Sprintf("\nintro=%d wpt=%d fs=%d fd=%d",
+		sn.intro, sn.winposetime, sn.fadeoutStart, sn.fadeDuration)
+	s += fmt.Sprintf("\nrng=%d p=%d/%d",
+		sn.rngDraws, sn.rngByPlayer[0], sn.rngByPlayer[1])
+	// Draws split by statedef block: -4/-3/-2/-1/0, then draws with no working
+	// char (engine-side, e.g. music or the round timeline).
+	s += fmt.Sprintf("\nrngm %d/%d/%d/%d/%d eng=%d",
+		sn.rngByMinus[0], sn.rngByMinus[1], sn.rngByMinus[2],
+		sn.rngByMinus[3], sn.rngByMinus[4], sn.rngByMinus[5])
+	return s
+}
+
 func (rs *RollbackSession) LiveChecksum() uint32 {
 	// System variables. Check always
 	buf := writeI32(sys.randseed)
 	buf = append(buf, writeI32(sys.matchTime)...)
 	buf = append(buf, writeI32(sys.curRoundTime)...)
+	// THE ROUND TIMELINE. sys.intro drives roundState() outright - roundState is
+	// a pure function of it (system.go) - and therefore decides when the round
+	// ends and runNextRound()/resetRound() fire. Leaving it out meant the two
+	// peers' timelines could drift apart SILENTLY, frame after frame, and the
+	// checksum only noticed once one peer reset the round and moved
+	// curRoundTime and scorePoints, which ARE hashed.
+	//
+	// That is why four captured desyncs all reported the identical values
+	// (intro=-327/wpt=-332 against intro=80/wpt=45): those are fixed points in
+	// the reset, not the moment of divergence. Even with the first-mismatch
+	// guard, the dumps showed the two peers a whole ROUND apart and could
+	// therefore name a symptom but never a cause.
+	//
+	// Hashing them makes the desync fire on the frame the timelines actually
+	// part, where the two dumps differ by one frame instead of by a round.
+	// Deliberate trade: a match now dies at the cause instead of surviving to
+	// the end of the round - but it was already doomed at that point, since an
+	// intro drift never converges.
+	buf = append(buf, writeI32(sys.intro)...)
+	buf = append(buf, writeI32(sys.winposetime)...)
 	for i := range sys.scorePoints {
 		buf = binary.BigEndian.AppendUint32(buf, math.Float32bits(sys.scorePoints[i]))
 		buf = binary.BigEndian.AppendUint32(buf, uint32(sys.comboCount[i]))
@@ -854,6 +1164,10 @@ func (rs *RollbackSession) LiveChecksum() uint32 {
 			//buf = binary.BigEndian.AppendUint32(buf, math.Float32bits(cc.pos[2]))
 		}
 	}
+
+	// Record the raw components under the same frame number this crc will be
+	// keyed to, so a later desync event can print them (see checksumSnap).
+	rs.recordChecksumSnap()
 
 	return crc32.ChecksumIEEE(buf)
 }

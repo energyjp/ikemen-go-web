@@ -26,7 +26,7 @@ const (
 	REPLAY_NUM_INPUTS  = MaxSimul * 2
 	REPLAY_INPUT_BYTES = 2 + 6
 
-	syncConfigVersion     uint16 = 1
+	syncConfigVersion     uint16 = 2
 	replayFormatVersion   uint16 = 2
 	replayMagic                  = "IKRPLCFG"
 	replaySyncMagic              = "IKRPLSYN"
@@ -73,6 +73,8 @@ type SyncHandshake struct {
 	Strict             []SyncSetting `json:"strict,omitempty"`
 	Host               []SyncSetting `json:"host,omitempty"`
 	ContentFingerprint string        `json:"content_fingerprint,omitempty"`
+	RoundFadeTime      int32         `json:"round_fade_time,omitempty"`
+	RoundFadeInTime    int32         `json:"round_fade_in_time,omitempty"`
 }
 
 type ReplayHeader struct {
@@ -81,6 +83,8 @@ type ReplayHeader struct {
 	Strict             []SyncSetting `json:"strict,omitempty"`
 	Host               []SyncSetting `json:"host,omitempty"`
 	ContentFingerprint string        `json:"content_fingerprint,omitempty"`
+	RoundFadeTime      int32         `json:"round_fade_time,omitempty"`
+	RoundFadeInTime    int32         `json:"round_fade_in_time,omitempty"`
 }
 
 type SessionConfigOverride struct {
@@ -91,6 +95,8 @@ type SessionConfigOverride struct {
 	AppliedHost        []SyncSetting
 	SyncVersion        uint16
 	ContentFingerprint string
+	RoundFadeTime      int32
+	RoundFadeInTime    int32
 }
 
 // -----------------------------------------------------------------------------
@@ -264,6 +270,11 @@ func (nc *NetConnection) Close() {
 		<-nc.recvEnd
 		close(nc.recvEnd)
 		nc.recvEnd = nil
+	}
+	if nc.recording != nil {
+		nc.recording.Close()
+		nc.recording = nil
+		nc.headerWritten = false
 	}
 	nc.conn = nil
 	nc.uiInputDebounced = false
@@ -902,6 +913,8 @@ type ReplayFile struct {
 	strictSettings     []SyncSetting
 	hostSettings       []SyncSetting
 	contentFingerprint string
+	roundFadeTime      int32
+	roundFadeInTime    int32
 }
 
 func OpenReplayFile(filename string) *ReplayFile {
@@ -926,6 +939,8 @@ func OpenReplayFile(filename string) *ReplayFile {
 	out.strictSettings = cloneSyncSettings(header.Strict)
 	out.hostSettings = cloneSyncSettings(header.Host)
 	out.contentFingerprint = header.ContentFingerprint
+	out.roundFadeTime = header.RoundFadeTime
+	out.roundFadeInTime = header.RoundFadeInTime
 
 	log.Printf("Replay file opened: %s", filename)
 	return out
@@ -1413,7 +1428,7 @@ func (s *System) currentContentFingerprint() string {
 	return ""
 }
 
-func (s *System) beginSessionOverride(source string, strict, host []SyncSetting, contentFingerprint string) error {
+func (s *System) beginSessionOverride(source string, strict, host []SyncSetting, contentFingerprint string, roundFadeTime, roundFadeInTime int32) error {
 	if s.netplayOverride.Active {
 		return nil
 	}
@@ -1436,6 +1451,8 @@ func (s *System) beginSessionOverride(source string, strict, host []SyncSetting,
 		AppliedHost:        cloneSyncSettings(host),
 		SyncVersion:        syncConfigVersion,
 		ContentFingerprint: contentFingerprint,
+		RoundFadeTime:      roundFadeTime,
+		RoundFadeInTime:    roundFadeInTime,
 	}
 	log.Printf("%s sync config override started: strict=%d host=%d fingerprint=%q",
 		strings.Title(source), len(strict), len(host), contentFingerprint)
@@ -1471,6 +1488,8 @@ func (s *System) currentReplayHeader() *ReplayHeader {
 		Strict:             cloneSyncSettings(s.netplayOverride.Strict),
 		Host:               cloneSyncSettings(s.netplayOverride.AppliedHost),
 		ContentFingerprint: s.netplayOverride.ContentFingerprint,
+		RoundFadeTime:      s.netplayOverride.RoundFadeTime,
+		RoundFadeInTime:    s.netplayOverride.RoundFadeInTime,
 	}
 }
 
@@ -1478,6 +1497,52 @@ func (s *System) popSessionWarning() string {
 	text := s.sessionWarning
 	s.sessionWarning = ""
 	return text
+}
+
+// localRoundFadeTime reads the round fade length this peer would use if nothing
+// pinned it. rect.go:85 is the ONLY write to Fade.time in the engine, and the
+// only cross-template caller that targets the shared fight-screen fade is demo
+// mode (motif.go:3929), so this value can silently differ between peers.
+func (s *System) localRoundFadeTime() int32 {
+	if s.fightScreen.round == nil || s.fightScreen.round.fadeOut == nil {
+		return 0
+	}
+	return s.fightScreen.round.fadeOut.time
+}
+
+// localRoundFadeInTime is the fadeIn counterpart. round.fadeIn is clobbered by
+// the same demo-mode write (motif.go:3919) that clobbers fadeOut, and it gates
+// intro stepping, so pinning only fadeOut would leave half the divergence live.
+func (s *System) localRoundFadeInTime() int32 {
+	if s.fightScreen.round == nil || s.fightScreen.round.fadeIn == nil {
+		return 0
+	}
+	return s.fightScreen.round.fadeIn.time
+}
+
+// applySyncedRoundFade pins the round fade to the host's value. Must run before
+// the first rollback snapshot of the match, i.e. before resetRound().
+// 0 means "no pinned value" (peer predates the field), so behaviour is unchanged.
+func (s *System) applySyncedRoundFade() {
+	if !s.netplayOverride.Active || s.fightScreen.round == nil {
+		return
+	}
+	// A non-positive value means "the peer sent nothing to pin" - leave the
+	// local value alone rather than forcing it to 0, which would itself desync.
+	if s.netplayOverride.RoundFadeTime > 0 && s.fightScreen.round.fadeOut != nil {
+		if s.fightScreen.round.fadeOut.time != s.netplayOverride.RoundFadeTime {
+			log.Printf("Round fadeOut pinned to host value: local=%d host=%d",
+				s.fightScreen.round.fadeOut.time, s.netplayOverride.RoundFadeTime)
+		}
+		s.fightScreen.round.fadeOut.time = s.netplayOverride.RoundFadeTime
+	}
+	if s.netplayOverride.RoundFadeInTime > 0 && s.fightScreen.round.fadeIn != nil {
+		if s.fightScreen.round.fadeIn.time != s.netplayOverride.RoundFadeInTime {
+			log.Printf("Round fadeIn pinned to host value: local=%d host=%d",
+				s.fightScreen.round.fadeIn.time, s.netplayOverride.RoundFadeInTime)
+		}
+		s.fightScreen.round.fadeIn.time = s.netplayOverride.RoundFadeInTime
+	}
 }
 
 func (s *System) synchronizeNetplayConfig(nc *NetConnection) (*ReplayHeader, error) {
@@ -1494,6 +1559,8 @@ func (s *System) synchronizeNetplayConfig(nc *NetConnection) (*ReplayHeader, err
 		return nil, err
 	}
 	localFingerprint := s.currentContentFingerprint()
+	localRoundFade := s.localRoundFadeTime()
+	localRoundFadeIn := s.localRoundFadeInTime()
 
 	if nc.host {
 		hostPayload := SyncHandshake{
@@ -1501,6 +1568,8 @@ func (s *System) synchronizeNetplayConfig(nc *NetConnection) (*ReplayHeader, err
 			Strict:             localStrict,
 			Host:               localHost,
 			ContentFingerprint: localFingerprint,
+			RoundFadeTime:      localRoundFade,
+			RoundFadeInTime:    localRoundFadeIn,
 		}
 		log.Printf("Netplay sync config host->peer: sending strict=%d host=%d fingerprint=%q",
 			len(localStrict), len(localHost), localFingerprint)
@@ -1526,7 +1595,7 @@ func (s *System) synchronizeNetplayConfig(nc *NetConnection) (*ReplayHeader, err
 		if err := validateContentFingerprint(localFingerprint, guestPayload.ContentFingerprint); err != nil {
 			return nil, err
 		}
-		if err := s.beginSessionOverride("netplay", localStrict, localHost, localFingerprint); err != nil {
+		if err := s.beginSessionOverride("netplay", localStrict, localHost, localFingerprint, localRoundFade, localRoundFadeIn); err != nil {
 			return nil, err
 		}
 		return s.currentReplayHeader(), nil
@@ -1544,6 +1613,8 @@ func (s *System) synchronizeNetplayConfig(nc *NetConnection) (*ReplayHeader, err
 		Strict:             localStrict,
 		Host:               localHost,
 		ContentFingerprint: localFingerprint,
+		RoundFadeTime:      localRoundFade,
+		RoundFadeInTime:    localRoundFadeIn,
 	}
 	sendGuestPayload := func() error {
 		log.Printf("Netplay sync config peer->host ack: sending strict=%d host=%d fingerprint=%q",
@@ -1575,7 +1646,7 @@ func (s *System) synchronizeNetplayConfig(nc *NetConnection) (*ReplayHeader, err
 		}
 		return nil, err
 	}
-	if err := s.beginSessionOverride("netplay", hostPayload.Strict, hostPayload.Host, hostPayload.ContentFingerprint); err != nil {
+	if err := s.beginSessionOverride("netplay", hostPayload.Strict, hostPayload.Host, hostPayload.ContentFingerprint, hostPayload.RoundFadeTime, hostPayload.RoundFadeInTime); err != nil {
 		return nil, err
 	}
 
@@ -1606,5 +1677,5 @@ func (s *System) beginReplaySession(rf *ReplayFile) error {
 		return err
 	}
 	log.Printf("Replay strict compatibility check: OK")
-	return s.beginSessionOverride("replay", rf.strictSettings, rf.hostSettings, rf.contentFingerprint)
+	return s.beginSessionOverride("replay", rf.strictSettings, rf.hostSettings, rf.contentFingerprint, rf.roundFadeTime, rf.roundFadeInTime)
 }

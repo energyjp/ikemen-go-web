@@ -56,23 +56,24 @@ func newPalFXDef() *PalFXDef {
 
 type PalFX struct {
 	PalFXDef
-	remap        []int
-	allowNeg     bool // Can use negative color math
-	sintime      [4]int32
-	enable       bool
-	eAllowNeg    bool
-	eInvertall   bool
-	eInvertblend int32
-	eAdd         [3]int32
-	eMul         [3]int32
-	eColor       float32
-	eHue         float32
-	eInterpolate bool
-	eiAdd        [3]int32
-	eiMul        [3]int32
-	eiColor      float32
-	eiHue        float32
-	eiTime       int32
+	remap          []int
+	allowNeg       bool // Can use negative color math
+	sintime        [4]int32
+	enable         bool
+	ignoreAllPalFX bool // TODO: Probably expose this as a parameter
+	eAllowNeg      bool
+	eInvertall     bool
+	eInvertblend   int32
+	eAdd           [3]int32
+	eMul           [3]int32
+	eColor         float32
+	eHue           float32
+	eInterpolate   bool
+	eiAdd          [3]int32
+	eiMul          [3]int32
+	eiColor        float32
+	eiHue          float32
+	eiTime         int32
 }
 
 func newPalFX() *PalFX {
@@ -92,6 +93,10 @@ func (pf *PalFX) clear() {
 }
 
 func (pf *PalFX) getSynFx(blendMode TransType, alpha [2]int32) *PalFX {
+	if pf != nil && pf.ignoreAllPalFX {
+		return pf
+	}
+
 	if pf == nil || !pf.enable {
 		if blendMode == TT_sub && sys.allPalFX.enable {
 			if pf == nil {
@@ -107,9 +112,11 @@ func (pf *PalFX) getSynFx(blendMode TransType, alpha [2]int32) *PalFX {
 			return sys.allPalFX
 		}
 	}
+
 	if !sys.allPalFX.enable {
 		return pf
 	}
+
 	synth := *pf
 	synth.synthesize(sys.allPalFX, blendMode, alpha)
 	return &synth
@@ -268,40 +275,77 @@ func (pf *PalFX) interpolationUpdate() {
 	pf.eHue = pf.eiHue + pf.hue
 }
 
-func (pf *PalFX) step() {
+// Updates the effective values. Does not step timers
+// Explods need this separation because they appear at tickFrame() but their PalFX only updates at tickNextFrame()
+func (pf *PalFX) refresh() {
 	pf.enable = pf.time != 0
-	if pf.enable {
-		pf.eInterpolate = pf.interpolate
-		if pf.eInterpolate {
-			pf.interpolationUpdate()
-		} else {
-			pf.eMul = pf.mul
-			pf.eAdd = pf.add
-			pf.eColor = pf.color
-			pf.eHue = pf.hue
+	if !pf.enable {
+		return
+	}
+
+	pf.eInterpolate = pf.interpolate
+
+	if pf.eInterpolate {
+		// Calculate interpolated values
+		t := float32(0)
+		if pf.itime > 0 {
+			t = float32(pf.eiTime) / float32(pf.itime)
 		}
-		pf.eInvertall = pf.invertall
-		if pf.invertblend <= -2 && pf.eInvertall {
-			pf.eInvertblend = 3
-		} else {
-			pf.eInvertblend = pf.invertblend
+		for i := 0; i < 3; i++ {
+			pf.eiMul[i] = int32(Lerp(float32(pf.imul[i+3]), float32(pf.imul[i]), t))
+			pf.eMul[i] = int32(float32(pf.eiMul[i]) * float32(pf.mul[i]) / 256)
+			pf.eiAdd[i] = int32(Lerp(float32(pf.iadd[i+3]), float32(pf.iadd[i]), t))
+			pf.eAdd[i] = pf.eiAdd[i] + pf.add[i]
 		}
-		pf.eAllowNeg = pf.allowNeg
-		pf.sinAdd(&pf.eAdd)
-		pf.sinMul(&pf.eMul)
-		pf.sinColor(&pf.eColor)
-		pf.sinHueshift(&pf.eHue)
-		if sys.tickFrame() {
-			for i := 0; i < 4; i++ {
-				if pf.cycletime[i] > 0 {
-					pf.sintime[i] = (pf.sintime[i] + 1) % pf.cycletime[i]
-				}
-			}
-			if pf.time > 0 {
-				pf.time--
-			}
+		pf.eiColor = Lerp(pf.icolor[1], pf.icolor[0], t)
+		pf.eColor = pf.eiColor * pf.color
+		pf.eiHue = Lerp(pf.ihue[1], pf.ihue[0], t)
+		pf.eHue = pf.eiHue + pf.hue
+	} else {
+		// Static values
+		pf.eMul = pf.mul
+		pf.eAdd = pf.add
+		pf.eColor = pf.color
+		pf.eHue = pf.hue
+	}
+
+	pf.eAllowNeg = pf.allowNeg
+	pf.eInvertall = pf.invertall
+	if pf.invertblend <= -2 && pf.eInvertall {
+		pf.eInvertblend = 3
+	} else {
+		pf.eInvertblend = pf.invertblend
+	}
+
+	// Sin effects
+	pf.sinAdd(&pf.eAdd)
+	pf.sinMul(&pf.eMul)
+	pf.sinColor(&pf.eColor)
+	pf.sinHueshift(&pf.eHue)
+}
+
+// Only responsible for stepping the timers
+func (pf *PalFX) tickTimers() {
+	if !pf.enable || !sys.tickFrame() {
+		return
+	}
+	for i := 0; i < 4; i++ {
+		if pf.cycletime[i] > 0 {
+			pf.sintime[i] = (pf.sintime[i] + 1) % pf.cycletime[i]
 		}
 	}
+	if pf.eInterpolate && pf.eiTime < pf.itime {
+		pf.eiTime++
+	}
+	if pf.time > 0 {
+		pf.time--
+	}
+}
+
+// The main PalFX update call
+func (pf *PalFX) step() {
+	pf.refresh()
+	pf.tickTimers()
 }
 
 func (pf *PalFX) synthesize(pfx *PalFX, blendMode TransType, alpha [2]int32) {
@@ -363,19 +407,67 @@ func (pf *PalFX) synthesize(pfx *PalFX, blendMode TransType, alpha [2]int32) {
 
 }
 
-func (pf *PalFX) setColor(r, g, b int32) {
-	rNormalized := Clamp(r, 0, 255)
-	gNormalized := Clamp(g, 0, 255)
-	bNormalized := Clamp(b, 0, 255)
-
-	pf.enable = true
-	pf.eColor = 1
-	pf.eHue = 0
-	pf.eMul = [...]int32{
-		256 * rNormalized >> 8,
-		256 * gNormalized >> 8,
-		256 * bNormalized >> 8,
+// Returns a copy of the PalFX with another one stacked on top
+// Used so a BG's own PalFX and a global BGPalFX can stack
+func (pf *PalFX) withStacked(extra *PalFX, blendMode TransType, alpha [2]int32) *PalFX {
+	// No extra. Do nothing
+	if extra == nil || !extra.enable {
+		return pf
 	}
+
+	var out PalFX
+	if pf != nil && pf.enable {
+		// Stack both
+		out = *pf
+		out.synthesize(extra, blendMode, alpha)
+	} else {
+		// Use extra only
+		out = *extra
+	}
+
+	return &out
+}
+
+// Returns a copy of the PalFX with font frgba applied as a base color
+// To do this perfectly correctly we'd need more shader uniforms
+// However, this should still be better than making font color parameter overwrite PalFX like before
+func (pf *PalFX) withStackedColor(r, g, b float32) *PalFX {
+	usesColor := r != 1.0 || g != 1.0 || b != 1.0
+	if !usesColor {
+		return pf
+	}
+
+	var pfx *PalFX
+	if pf == nil {
+		// No existing PalFX: create a new one because RenderSprite expects a non-nil PalFX to apply color
+		pfx = newPalFX()
+	} else {
+		// Create a shallow copy of the original PalFX
+		tmp := *pf
+		pfx = &tmp
+	}
+
+	// Force the copy to be enabled
+	pfx.enable = true
+
+	// Check status of the original PalFX
+	if pf == nil || (!pf.enable && pf.time == 0) {
+		// Uninitialized or disabled: set color directly from RGB
+		pfx.eMul[0] = int32(256 * r)
+		pfx.eMul[1] = int32(256 * g)
+		pfx.eMul[2] = int32(256 * b)
+		// eColor defaults to 0 in this case, resulting in grayscale
+		// Set to 1 so the sprite's own colors are multiplied instead of overridden
+		// https://github.com/ikemen-engine/Ikemen-GO/issues/3956
+		pfx.eColor = 1
+	} else {
+		// Active: stack RGB on top of existing eMul
+		pfx.eMul[0] = int32(float32(pf.eMul[0]) * r)
+		pfx.eMul[1] = int32(float32(pf.eMul[1]) * g)
+		pfx.eMul[2] = int32(float32(pf.eMul[2]) * b)
+	}
+
+	return pfx
 }
 
 type Palette struct {
@@ -399,11 +491,13 @@ type PaletteList struct {
 	numcols    map[[2]uint16]int
 	PalTex     []Texture
 	// PalTable can only name one palette per key, but an SFF may declare the same
-	// key more than once, and its sprites can reference those extra palettes by
-	// index. They are the same palette as far as the character is concerned, so a
-	// remap of the key has to move them too or they stay stuck on the colors they
-	// loaded with. Maps each extra palette to the index PalTable kept for its key.
-	palAlias map[int]int
+	// key more than once, or link one entry to another, and its sprites can
+	// reference those extra entries by index. They are the same palette as far
+	// as the character is concerned, so a remap of the key has to move them too
+	// or they stay stuck on the colors they loaded with. Maps a physical palette
+	// to every other logical index that resolves to it (upstream #3854; this
+	// replaced the fork's palAlias, which knew only about duplicate keys).
+	duplicatePals map[int][]int
 }
 
 func (pl *PaletteList) init() {
@@ -412,18 +506,7 @@ func (pl *PaletteList) init() {
 	pl.PalTable = make(map[[2]uint16]int)
 	pl.numcols = make(map[[2]uint16]int)
 	pl.PalTex = nil
-	pl.palAlias = make(map[int]int)
-}
-
-// AliasesOf returns the extra palettes that declared the same key as idx
-func (pl *PaletteList) AliasesOf(idx int) []int {
-	var out []int
-	for dup, canon := range pl.palAlias {
-		if canon == idx && dup != idx {
-			out = append(out, dup)
-		}
-	}
-	return out
+	pl.duplicatePals = make(map[int][]int)
 }
 
 func (pl *PaletteList) SetSource(i int, p []uint32) {
@@ -639,17 +722,18 @@ func readActPalette(filename string) ([]uint32, error) {
 }
 
 type Sprite struct {
-	Pal      []uint32
-	Tex      Texture
-	Group    uint16 // Group index: valid range 0–65535
-	Number   uint16 // Sprite index: valid range 0–65535
-	Size     [2]uint16
-	Offset   [2]int16
-	palidx   int
-	rle      int
-	coldepth byte
-	paltemp  []uint32
-	PalTex   Texture
+	Pal          []uint32
+	Tex          Texture
+	Group        uint16 // Group index: valid range 0–65535
+	Number       uint16 // Sprite index: valid range 0–65535
+	Size         [2]uint16
+	Offset       [2]int16
+	palidx       int
+	rle          int
+	coldepth     byte
+	paltemp      []uint32
+	PalTex       Texture
+	sffv1BasePal bool // SFFv1 sprite palette duplicates the base palette
 }
 
 func (s *Sprite) isBlank() bool {
@@ -857,6 +941,16 @@ func (s *Sprite) SetPxl(px []byte) {
 }
 
 func (s *Sprite) SetRaw(data []byte, sprWidth int32, sprHeight int32, sprDepth int32) {
+	if sprDepth == 32 {
+		// Normalize fully transparent RGBA pixels to prevent their RGB values from bleeding into visible pixels
+		for i := 0; i+3 < len(data); i += 4 {
+			if data[i+3] == 0 {
+				data[i] = 0
+				data[i+1] = 0
+				data[i+2] = 0
+			}
+		}
+	}
 	sys.mainThreadTask <- func() {
 		s.Tex = gfx.newTexture(sprWidth, sprHeight, sprDepth, sys.cfg.Video.RGBSpriteBilinearFilter)
 		s.Tex.SetData(data)
@@ -965,7 +1059,8 @@ func (s *Sprite) RlePcxDecode(rle []byte) (p []byte) {
 }
 
 func (s *Sprite) read(f io.ReadSeeker, sh *SffHeader, offset int64, datasize uint32,
-	nextSubheader uint32, prev *Sprite, pl *PaletteList) error {
+	nextSubheader uint32, prev *Sprite, pl *PaletteList, isCharFirstSprite bool) error {
+
 	read := func(x interface{}) error {
 		return binary.Read(f, binary.LittleEndian, x)
 	}
@@ -977,59 +1072,90 @@ func (s *Sprite) read(f io.ReadSeeker, sh *SffHeader, offset int64, datasize uin
 	if err := s.readPcxHeader(f, offset); err != nil {
 		return err
 	}
-	pcxHeaderStart := offset
-	pcxDataStart := pcxHeaderStart + 128
+	pcxDataStart := offset + 128
 
-	var blockEnd int64
-	if int64(nextSubheader) > offset {
-		blockEnd = int64(nextSubheader)
+	var px []byte
+	var paletteOffset int64
+
+	if isCharFirstSprite {
+		// Preserve legacy SFFv1 handling for the character's 0,0 sprite
+		if int64(nextSubheader) > offset {
+			datasize = nextSubheader - uint32(offset)
+		}
+
+		rleSize := int64(datasize) - 128
+		if rleSize < 0 {
+			rleSize = 0
+		}
+
+		px = make([]byte, rleSize)
+		f.Seek(pcxDataStart, io.SeekStart)
+
+		if err := read(px); err != nil {
+			return err
+		}
+
+		paletteOffset = offset + int64(datasize) - 768
 	} else {
-		blockEnd = offset + int64(datasize)
-	}
+		// Use the padding-safe handling for regular SFFv1 sprites
+		var blockEnd int64
+		if int64(nextSubheader) > offset {
+			blockEnd = int64(nextSubheader)
+		} else {
+			blockEnd = offset + int64(datasize)
+		}
 
-	paletteOffset := int64(-1)
-	if !paletteSame {
-		// If new palette, search for PCX 0x0C marker to skip padding
-		var b [1]byte
-		scanStart := blockEnd - 769
-		scanLimit := pcxDataStart
+		if paletteSame {
+			paletteOffset = blockEnd
+		} else {
+			var b [1]byte
+			paletteOffset = -1
 
-		for pos := scanStart; pos >= scanLimit; pos-- {
-			f.Seek(pos, 0)
-			f.Read(b[:])
-			if b[0] == 0x0C {
-				paletteOffset = pos
-				break
+			for pos := blockEnd - 769; pos >= pcxDataStart; pos-- {
+				f.Seek(pos, io.SeekStart)
+
+				if _, err := f.Read(b[:]); err != nil {
+					return err
+				}
+
+				if b[0] == 0x0C {
+					paletteOffset = pos
+					break
+				}
+			}
+
+			if paletteOffset < 0 {
+				paletteOffset = blockEnd - 769
 			}
 		}
-		if paletteOffset == -1 {
-			paletteOffset = blockEnd - 769
+
+		rleSize := paletteOffset - pcxDataStart
+		if rleSize < 0 {
+			rleSize = 0
 		}
-	} else {
-		paletteOffset = blockEnd
-	}
-	// RLE size is distance between PCX data start and palette marker. This removes padding
-	rleSize := paletteOffset - pcxDataStart
-	if rleSize < 0 {
-		rleSize = 0
+
+		px = make([]byte, rleSize)
+		f.Seek(pcxDataStart, io.SeekStart)
+
+		if err := read(px); err != nil {
+			return err
+		}
 	}
 
-	px := make([]byte, rleSize)
-	f.Seek(pcxDataStart, 0)
-	if err := read(px); err != nil {
-		return err
-	}
 	if paletteSame {
-		if prev != nil {
-			s.palidx = prev.palidx
-		}
+		s.palidx = prev.palidx
 		if s.palidx < 0 {
 			s.palidx, _ = pl.NewPal()
 		}
 	} else {
 		var pal []uint32
 		s.palidx, pal = pl.NewPal()
-		f.Seek(paletteOffset+1, 0) // Skip marker
+		f.Seek(paletteOffset, io.SeekStart)
+		// The regular path finds the 0x0C marker, while the legacy
+		// character path points directly at the palette
+		if !isCharFirstSprite {
+			f.Seek(1, io.SeekCurrent)
+		}
 		var rgb [3]byte
 		for i := range pal {
 			if err := read(rgb[:]); err != nil {
@@ -1517,22 +1643,6 @@ func newSff() (s *Sff) {
 	return
 }
 
-/*
-// A simple SFF cache storing shallow copies
-type SffCacheEntry struct {
-	sffData  Sff
-	refCount int
-}
-
-var SffCache = map[string]*SffCacheEntry{}
-
-func removeSFFCache(filename string) {
-	if _, ok := SffCache[filename]; ok {
-		delete(SffCache, filename)
-	}
-}
-*/
-
 // Find an already loaded SFF we can borrow. Replaces SFF caching
 func findActiveSff(filename string) *Sff {
 	// This would be clean, but it'd make multiple instances of the same character all do a full SFF reload
@@ -1639,8 +1749,9 @@ func loadSff(filename string, char bool, isMainThread bool, isActPal bool) (*Sff
 		} else {
 			switch s.header.Version[0] {
 			case 1:
+				isCharFirstSprite := char && (prev == nil || spriteList[i].Group == 0 && spriteList[i].Number == 0)
 				if err := spriteList[i].read(f, &s.header, shofs+32, size,
-					xofs, prev, &s.palList); err != nil {
+					xofs, prev, &s.palList, isCharFirstSprite); err != nil {
 					return nil, err
 				}
 				if isActPal {
@@ -1677,19 +1788,62 @@ func loadSff(filename string, char bool, isMainThread bool, isActPal bool) (*Sff
 		return nil, ErrLoadingCanceled
 	}
 
-	/*
-		SffCache[filename] = &SffCacheEntry{*s, 1}
-		runtime.SetFinalizer(s, func(s *Sff) {
-			if cached, ok := SffCache[filename]; ok {
-				cached.refCount--
-				if cached.refCount == 0 {
-					delete(SffCache, filename)
-				}
-			}
-		})
-	*/
-
 	return s, nil
+}
+
+// Tracks SFFv1 palette sharing while reading sprite headers
+type sffv1PalState struct {
+	state           int
+	current         int
+	location        int64
+	initialLocation int64
+}
+
+// Updates the current palette state based on the sprite header
+func (p *sffv1PalState) update(sprite *Sprite, ps byte, xofs uint32) {
+	if sprite.Group == 0 && sprite.Number == 0 {
+		p.state = 2
+		p.location = p.initialLocation
+	} else if ps == 0 && p.state == 2 {
+		p.state = 3
+		p.current++
+		p.location = int64(xofs - 768)
+	} else if ps == 0 {
+		if p.current == 0 {
+			p.state = 1
+		}
+		p.current++
+		p.location = int64(xofs - 768)
+	}
+}
+
+// Reads an SFFv1 palette from the specified file offset
+func readSffv1Palette(f io.ReadSeeker, read func(interface{}) error, offset int64) ([]uint32, error) {
+	if offset <= 0 {
+		return nil, nil
+	}
+
+	if _, err := f.Seek(offset, 0); err != nil {
+		return nil, err
+	}
+
+	pal := make([]uint32, 256)
+	var rgb [3]byte
+
+	for i := range pal {
+		if err := read(rgb[:]); err != nil {
+			return nil, err
+		}
+
+		var alpha = byte(255)
+		if i == 0 {
+			alpha = 0
+		}
+
+		pal[i] = uint32(alpha)<<24 | uint32(rgb[2])<<16 | uint32(rgb[1])<<8 | uint32(rgb[0])
+	}
+
+	return pal, nil
 }
 
 // Loads a SFF with only specific sprites
@@ -1735,13 +1889,9 @@ func preloadSff(filename string, char bool, preloadSpr map[[2]uint16]bool) (*Sff
 	headerXofs := make([]uint32, len(spriteList))
 	headerSize := make([]uint32, len(spriteList))
 	headerShofs32 := make([]int64, len(spriteList)) // only used with Version[0] == 1
-
-	//set various variables that let us know if a sprite should use it's own palette
-	paletteState := 0
-	currentPalette := 0
-	var paletteLocation int64
-	var initialPalLocation int64
+	var palState sffv1PalState
 	coloredPalette := -1
+	// Find the SFFv2 palette marked as the character's colored palette
 	if sff.header.Version[0] != 1 {
 		for i := 0; i < int(sff.header.NumberOfPalettes); i++ {
 			f.Seek(int64(sff.header.FirstPaletteHeaderOffset)+int64(i*16), 0)
@@ -1781,23 +1931,10 @@ func preloadSff(filename string, char bool, preloadSpr map[[2]uint16]bool) (*Sff
 				if err := read(&ps); err != nil {
 					return nil, nil, err
 				}
-				if spriteList[i].Group == 0 && spriteList[i].Number == 0 {
-					paletteState = 2
-					paletteLocation = initialPalLocation
-				} else if ps == 0 && paletteState == 2 {
-					paletteState = 3
-					currentPalette++
-					paletteLocation = int64(xofs - 768)
-				} else if ps == 0 {
-					if currentPalette == 0 {
-						paletteState = 1
-					}
-					currentPalette++
-					paletteLocation = int64(xofs - 768)
-				}
+				palState.update(spriteList[i], ps, xofs)
 			} else {
-				paletteLocation = int64(xofs - 768)
-				initialPalLocation = paletteLocation
+				palState.location = int64(xofs - 768)
+				palState.initialLocation = palState.location
 			}
 			shofs = shofs - 32
 			f.Seek(-1, 1) //Return to where it was.
@@ -1839,8 +1976,9 @@ func preloadSff(filename string, char bool, preloadSpr map[[2]uint16]bool) (*Sff
 						var err error
 						switch sff.header.Version[0] {
 						case 1:
-							err = spriteList[base].read(
-								f, &sff.header, headerShofs32[base], bsize, bxofs, prev, pl)
+							isCharFirstSprite := char && (prev == nil || spriteList[base].Group == 0 && spriteList[base].Number == 0)
+							err = spriteList[base].read(f, &sff.header, headerShofs32[base], bsize,
+								bxofs, prev, pl, isCharFirstSprite)
 						case 2:
 							err = spriteList[base].readV2(f, int64(bxofs), bsize)
 						}
@@ -1858,7 +1996,9 @@ func preloadSff(filename string, char bool, preloadSpr map[[2]uint16]bool) (*Sff
 			} else {
 				switch sff.header.Version[0] {
 				case 1:
-					if err := spriteList[i].read(f, &sff.header, int64(shofs+32), size, xofs, prev, pl); err != nil {
+					isCharFirstSprite := char && (prev == nil || spriteList[i].Group == 0 && spriteList[i].Number == 0)
+					if err := spriteList[i].read(f, &sff.header, int64(shofs+32), size,
+						xofs, prev, pl, isCharFirstSprite); err != nil {
 						return nil, nil, err
 					}
 				case 2:
@@ -1879,33 +2019,34 @@ func preloadSff(filename string, char bool, preloadSpr map[[2]uint16]bool) (*Sff
 							spriteList[i].palidx = 0
 						}
 						// Base or shared sprites, force palette read from file (keeps shared ones in sync)
-						if spriteList[i].Group == 0 && spriteList[i].Number == 0 || paletteState%2 == 0 {
-							if paletteLocation > 0 {
-								if _, err := f.Seek(paletteLocation, 0); err == nil {
-									pal := make([]uint32, 256)
-									var rgb [3]byte
-									ok := true
-									for c := range pal {
-										if err := read(rgb[:]); err != nil {
-											ok = false
-											break
-										}
-										var alpha byte = 255
-										if c == 0 {
-											alpha = 0
-										}
-										pal[c] = uint32(alpha)<<24 | uint32(rgb[2])<<16 | uint32(rgb[1])<<8 | uint32(rgb[0])
-									}
-									if ok {
-										spriteList[i].Pal = pal
-										spriteList[i].palidx = 0 // shared
-									}
-								}
-								f.Seek(int64(xofs), 0) // reset pointer to sprite data
+						if spriteList[i].Group == 0 && spriteList[i].Number == 0 || palState.state%2 == 0 {
+							if pal, err := readSffv1Palette(f, read, palState.location); err != nil {
+								return nil, nil, err
+							} else if pal != nil {
+								spriteList[i].Pal = pal
+								spriteList[i].palidx = 0 // shared
 							}
+							f.Seek(int64(xofs), 0) // reset pointer to sprite data
 						} else {
 							// Unique palette, keep as is
 							spriteList[i].palidx = 1
+						}
+						// Detect SFFv1 sprites that have their own entry but
+						// physically use the same palette as the base palette.
+						if spriteList[i].Pal != nil {
+							basePal := pl.Get(0)
+							if basePal != nil && len(spriteList[i].Pal) == len(basePal) {
+								sameBase := true
+								for j := range spriteList[i].Pal {
+									if spriteList[i].Pal[j] != basePal[j] {
+										sameBase = false
+										break
+									}
+								}
+								if sameBase {
+									spriteList[i].sffv1BasePal = true
+								}
+							}
 						}
 					} else if spriteList[i].coldepth <= 8 {
 						plSize = 0
@@ -1989,6 +2130,10 @@ func preloadSff(filename string, char bool, preloadSpr map[[2]uint16]bool) (*Sff
 			}
 		}
 	}
+	// Keep the SFFv1 palettes loaded during preload available to animations using this SFF
+	if sff.header.Version[0] == 1 {
+		sff.palList = *pl
+	}
 	return sff, selPal, nil
 }
 
@@ -2030,10 +2175,10 @@ func (s *Sff) loadPalettes(f io.ReadSeeker, lofs uint32) error {
 		var idx int
 		if old, ok := uniquePals[[2]uint16{gn[0], gn[1]}]; ok {
 			// Duplicate key. Sprites may still reference this palette by its own
-			// index, so remember that it stands in for the one PalTable keeps
+			// index; duplicatePals below records that it stands in for the one
+			// PalTable keeps
 			idx = old
 			pal = s.palList.Get(old)
-			s.palList.palAlias[i] = old
 			LogMessage("WARNING: Duplicate palette key in %v: %v,%v (%v/%v)", s.filename, gn[0], gn[1], i+1, s.header.NumberOfPalettes)
 		} else if plSize == 0 {
 			// Linked palette
@@ -2051,6 +2196,11 @@ func (s *Sff) loadPalettes(f io.ReadSeeker, lofs uint32) error {
 		uniquePals[[2]uint16{gn[0], gn[1]}] = idx
 		s.palList.SetSource(i, pal)
 		s.palList.PalTable[[2]uint16{gn[0], gn[1]}] = idx
+
+		// Track SFFv2 palette entries that share the same physical palette.
+		if idx != i {
+			s.palList.duplicatePals[idx] = append(s.palList.duplicatePals[idx], i)
+		}
 		// Number of colors as specified in the SFF
 		// We'll use a length check later instead because that's more reliable
 		s.palList.numcols[[2]uint16{gn[0], gn[1]}] = int(gn[2])

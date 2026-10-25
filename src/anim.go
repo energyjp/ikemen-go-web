@@ -847,30 +847,43 @@ func (a *Animation) Action() {
 
 // Convert animation transparency to RenderParams transparency
 func (a *Animation) alphaToBlend() (blendMode TransType, blendAlpha [2]int32) {
-	var sa, da byte
+	var sa, da int32
 
 	blendMode = a.transType
 
 	if blendMode == TT_default {
 		blendMode = a.curtrans
-		sa = byte(a.interpolate_blend_srcalpha)
-		da = byte(a.interpolate_blend_dstalpha)
+		sa = int32(a.interpolate_blend_srcalpha)
+		da = int32(a.interpolate_blend_dstalpha)
 	} else {
-		sa = byte(a.srcAlpha)
-		da = byte(a.dstAlpha)
+		sa = int32(a.srcAlpha)
+		da = int32(a.dstAlpha)
 	}
 
 	// Fallback: Make sure blend mode is not default
 	if blendMode == TT_default {
 		blendMode = TT_none
-		sa = byte(255)
-		da = byte(0)
+		sa = 255
+		da = 0
+	}
+
+	// Mugen's alpha range is 0-256, but Ikemen's renderer uses a more conventional 0-255
+	// Adjust "src + dst = 256" to be the same as if 255
+	// https://github.com/ikemen-engine/Ikemen-GO/issues/3125
+	if sa+da == 256 {
+		da = 255 - sa
 	}
 
 	// Apply system brightness
-	sa = byte(float32(sa) * sys.brightness)
+	sa = int32(float32(sa) * sys.brightness)
 
-	blendAlpha = [2]int32{int32(sa), int32(da)}
+	// Clamp values just in case
+	// Apparently Mugen doesn't clamp here. Or at least not the source
+	// But implementing that would require changes all over the code. And no use cases have been found
+	sa = Clamp(sa, 0, 255)
+	da = Clamp(da, 0, 255)
+
+	blendAlpha = [2]int32{sa, da}
 
 	return
 }
@@ -1104,7 +1117,7 @@ func (a *Animation) ShadowDraw(window *[4]int32, x, y, xscl, yscl, vscl, rxadd f
 		rcx:            (x + float32(sys.gameWidth)/2) * sys.widthScale,
 		rcy:            y * sys.heightScale,
 		projectionMode: projectionMode,
-		fLength:        fLength,
+		fLength:        fLength * sys.heightScale,
 		xOffset:        xoff,
 		yOffset:        yoff,
 		customShader:   shader,
@@ -1194,8 +1207,6 @@ func (at AnimationTable) readAction(sff *Sff, pal *PaletteList, lines []string, 
 				}
 				return existing
 			}
-			// Store the new animation in the table.
-			at.anims[no] = a
 			// Recursive logic until we find a non-empty animation
 			// If the current action is empty, we attempt to copy the very next action found in the file
 			logged := false
@@ -1210,6 +1221,8 @@ func (at AnimationTable) readAction(sff *Sff, pal *PaletteList, lines []string, 
 				}
 				(*i)++
 			}
+			// Store only now that the animation is fully resolved or confirmed empty
+			at.anims[no] = a
 			return a
 		} else {
 			// No action found on this line, advance to the next one
@@ -1401,6 +1414,7 @@ func (dl DrawList) draw(layerno int32, under bool, cameraX, cameraY, cameraScl f
 
 	// Common variables
 	shake := sys.envShake.getOffset()
+	fightClip, clipFight := sys.fightDrawClip()
 
 	// Draw only the filtered items
 	for _, idx := range sortList {
@@ -1467,6 +1481,10 @@ func (dl DrawList) draw(layerno int32, under bool, cameraX, cameraY, cameraScl f
 			window[2] = int32(cs * (w[2] - w[0]) * sys.widthScale)
 			window[3] = int32(cs * (w[3] - w[1]) * sys.heightScale)
 
+			drawwindow = &window
+		}
+		if clipFight {
+			window := intersectRect(*drawwindow, fightClip)
 			drawwindow = &window
 		}
 
@@ -2127,7 +2145,11 @@ func (a *Anim) Copy() *Anim {
 	newAnim.anim.totaltime = a.anim.totaltime
 	newAnim.anim.frames = a.anim.frames
 	newAnim.anim.interpolate_blend_srcalpha = a.anim.interpolate_blend_srcalpha
+	newAnim.anim.interpolate_blend_dstalpha = a.anim.interpolate_blend_dstalpha
 	newAnim.anim.interpolate_scale = a.anim.interpolate_scale
+	newAnim.anim.interpolate_blend = a.anim.interpolate_blend
+	newAnim.anim.interpolate_offset = a.anim.interpolate_offset
+	newAnim.anim.interpolate_angle = a.anim.interpolate_angle
 	newAnim.anim.mask = a.anim.mask
 	newAnim.anim.srcAlpha = a.anim.srcAlpha
 	newAnim.anim.dstAlpha = a.anim.dstAlpha
@@ -2149,8 +2171,9 @@ func (a *Anim) Copy() *Anim {
 		// Copy arrays (if not slices, this is fine as-is)
 		dst.Offset = src.Offset
 		dst.Size = src.Size
+		dst.sffv1BasePal = src.sffv1BasePal
 
-		if dst.palidx == 0 {
+		if dst.palidx == 0 || dst.sffv1BasePal {
 			dst.Pal = nil
 		} else {
 			dst.Pal = src.Pal
@@ -2228,15 +2251,26 @@ func (a *Anim) SetWindow(window [4]float32) {
 	}
 
 	a.windowInit = window
+	a.window = a.drawWindow()
+}
+
+func (a *Anim) drawWindow() [4]int32 {
+	if a.windowInit == [4]float32{0, 0, 0, 0} {
+		return a.window
+	}
+	// Pixel bounds depend on the aspect state selected for this draw pass.
+	window := a.windowInit
 	x := window[0]/a.localScale + float32(a.offsetX)
 	y := window[1] / a.localScale
 	w := (window[2] - window[0]) / a.localScale
 	h := (window[3] - window[1]) / a.localScale
 	// Truncate to int32 first, like before PR #3575, to avoid an off-by-one error
-	a.window[0] = int32((x + float32(int32(sys.gameWidth)-320)/2) * sys.widthScale)
-	a.window[1] = int32((y + float32(int32(sys.gameHeight)-240)) * sys.heightScale)
-	a.window[2] = int32(w*sys.widthScale + 0.5)
-	a.window[3] = int32(h*sys.heightScale + 0.5)
+	return [4]int32{
+		int32((x + float32(int32(sys.gameWidth)-320)/2) * sys.widthScale),
+		int32((y + float32(int32(sys.gameHeight)-240)) * sys.heightScale),
+		int32(w*sys.widthScale + 0.5),
+		int32(h*sys.heightScale + 0.5),
+	}
 }
 
 func (a *Anim) SetVelocity(xvel, yvel float32) {
@@ -2309,17 +2343,17 @@ func (a *Anim) Update(force bool) {
 	if a.anim == nil {
 		return
 	}
-	// Advance at most once per engine frame, unless forced.
-	if !force && a.lastUpdateFrame == sys.frameCounter {
+	// Advance at most once per logical UI frame, unless forced.
+	if !force && a.lastUpdateFrame == sys.uiFrameCounter {
 		return
 	}
-	a.lastUpdateFrame = sys.frameCounter
+	a.lastUpdateFrame = sys.uiFrameCounter
 	a.palfx.step()
-	// Advance the *shared* animation timeline at most once per engine frame,
+	// Advance the *shared* animation timeline at most once per logical UI frame,
 	// even if multiple Lua userdatas reference the same *Animation.
-	if force || a.anim.lastActionFrame != sys.frameCounter {
+	if force || a.anim.lastActionFrame != sys.uiFrameCounter {
 		a.anim.Action()
-		a.anim.lastActionFrame = sys.frameCounter
+		a.anim.lastActionFrame = sys.uiFrameCounter
 	}
 	a.updateVel()
 }
@@ -2347,7 +2381,8 @@ func (a *Anim) Draw(ln int16) {
 	// so we force integer divsion by casting
 	// the result of sys.gameWidth subtraction to int.
 	// we do the same thing to sys.gameHeight just in case
-	a.anim.Draw(&a.window, a.x+a.vel[0]-xsoffset+float32(int(sys.gameWidth-320)/2),
+	window := a.drawWindow()
+	a.anim.Draw(&window, a.x+a.vel[0]-xsoffset+float32(int(sys.gameWidth-320)/2),
 		a.y+a.vel[1]+float32(int(sys.gameHeight-240)), 1, 1, xscl, xscl, a.yscl,
 		xshear, a.rot, 0, a.palfx, a.facing, [2]float32{1, 1}, a.projection, a.fLength, 0, false, CustomShaderRenderData{})
 }
@@ -2414,5 +2449,8 @@ func (pa PreloadedAnims) addSprite(sff *Sff, grp, idx uint16) {
 func (pa PreloadedAnims) updateSff(sff *Sff) {
 	for _, v := range pa {
 		v.sff = sff
+		// Animations created from the temporary SFF keep their old palette pointer,
+		// so it must be updated together with the SFF.
+		v.palettedata = &sff.palList
 	}
 }

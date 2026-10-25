@@ -2358,14 +2358,20 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 	case "drawgame":
 		out.append(OC_ex_, OC_ex_drawgame)
 	case "drawpal":
-		c.token = c.tokenizer(in)
+		if err := c.checkOpeningParenthesis(in); err != nil {
+			return bvNone(), err
+		}
 		switch c.token {
 		case "group":
 			out.append(OC_ex2_, OC_ex2_drawpal_group)
 		case "index":
 			out.append(OC_ex2_, OC_ex2_drawpal_index)
 		default:
-			return bvNone(), Error("Invalid data: " + c.token)
+			return bvNone(), Error("Invalid DrawPal argument: " + c.token)
+		}
+		c.token = c.tokenizer(in)
+		if err := c.checkClosingParenthesis(); err != nil {
+			return bvNone(), err
 		}
 	case "explodvar":
 		if err := c.checkOpeningParenthesis(in); err != nil {
@@ -2431,17 +2437,10 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			opc = OC_ex2_explodvar_bindid
 		case "bindtime":
 			opc = OC_ex2_explodvar_bindtime
-		case "drawpal":
-			c.token = c.tokenizer(in)
-
-			switch c.token {
-			case "group":
-				opc = OC_ex2_explodvar_drawpal_group
-			case "index":
-				opc = OC_ex2_explodvar_drawpal_index
-			default:
-				return bvNone(), Error("Invalid data: " + c.token)
-			}
+		case "drawpal.group":
+			opc = OC_ex2_explodvar_drawpal_group
+		case "drawpal.index":
+			opc = OC_ex2_explodvar_drawpal_index
 		case "facing":
 			opc = OC_ex2_explodvar_facing
 		case "friction":
@@ -3357,17 +3356,10 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		case "attr":
 			opc = OC_ex2_projvar_attr
 			isFlag = true
-		case "drawpal":
-			c.token = c.tokenizer(in)
-
-			switch c.token {
-			case "group":
-				opc = OC_ex2_projvar_drawpal_group
-			case "index":
-				opc = OC_ex2_projvar_drawpal_index
-			default:
-				return bvNone(), Error("Invalid data: " + c.token)
-			}
+		case "drawpal.group":
+			opc = OC_ex2_projvar_drawpal_group
+		case "drawpal.index":
+			opc = OC_ex2_projvar_drawpal_index
 		case "facing":
 			opc = OC_ex2_projvar_facing
 		case "guardflag":
@@ -6500,6 +6492,14 @@ func (c *CharCompiler) paramTrans(is IniSection, sc *StateControllerBase, prefix
 			exp[0] = sc.iToExp(defsrc)[0]
 		}
 		if exp[1] == nil {
+			exp[1] = sc.iToExp(defdst)[0]
+		}
+
+		// You couldn't define alpha for "sub" type in Mugen, so we'll lock it to defaults for Mugen characters
+		// https://github.com/ikemen-engine/Ikemen-GO/issues/3868
+		// TODO: They can still do it in the AIR format, so this might be moot
+		if tt == TT_sub && sys.cgi[c.playerNo].ikemenver[0] == 0 && sys.cgi[c.playerNo].ikemenver[1] == 0 {
+			exp[0] = sc.iToExp(defsrc)[0]
 			exp[1] = sc.iToExp(defdst)[0]
 		}
 

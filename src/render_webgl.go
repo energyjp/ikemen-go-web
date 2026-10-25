@@ -15,9 +15,12 @@ import (
 // sprite/postprocess pipeline onto WebGL2 via syscall/js.
 //
 // Deliberate differences from the GL33 renderer:
-//   - 3D model/shadow pipelines are disabled (IsModelEnabled/IsShadowEnabled
-//     return false; the engine skips those passes). glTF stages won't render
-//     their models, everything else is unaffected.
+//   - The 3D model pipeline lives in render_webgl_model.go: glTF stages draw
+//     their models, with environment lighting where the browser can render
+//     into float targets. Model SHADOWS are not available (IsShadowEnabled is
+//     false): they need geometry shaders and cube map arrays, which WebGL2
+//     lacks. If the model pipeline cannot be set up, IsModelEnabled is false
+//     and the engine skips the models, keeping the stages' 2D layers.
 //   - No MSAA (WebGL2 multisampled renderbuffers exist but the ping-pong
 //     postprocess path doesn't need them; sys.msaa is forced to 0).
 //   - Uniform locations are JS objects, not ints, so programs index them
@@ -128,6 +131,12 @@ type Texture_WebGL struct {
 	handle js.Value
 	serial uint64
 	cmdID  int32 // handle in the command-buffer object table
+	// Model pipeline textures (render_webgl_model.go): a cube map, an RGBA16F
+	// image uploaded from float data (the environment panorama), and an
+	// environment map whose render pass has run.
+	cube        bool
+	halfFloat   bool
+	envRendered bool
 }
 
 func (t *Texture_WebGL) mapFormat(i int32) (internal, format js.Value, ok bool) {
@@ -228,12 +237,49 @@ func (t *Texture_WebGL) SetSubData(data []byte, x, y, width, height, stride int3
 	gl.Call("texParameteri", r.c("TEXTURE_2D"), r.c("TEXTURE_WRAP_T"), r.c("CLAMP_TO_EDGE"))
 }
 
+// SetDataG uploads a model texture (RGBA8) and builds its mipmaps.
+//   - An image larger than this GPU's MAX_TEXTURE_SIZE is halved (2x2 box)
+//     until it fits. At its full size texImage2D fails with INVALID_VALUE and
+//     the material samples black. Desktop GPUs allow 16384; phones and older
+//     integrated GPUs often 4096 or 8192. One console warning per size.
+//   - Level 0 is allocated empty and filled in row bands through the
+//     long-lived scratch buffer, never from one Uint8Array the size of the
+//     image: a js.Value lives until the next Go GC runs its finalizer, which
+//     after a stage reload can be a long time, and CVS-P's 8000x4934 texture
+//     kept ~150 MB of ArrayBuffer alive that way.
 func (t *Texture_WebGL) SetDataG(data []byte, mag, min, ws, wt TextureSamplingParam) {
 	r := gfx.(*Renderer_WebGL)
+	bpp := int(Max(t.depth, 8) / 8)
+	if limit := r.maxTextureSize(); bpp == 4 && limit > 0 && (t.width > limit || t.height > limit) &&
+		len(data) >= int(t.width)*int(t.height)*4 {
+		w0, h0 := t.width, t.height
+		for t.width > limit || t.height > limit {
+			data, t.width, t.height = halveRGBA8(data, t.width, t.height)
+		}
+		r.wglWarn(fmt.Sprintf("WebGL: a %dx%d model texture is over this GPU's limit (%d); drawn at %dx%d",
+			w0, h0, limit, t.width, t.height))
+	}
 	gl := t.bindAndPrepare()
 	internal, format, _ := t.mapFormat(Max(t.depth, 8))
 	gl.Call("texImage2D", r.c("TEXTURE_2D"), 0, internal, t.width, t.height, 0,
-		format, r.c("UNSIGNED_BYTE"), r.scratch.bytes(data))
+		format, r.c("UNSIGNED_BYTE"), js.Null())
+	if row := int(t.width) * bpp; row > 0 {
+		band := (1 << 20) / row
+		if band < 1 {
+			band = 1
+		}
+		for y := 0; y < int(t.height); y += band {
+			n := int(t.height) - y
+			if n > band {
+				n = band
+			}
+			if (y+n)*row > len(data) {
+				break
+			}
+			gl.Call("texSubImage2D", r.c("TEXTURE_2D"), 0, 0, y, t.width, n,
+				format, r.c("UNSIGNED_BYTE"), r.scratch.bytes(data[y*row:(y+n)*row]))
+		}
+	}
 	gl.Call("generateMipmap", r.c("TEXTURE_2D"))
 	gl.Call("texParameteri", r.c("TEXTURE_2D"), r.c("TEXTURE_MAG_FILTER"), t.samplingParam(mag))
 	gl.Call("texParameteri", r.c("TEXTURE_2D"), r.c("TEXTURE_MIN_FILTER"), t.samplingParam(min))
@@ -241,13 +287,27 @@ func (t *Texture_WebGL) SetDataG(data []byte, mag, min, ws, wt TextureSamplingPa
 	gl.Call("texParameteri", r.c("TEXTURE_2D"), r.c("TEXTURE_WRAP_T"), t.samplingParam(wt))
 }
 
+// SetPixelData uploads float texels: the model pipeline's joint matrices and
+// morph targets (RGBA32F, sampled NEAREST) and the environment panorama
+// (RGBA16F, see newHDRTexture).
 func (t *Texture_WebGL) SetPixelData(data []float32) {
 	r := gfx.(*Renderer_WebGL)
-	gl := t.bindAndPrepare()
+	if t.halfFloat && !r.model.envOK {
+		return // the environment is never rendered; skip the upload
+	}
 	internal, _, _ := t.mapFormat(Max(t.depth, 8))
 	_, format, _ := t.mapFormat(Max(t.depth/4, 8))
+	if t.halfFloat {
+		internal = r.c("RGBA16F")
+	}
+	channels := int(Max(t.depth, 8) / 32)
+	if channels < 1 {
+		channels = 1
+	}
+	src := r.uploadFloats(data, int(t.width)*int(t.height)*channels)
+	gl := t.bindAndPrepare()
 	gl.Call("texImage2D", r.c("TEXTURE_2D"), 0, internal, t.width, t.height, 0,
-		format, r.c("FLOAT"), r.scratch.floats(data))
+		format, r.c("FLOAT"), src)
 }
 
 func (t *Texture_WebGL) CopyData(src *Texture) {}
@@ -290,14 +350,34 @@ type Renderer_WebGL struct {
 	grabTexture *Texture_WebGL
 
 	// state cache
-	programID      uint32
-	blendEnabled   bool
-	blendEquation  BlendEquation
-	blendSrc       BlendFunc
-	blendDst       BlendFunc
-	depthTest      bool
+	programID     uint32
+	blendEnabled  bool
+	blendEquation BlendEquation
+	blendSrc      BlendFunc
+	blendDst      BlendFunc
+	depthTest     bool
+	// MUST start true: this mirrors GL state, and WebGL's own default for
+	// DEPTH_WRITEMASK is true. Left at Go's zero value it claimed the mask was
+	// already false, so the single SetDepthMask(false) call took the "no
+	// change" early-out and never emitted anything - the real depth write mask
+	// stayed enabled for the whole session.
+	//
+	// That is not merely a wasted call. ANGLE enables the
+	// forceDepthAttachmentInitOnClear workaround on AMD ONLY, and it triggers
+	// for any clear including DEPTH_BUFFER_BIT unless depth is masked out -
+	// so an AMD machine paid an extra depth-attachment init on every clear
+	// while NVIDIA paid nothing. See newRenderer_WebGL for the init that keeps
+	// this honest.
 	depthMask      bool
 	scissorEnabled bool
+	// A disable that has been REQUESTED but not emitted. RenderSprite calls
+	// DisableScissor after every single sprite, which cost a rasterizer-state
+	// change per sprite AND made EnableScissor's rect dedup unreachable - that
+	// early-out requires scissorEnabled to still be true, and the disable had
+	// just cleared it. Deferring means consecutive sprites sharing a window
+	// emit nothing at all. Anything that must actually see scissor off calls
+	// flushScissorDisable.
+	scissorPending bool
 	scissorRect    [4]int32
 
 	// uniform dedup caches (keyed by programID<<16 | uniformIdx)
@@ -317,6 +397,9 @@ type Renderer_WebGL struct {
 	cmd         wglCmdBuf
 	vertexBufID int32
 	spriteVAOID int32
+
+	// 3D model pipeline (render_webgl_model.go)
+	model wglModel
 }
 
 // c resolves a WebGL enum constant by name, cached.
@@ -368,13 +451,27 @@ func (r *Renderer_WebGL) newShaderProgram(vert, frag, geo, name string, crashWhe
 		chkEX(err, "Shader compilation error on "+name+"\n", crashWhenFail)
 		return nil, err
 	}
-	vertObj, err := r.compileShader(r.c("VERTEX_SHADER"), vert)
-	if chkEX(err, "Shader compilation error on "+name+"\n", crashWhenFail) {
+	s, what, err := r.buildProgram(vert, frag, name)
+	if err != nil {
+		chkEX(err, what+name+"\n", crashWhenFail)
 		return nil, err
 	}
+	return s, nil
+}
+
+// buildProgram compiles and links without reporting the failure: the caller
+// decides between the error dialog (newShaderProgram, the 2D shaders) and a
+// feature that turns itself off (the 3D model pipeline). `what` names the
+// failed step in the dialog's wording.
+func (r *Renderer_WebGL) buildProgram(vert, frag, name string) (s *ShaderProgram_WebGL, what string, err error) {
+	vertObj, err := r.compileShader(r.c("VERTEX_SHADER"), vert)
+	if err != nil {
+		return nil, "Shader compilation error on ", err
+	}
 	fragObj, err := r.compileShader(r.c("FRAGMENT_SHADER"), frag)
-	if chkEX(err, "Shader compilation error on "+name+"\n", crashWhenFail) {
-		return nil, err
+	if err != nil {
+		r.glc("deleteShader", vertObj)
+		return nil, "Shader compilation error on ", err
 	}
 	prog := r.glc("createProgram")
 	r.glc("attachShader", prog, vertObj)
@@ -385,9 +482,7 @@ func (r *Renderer_WebGL) newShaderProgram(vert, frag, geo, name string, crashWhe
 	if !r.glc("getProgramParameter", prog, r.c("LINK_STATUS")).Bool() {
 		log := r.glc("getProgramInfoLog", prog).String()
 		r.glc("deleteProgram", prog)
-		err := Error("program link error: " + log)
-		chkEX(err, "Link program error on "+name+"\n", crashWhenFail)
-		return nil, err
+		return nil, "Link program error on ", Error("program link error: " + log)
 	}
 	r.nextShaderID++
 	return &ShaderProgram_WebGL{
@@ -398,7 +493,7 @@ func (r *Renderer_WebGL) newShaderProgram(vert, frag, geo, name string, crashWhe
 		textures:   make(map[string]int),
 		id:         r.nextShaderID,
 		cmdID:      r.regJS(prog),
-	}, nil
+	}, "", nil
 }
 
 func (s *ShaderProgram_WebGL) RegisterAttributes(names ...string) {
@@ -459,37 +554,6 @@ func (r *Renderer_WebGL) newPaletteTexture() Texture {
 	return r.newTexture(256, 1, 32, false)
 }
 
-func (r *Renderer_WebGL) newModelTexture(width, height, depth int32, filter bool) Texture {
-	return r.newTexture(width, height, depth, filter)
-}
-
-func (r *Renderer_WebGL) newDataTexture(width, height int32) Texture {
-	r.SetActiveTexture0()
-	t := r.generateTexture(width, height, 128, false)
-	r.glc("bindTexture", r.c("TEXTURE_2D"), t.handle)
-	r.glc("texParameteri", r.c("TEXTURE_2D"), r.c("TEXTURE_MAG_FILTER"), r.c("NEAREST"))
-	r.glc("texParameteri", r.c("TEXTURE_2D"), r.c("TEXTURE_MIN_FILTER"), r.c("NEAREST"))
-	r.glc("texParameteri", r.c("TEXTURE_2D"), r.c("TEXTURE_WRAP_S"), r.c("CLAMP_TO_EDGE"))
-	r.glc("texParameteri", r.c("TEXTURE_2D"), r.c("TEXTURE_WRAP_T"), r.c("CLAMP_TO_EDGE"))
-	return t
-}
-
-func (r *Renderer_WebGL) newHDRTexture(width, height int32) Texture {
-	r.SetActiveTexture0()
-	t := r.generateTexture(width, height, 128, false)
-	r.glc("bindTexture", r.c("TEXTURE_2D"), t.handle)
-	r.glc("texParameteri", r.c("TEXTURE_2D"), r.c("TEXTURE_MIN_FILTER"), r.c("LINEAR"))
-	r.glc("texParameteri", r.c("TEXTURE_2D"), r.c("TEXTURE_MAG_FILTER"), r.c("LINEAR"))
-	r.glc("texParameteri", r.c("TEXTURE_2D"), r.c("TEXTURE_WRAP_S"), r.c("MIRRORED_REPEAT"))
-	r.glc("texParameteri", r.c("TEXTURE_2D"), r.c("TEXTURE_WRAP_T"), r.c("MIRRORED_REPEAT"))
-	return t
-}
-
-func (r *Renderer_WebGL) newCubeMapTexture(widthHeight int32, mipmap bool, lowestMipLevel int32) Texture {
-	// Only used by the 3D model pipeline (disabled on WebGL).
-	return r.generateTexture(widthHeight, widthHeight, 24, false)
-}
-
 func (r *Renderer_WebGL) Init() {
 	doc := js.Global().Get("document")
 	canvas := doc.Call("getElementById", "ikemen-canvas")
@@ -522,6 +586,12 @@ func (r *Renderer_WebGL) Init() {
 	r.customShaderMap = make(map[string]uint32)
 	r.nextShaderID = 1
 	r.currentProgram = nil
+	// Seed the state-mirror caches to the values GL actually starts with, not
+	// to Go zero values. DEPTH_WRITEMASK defaults to true in WebGL; claiming
+	// false here makes the first SetDepthMask(false) a no-op and leaves depth
+	// writes on for the entire session.
+	r.depthMask = true
+
 	r.uniformICache = make(map[uint32]int32)
 	r.uniformF1Cache = make(map[uint32]float32)
 	r.uniformF2Cache = make(map[uint32][2]float32)
@@ -639,14 +709,17 @@ func (r *Renderer_WebGL) Init() {
 		LogMessage("WebGL: framebuffer incomplete")
 	}
 	r.glc("bindFramebuffer", r.c("FRAMEBUFFER"), js.Null())
+
+	// 3D model pipeline (render_webgl_model.go); turns itself off on failure.
+	r.initModel()
 }
 
 func (r *Renderer_WebGL) Close() {}
 
-func (r *Renderer_WebGL) IsModelEnabled() bool  { return false }
-func (r *Renderer_WebGL) IsShadowEnabled() bool { return false }
-
 func (r *Renderer_WebGL) BeginFrame(clearColor bool) {
+	// A clear obeys the scissor rect, so a deferred disable must land first or
+	// only the last sprite's window gets cleared.
+	r.flushScissorDisable()
 	r.glc("bindFramebuffer", r.c("FRAMEBUFFER"), r.fbo)
 	r.glc("viewport", 0, 0, sys.scrrect[2], sys.scrrect[3])
 	if clearColor {
@@ -675,7 +748,7 @@ func (r *Renderer_WebGL) EndFrame() {
 	}
 	r.SetActiveTexture0()
 
-	r.DisableScissor()
+	r.flushScissorDisable()
 	r.DisableBlending()
 	r.SetDepthTest(false)
 	r.SetDepthMask(false)
@@ -760,6 +833,8 @@ func (r *Renderer_WebGL) mapBlendFunction(i BlendFunc) js.Value {
 
 func (r *Renderer_WebGL) mapPrimitiveMode(i PrimitiveMode) js.Value {
 	switch i {
+	case POINTS:
+		return r.c("POINTS")
 	case LINES:
 		return r.c("LINES")
 	case LINE_LOOP:
@@ -851,17 +926,6 @@ func (r *Renderer_WebGL) DisableBlending() {
 	}
 }
 
-// 3D model/shadow pipeline: disabled on WebGL.
-func (r *Renderer_WebGL) prepareShadowMapPipeline(bufferIndex uint32) {}
-func (r *Renderer_WebGL) setShadowMapPipeline(doubleSided, invertFrontFace, useUV, useNormal, useTangent, useVertColor, useJoint0, useJoint1 bool, numVertices, vertAttrOffset uint32) {
-}
-func (r *Renderer_WebGL) ReleaseShadowPipeline()                                    {}
-func (r *Renderer_WebGL) prepareModelPipeline(bufferIndex uint32, env *Environment) {}
-func (r *Renderer_WebGL) SetModelPipeline(eq BlendEquation, src, dst BlendFunc, depthTest, depthMask, doubleSided, invertFrontFace, useUV, useNormal, useTangent, useVertColor, useJoint0, useJoint1, useOutlineAttribute bool, numVertices, vertAttrOffset uint32) {
-}
-func (r *Renderer_WebGL) SetMeshOutlinePipeline(invertFrontFace bool, meshOutline float32) {}
-func (r *Renderer_WebGL) ReleaseModelPipeline()                                            {}
-
 func (r *Renderer_WebGL) ReadPixels(data []uint8, width, height int) {
 	r.glc("bindFramebuffer", r.c("READ_FRAMEBUFFER"), js.Null())
 	r.scratch.ensure(len(data))
@@ -871,6 +935,9 @@ func (r *Renderer_WebGL) ReadPixels(data []uint8, width, height int) {
 }
 
 func (r *Renderer_WebGL) EnableScissor(x, y, width, height int32) {
+	// We want scissor ON, so cancel any deferred disable outright rather than
+	// emitting a disable/enable pair.
+	r.scissorPending = false
 	realY := sys.scrrect[3] - (y + height)
 	if r.scissorEnabled &&
 		r.scissorRect[0] == x && r.scissorRect[1] == realY &&
@@ -892,7 +959,21 @@ func (r *Renderer_WebGL) EnableScissor(x, y, width, height int32) {
 	r.scissorRect = [4]int32{x, realY, width, height}
 }
 
+// DEFERRED. Records the intent without emitting; see scissorPending. The GL
+// state only changes when flushScissorDisable runs, which every operation that
+// genuinely needs an unclipped target does.
 func (r *Renderer_WebGL) DisableScissor() {
+	r.scissorPending = true
+}
+
+// Emit the deferred disable, if one is outstanding. Called before anything that
+// must not be clipped by a leftover sprite window: frame clears, the post-
+// processing passes, and text.
+func (r *Renderer_WebGL) flushScissorDisable() {
+	if !r.scissorPending {
+		return
+	}
+	r.scissorPending = false
 	if r.scissorEnabled {
 		r.need(2)
 		r.emitI(wcDisable)
@@ -1063,21 +1144,6 @@ func (r *Renderer_WebGL) SetUniformMatrix(name string, value []float32) {
 	r.glc("uniformMatrix4fv", loc, false, r.scratch.floats(value))
 }
 
-func (r *Renderer_WebGL) SetModelUniformI(name string, val int)                   {}
-func (r *Renderer_WebGL) SetModelUniformF(name string, values ...float32)         {}
-func (r *Renderer_WebGL) SetModelUniformFv(name string, values []float32)         {}
-func (r *Renderer_WebGL) SetModelUniformMatrix(name string, value []float32)      {}
-func (r *Renderer_WebGL) SetModelUniformMatrix3(name string, value []float32)     {}
-func (r *Renderer_WebGL) SetModelTexture(name string, t Texture)                  {}
-func (r *Renderer_WebGL) SetShadowMapUniformI(name string, val int)               {}
-func (r *Renderer_WebGL) SetShadowMapUniformF(name string, values ...float32)     {}
-func (r *Renderer_WebGL) SetShadowMapUniformFv(name string, values []float32)     {}
-func (r *Renderer_WebGL) SetShadowMapUniformMatrix(name string, value []float32)  {}
-func (r *Renderer_WebGL) SetShadowMapUniformMatrix3(name string, value []float32) {}
-func (r *Renderer_WebGL) SetShadowMapTexture(name string, t Texture)              {}
-func (r *Renderer_WebGL) SetShadowFrameTexture(i uint32)                          {}
-func (r *Renderer_WebGL) SetShadowFrameCubeTexture(i uint32)                      {}
-
 func (r *Renderer_WebGL) SetActiveTexture0() {
 	r.need(2)
 	r.emitI(wcActiveTex)
@@ -1140,23 +1206,12 @@ func (r *Renderer_WebGL) SetVertexData(values ...float32) {
 	}
 }
 
-func (r *Renderer_WebGL) SetModelVertexData(bufferIndex uint32, values []byte)   {}
-func (r *Renderer_WebGL) SetModelIndexData(bufferIndex uint32, values ...uint32) {}
-
 func (r *Renderer_WebGL) RenderQuad() {
 	r.need(4)
 	r.emitI(wcDrawArrays)
 	r.emitI(int32(r.ci("TRIANGLE_STRIP")))
 	r.emitI(0)
 	r.emitI(4)
-}
-
-func (r *Renderer_WebGL) RenderElements(mode PrimitiveMode, count, offset int)          {}
-func (r *Renderer_WebGL) RenderShadowMapElements(mode PrimitiveMode, count, offset int) {}
-func (r *Renderer_WebGL) RenderCubeMap(envTexture Texture, cubeTexture Texture)         {}
-func (r *Renderer_WebGL) RenderFilteredCubeMap(distribution int32, cubeTexture Texture, filteredTexture Texture, mipmapLevel, sampleCount int32, roughness float32) {
-}
-func (r *Renderer_WebGL) RenderLUT(distribution int32, cubeTexture Texture, lutTexture Texture, sampleCount int32) {
 }
 
 func (r *Renderer_WebGL) LoadCustomSpriteShader(shaderName string, shaderData []byte) uint32 {

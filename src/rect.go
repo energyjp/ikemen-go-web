@@ -15,6 +15,7 @@ type Fade struct {
 	isFadeIn      bool
 	timeRemaining int32
 	snd           [2]int32
+	sndSource     *Snd
 }
 
 func newFade() *Fade {
@@ -104,7 +105,13 @@ func (fa *Fade) step() {
 		return
 	}
 	if fa.timeRemaining == fa.totalTime && fa.snd[0] != -1 && fa.snd[1] != -1 {
-		sys.motif.Snd.play(fa.snd, 100, 0, 0, 0, 0)
+		snd := fa.sndSource
+		if snd == nil {
+			snd = sys.motif.Snd
+		}
+		if snd != nil {
+			snd.play(fa.snd, 100, 0, 0, 0, 0)
+		}
 	}
 
 	if fa.animData != nil {
@@ -276,8 +283,8 @@ func (r *Rect) updateAlpha() {
 }
 
 func (r *Rect) Draw(ln int16) {
-	if r.layerno == ln && r != nil {
-		FillRect(r.window, r.col, r.alpha, nil)
+	if r != nil && r.layerno == ln {
+		FillRect(r.drawWindow(), r.col, r.alpha, nil)
 	}
 }
 
@@ -325,14 +332,25 @@ func (r *Rect) SetWindow(window [4]float32) {
 		return
 	}
 	r.windowInit = window
+	r.window = r.drawWindow()
+}
+
+func (r *Rect) drawWindow() [4]int32 {
+	if r.windowInit == [4]float32{0, 0, 0, 0} {
+		return r.window
+	}
+	// Pixel bounds depend on the aspect state selected for this draw pass.
+	window := r.windowInit
 	x := window[0]/r.localScale + float32(r.offsetX)
 	y := window[1] / r.localScale
 	w := (window[2] - window[0]) / r.localScale
 	h := (window[3] - window[1]) / r.localScale
-	r.window[0] = int32((x + float32(sys.gameWidth-320)/2) * sys.widthScale)
-	r.window[1] = int32((y + float32(sys.gameHeight-240)) * sys.heightScale)
-	r.window[2] = int32(w*sys.widthScale + 0.5)
-	r.window[3] = int32(h*sys.heightScale + 0.5)
+	return [4]int32{
+		int32((x + float32(sys.gameWidth-320)/2) * sys.widthScale),
+		int32((y + float32(sys.gameHeight-240)) * sys.heightScale),
+		int32(w*sys.widthScale + 0.5),
+		int32(h*sys.heightScale + 0.5),
+	}
 }
 
 func (r *Rect) Update() {

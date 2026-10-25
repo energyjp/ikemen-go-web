@@ -10,6 +10,8 @@ Ikemen GO is an open source fighting game engine that supports resources from th
 ## Features
 Ikemen GO aims for backwards-compatibility on par with M.U.G.E.N version 1.1 Beta, while simultaneously expanding on its features in a variety of ways.
 
+This does not mean bug-for-bug emulation. Behavior may intentionally differ when matching M.U.G.E.N would mean preserving bugs, quirks, or unnecessarily limiting the engine.
+
 Refer to [our wiki](https://github.com/ikemen-engine/Ikemen-GO/wiki) to see a comprehensive list of new features that have been added in Ikemen GO.
 
 ## Installing
@@ -26,7 +28,7 @@ These instructions are for those interested in developing the Ikemen GO engine i
 
 ### Building
 For setup and platform-specific steps, see [BUILDING.md](./BUILDING.md).
-It covers Windows, Linux (including ARM64), macOS (Apple Silicon and Intel), and Android (APK via Docker).
+It covers Windows, Linux, macOS, and Android.
 
 ### Debugging
 In order to run the compiled Ikemen GO executable, you will need to download the [engine dependencies](https://github.com/ikemen-engine/Ikemen-GO-Screenpack) and unpack them into the Ikemen-GO source directory. After that, you can use [Goland](https://www.jetbrains.com/go/) or [Visual Studio Code](https://code.visualstudio.com/) to debug.

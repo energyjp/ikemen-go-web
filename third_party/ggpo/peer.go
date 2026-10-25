@@ -406,6 +406,14 @@ func (p *Peer) SyncInput(disconnectFlags *int) ([][]byte, error) {
 	return values, nil
 }
 
+// CurrentFrame exposes the sync layer's frame counter, i.e. the frame number
+// the NEXT AdvanceFrame(checksum) call will be keyed to. The embedding game
+// uses it to key per-frame diagnostics to the same frame numbers the checksum
+// exchange uses, so Event.NumFrameOfDesync can be looked up on the game side.
+func (p *Peer) CurrentFrame() int {
+	return p.sync.FrameCount()
+}
+
 // Maps to top level API AdvanceFrame function
 // sync.IncremenetFrame increments the frame count and saves the
 // current state via user provided callback

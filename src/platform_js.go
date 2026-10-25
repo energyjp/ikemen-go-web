@@ -40,12 +40,38 @@ func osPreferredLanguage() string {
 // browser build ships without video support. Stages that reference a
 // video simply show nothing in that layer (texture stays nil, which
 // stage.go treats as "no frame yet").
+//
+// THAT COMMENT DESCRIBED AN INTENTION THE CODE DID NOT IMPLEMENT. Open()
+// returned an error, and nothing above it treats a failed video layer as a
+// skippable layer:
+//
+//	stage.go:272        bg.video.Open(...) err -> return nil, err
+//	bgdef.go:101-103    readBackGround err     -> return nil, err, ABANDONING
+//	stage.go:1461-1463  the rest of the BG sections in that group
+//
+// So one video layer discarded every OTHER layer beside it. For a screenpack
+// that is survivable - motif.go:2399-2406 logs it and substitutes an empty
+// BGDef, so the screen boots with no background at all - but for a STAGE it is
+// fatal: loadStage returns the error to system.go:6398 and the match never
+// loads. ICA_GO declares seven `type = video` sections.
+//
+// Returning nil makes the failure mean what the comment always said: this one
+// layer has no frames. The sprite and anim layers beside it survive, and a
+// video stage loads and plays with a hole where the video would be. That is a
+// strictly better outcome than the group vanishing or the match refusing to
+// start, and it costs nothing - Tick() is already a no-op and the draw path
+// already treats a nil texture as "no frame yet" (stage.go:677-679).
+//
+// The message is still logged, so this is not silent.
 type bgVideo struct {
 	texture Texture
+	muted   bool // written by System.tickSound for every stage video; nothing here reads it
 }
 
 func (bgv *bgVideo) Open(filename string, volume int, sm BgVideoScaleMode, sf BgVideoScaleFilter, loop bool) error {
-	return Error("stage videos are not supported in the browser build")
+	LogMessage("Video backgrounds are not supported in the browser build; "+
+		"this layer will be empty: %v", filename)
+	return nil
 }
 
 func (bgv *bgVideo) Tick() error { return nil }
@@ -58,7 +84,10 @@ func (bgv *bgVideo) Reset() {}
 
 func (bgv *bgVideo) Close() {}
 
-func (bgv *bgVideo) MixerCleared() bool { return true }
+func (bgv *bgVideo) MixerCleared() {}
+
+// No audio chain on the browser build; tickSound calls this after setting muted.
+func (bgv *bgVideo) updateAudioVolume() {}
 
 // platformIdleGC forces a garbage collection at moments where a pause is
 // invisible (pauses, between rounds). On single-threaded wasm the GC mark

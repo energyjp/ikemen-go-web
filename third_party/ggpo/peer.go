@@ -146,9 +146,23 @@ func (p *Peer) Idle(timeout int, timeFunc ...polling.FuncTimeType) error {
 						input.Size = p.inputSize * p.numPlayers
 						inputs, _ = p.sync.GetConfirmedInputs(p.nextSpectatorFrame)
 						for i, _ := range inputs {
-							input.Bits = append(input.Bits, inputs[i]...)
+							// A player who left has no input past its last
+							// frame (an erased, empty one): the watcher gets
+							// zeros of the full size, which is what the
+							// players' games read for it, so every frame
+							// a watcher receives is inputSize*numPlayers.
+							b := inputs[i]
+							if len(b) != p.inputSize {
+								b = make([]byte, p.inputSize)
+								copy(b, inputs[i])
+							}
+							input.Bits = append(input.Bits, b...)
 						}
 						for i := 0; i < p.numSpectators; i++ {
+							// Nothing reads a dropped watcher's queue.
+							if p.spectators[i].IsDisconnected() {
+								continue
+							}
 							p.spectators[i].SendInput(&input)
 						}
 						p.nextSpectatorFrame++
@@ -296,6 +310,9 @@ func (p *Peer) AddSpectator(ip string, port int) error {
 	queue := p.numSpectators
 	p.numSpectators++
 	p.spectators[queue] = protocol.NewUdpProtocol(p.connection, queue+1000, ip, port, &p.localConnectStatus)
+	// Everything from a watcher is untrusted, and the players never wait
+	// on one: see SetSpectatorEndpoint and CheckInitialSync.
+	p.spectators[queue].SetSpectatorEndpoint(protocol.SpectatorMaxPendingFrames)
 	p.poll.RegisterLoop(&(p.spectators[queue]), nil)
 	p.spectators[queue].SetDisconnectTimeout(p.disconnectTimeout)
 	p.spectators[queue].SetDisconnectNotifyStart(p.disconnectNotifyStart)
@@ -308,7 +325,15 @@ func (p *Peer) AddSpectator(ip string, port int) error {
 // Maps to top level API function
 func (p *Peer) AddPlayer(player *Player, handle *PlayerHandle) error {
 	if player.PlayerType == PlayerTypeSpectator {
-		return p.AddSpectator(player.Remote.IpAdress, player.Remote.Port)
+		// The watcher's handle (1000 + its slot) was never handed back, so the
+		// caller had no way to name the watcher in DropSpectator or to match
+		// its events.
+		queue := p.numSpectators
+		err := p.AddSpectator(player.Remote.IpAdress, player.Remote.Port)
+		if err == nil && handle != nil {
+			*handle = p.QueueToSpectatorHandle(queue)
+		}
+		return err
 	}
 
 	queue := player.PlayerNum - 1
@@ -527,7 +552,9 @@ func (p *Peer) OnUdpProtocolSpectatorEvent(evt *protocol.UdpProtocolEvent, queue
 	var info Event
 	switch evt.Type() {
 	case protocol.DisconnectedEvent:
-		p.spectators[queue].Disconnect()
+		if !p.spectators[queue].IsDisconnected() {
+			p.spectators[queue].Disconnect()
+		}
 
 		info.Code = EventCodeDisconnectedFromPeer
 		info.Player = handle
@@ -808,11 +835,13 @@ func (p *Peer) CheckInitialSync() {
 			}
 		}
 
-		for i = 0; i < p.numSpectators; i++ {
-			if p.spectators[i].IsInitialized() && !p.spectators[i].IsSynchronized() {
-				return
-			}
-		}
+		// THE PLAYERS NEVER WAIT ON A WATCHER. This used to return here
+		// until every registered spectator had synced too, so a watcher
+		// that was slow to load, or had already gone, held the players'
+		// match start forever. A watcher still syncing now keeps its frames
+		// queued from frame 0 and gets them once it is through; one that is
+		// not through within SpectatorMaxPendingFrames is dropped from this
+		// match (protocol.sendSpectatorInput).
 
 		var info Event
 		info.Code = EventCodeRunning
@@ -872,4 +901,42 @@ func (p *Peer) InitializeConnection(t ...transport.Connection) error {
 
 func (p *Peer) Start() {
 	go p.connection.Read(p.messageChannel)
+}
+
+// SpectatorDropReason says why a watcher was dropped ("" if it was not, or the
+// handle is not a watcher's).
+func (p *Peer) SpectatorDropReason(handle PlayerHandle) string {
+	q := int(handle) - 1000
+	if q < 0 || q >= p.numSpectators {
+		return ""
+	}
+	return p.spectators[q].FailReason()
+}
+
+// DropSpectator drops one watcher from this session with a reason (its page
+// went away, say). The players are not touched; the usual
+// EventCodeDisconnectedFromPeer for the watcher's handle follows on the next
+// poll.
+func (p *Peer) DropSpectator(handle PlayerHandle, reason string) error {
+	q := int(handle) - 1000
+	if q < 0 || q >= p.numSpectators {
+		return Error{Code: ErrorCodeInvalidPlayerHandle, Name: "ErrorCodeInvalidPlayerHandle"}
+	}
+	p.spectators[q].Fail(reason)
+	return nil
+}
+
+// NumSpectators is how many watchers were registered with this session,
+// dropped ones included; their handles are 1000 to 1000+n-1.
+func (p *Peer) NumSpectators() int {
+	return p.numSpectators
+}
+
+// SpectatorConnected reports whether a watcher is synced and not dropped.
+func (p *Peer) SpectatorConnected(handle PlayerHandle) bool {
+	q := int(handle) - 1000
+	if q < 0 || q >= p.numSpectators {
+		return false
+	}
+	return p.spectators[q].IsRunning()
 }

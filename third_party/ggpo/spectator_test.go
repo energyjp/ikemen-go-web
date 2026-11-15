@@ -73,6 +73,16 @@ func TestNewSpectatorBackendSession(t *testing.T) {
 	if err != nil {
 		t.Errorf("Error when adding local input, %s", err)
 	}
+	// The host forwards a frame to its spectators once both players' inputs
+	// for it are confirmed and its own line to the spectator has synced (the
+	// broadcast mock above makes that take a retry or two). This test used to
+	// read frame 0 straight away and pass only because the spectator's buffer
+	// started out holding a fake, empty frame 0 (the range-copy
+	// initialization bug).
+	for i := 0; i < protocol.NumSyncPackets; i++ {
+		p2p.Idle(0, advance)
+		stb.Idle(0, advance)
+	}
 	var disconnectFlags int
 	_, err = stb.SyncInput(&disconnectFlags)
 	if err != nil {
@@ -629,15 +639,20 @@ func TestSpectatorBackendSetDisconnectNotifyStartError(t *testing.T) {
 	}
 }
 
-func TestSpectatorBackendCloseError(t *testing.T) {
+// Close used to be unsupported on a spectator (it returned an error and left
+// the transport reading). A watcher builds a new Spectator per match, so Close
+// now stops the old one, and closing one that never started is harmless.
+func TestSpectatorBackendClose(t *testing.T) {
 	session := mocks.NewFakeSession()
 	hostIp := "127.2.1.1"
 	hostPort := 6001
 	localPort := 6000
 	stb := ggpo.NewSpectator(&session, localPort, 2, 4, hostIp, hostPort)
-	err := stb.Close()
-	if err == nil {
-		t.Errorf("The code did not error when using an unsupported Feature.")
+	if err := stb.Close(); err != nil {
+		t.Errorf("Closing a spectator that never started failed: %v", err)
+	}
+	if err := stb.Close(); err != nil {
+		t.Errorf("Closing a spectator twice failed: %v", err)
 	}
 }
 func TestSpectatorBackendAddPlayerError(t *testing.T) {

@@ -121,6 +121,11 @@ func (rs *RollbackSystem) preMatchSetup() {
 		rs.netConnection = sys.netConnection
 		sys.netConnection = nil
 
+	} else if rs.session != nil && rs.session.spectating {
+		// A watcher: a spectator session fed by the host (watch.go). Its
+		// clock and seed came with the host's start message.
+		rs.session.InitWatch()
+		sys.matchTime = rs.session.netTime
 	} else if sys.netConnection == nil && rs.session == nil {
 		// If offline, initialize a local rollback sync test session
 		session := NewRollbackSession(sys.cfg.Netplay.Rollback)
@@ -134,6 +139,14 @@ func (rs *RollbackSystem) preMatchSetup() {
 
 func (rs *RollbackSystem) postMatchSetup() {
 	rs.session.SaveReplay()
+	if len(rs.session.watchers) > 0 || rs.session.spectating {
+		// Host and watcher print the same line, so the two can be compared.
+		platformWatchLog("match result: " + watchMatchSummary())
+	}
+	rs.session.watchEnd()
+	if rs.session.spectating {
+		sys.watch.running = false
+	}
 
 	// sys.esc = true
 
@@ -164,6 +177,10 @@ func (rs *RollbackSystem) runFrame() bool {
 	if sys.esc {
 		return false
 	}
+	if rs.session.spectating {
+		return rs.runWatchFrame()
+	}
+	rs.session.watchCheckGone()
 
 	// Surface the connection quality once a second (browser overlay ping
 	// counter; no-op on desktop).
@@ -198,6 +215,11 @@ func (rs *RollbackSystem) runFrame() bool {
 
 		if ggpoerr == nil {
 			rs.ggpoInputs, rs.ggpoAnalogInputs = decodeInputs(values)
+			if len(rs.session.watchers) > 0 {
+				if p, ok := rs.session.backend.(*ggpo.Peer); ok {
+					rs.session.watchRecord(p.CurrentFrame(), values)
+				}
+			}
 
 			// Record inputs against the rollback timeline. netTime is part of the saved state,
 			// so any confirmed re-simulation overwrites earlier speculative data for the same frame.
@@ -528,6 +550,15 @@ type RollbackSession struct {
 	inputBits           []InputBits
 	inRollback          bool
 	replaySaved         bool
+
+	// Watching (watch.go). Host: the slots offered this match, the watchers
+	// registered and the inputs of its last frames. Watcher: this is a
+	// spectator session, and the next frame it simulates.
+	watchSlots []int
+	watchers   []watchReg
+	watchTail  []watchTail
+	spectating bool
+	watchFrame int
 }
 
 func (rs *RollbackSession) SetInput(time int32, player int, input InputBits, axes [6]int8) {
@@ -762,6 +793,11 @@ func (r *RollbackSession) AdvanceFrame(flags int) {
 	// Run frame again using confirmed inputs
 	if ggpoerr == nil {
 		sys.rollback.ggpoInputs, sys.rollback.ggpoAnalogInputs = decodeInputs(inputs)
+		if len(r.watchers) > 0 {
+			if p, ok := r.backend.(*ggpo.Peer); ok {
+				r.watchRecord(p.CurrentFrame(), inputs)
+			}
+		}
 		if r.recording != nil {
 			r.RecordReplayFrame(r.netTime, sys.rollback.ggpoInputs, sys.rollback.ggpoAnalogInputs)
 			r.netTime++
@@ -787,6 +823,17 @@ func (r *RollbackSession) AdvanceFrame(flags int) {
 }
 
 func (r *RollbackSession) OnEvent(info *ggpo.Event) {
+	// A watcher's events (handles from 1000 up) never touch the players'
+	// match: before this a watcher that disconnected ended it, through the
+	// EventCodeDisconnectedFromPeer case below.
+	if int(info.Player) >= 1000 {
+		r.onWatcherEvent(info)
+		return
+	}
+	if r.spectating {
+		r.onWatchEvent(info)
+		return
+	}
 	switch info.Code {
 	case ggpo.EventCodeConnectedToPeer:
 		r.connected = true
@@ -1211,7 +1258,8 @@ func (rs *RollbackSession) InitP1(numPlayers int, localPort int, remotePort int,
 	peer := ggpo.NewPeer(rs, localPort, numPlayers, inputSize)
 	rs.backend = &peer
 
-	peer.InitializeConnection(platformGGPOTransport()...)
+	// With no watcher to register this is platformGGPOTransport() as it was.
+	peer.InitializeConnection(rs.watchTransport(platformGGPOTransport())...)
 
 	var handle ggpo.PlayerHandle
 	result := peer.AddPlayer(&player, &handle)
@@ -1228,6 +1276,7 @@ func (rs *RollbackSession) InitP1(numPlayers int, localPort int, remotePort int,
 	rs.currentPlayer = int(handle)
 	rs.currentPlayerHandle = handle
 	rs.remotePlayerHandle = handle2
+	rs.addWatchers(&peer)
 
 	peer.SetDisconnectTimeout(rs.config.DisconnectTimeout)
 	peer.SetDisconnectNotifyStart(rs.config.DisconnectNotifyStart)

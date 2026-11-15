@@ -378,6 +378,7 @@ type System struct {
 	savePool        GameStatePool
 	loadPool        GameStatePool
 	rollback        RollbackSystem
+	watch           watchState // this engine as a watcher (watch.go)
 	rollbackConfig  RollbackProperties
 	saveState       *GameState
 	saveStateFlag   bool
@@ -1019,7 +1020,10 @@ func (s *System) update() bool {
 
 	// preMatchTime normally follows the local UI clock until gameplay begins.
 	// Preserve the synchronized prematch time while rollback waits for its first frame.
-	rollbackMatchStarting := s.rollback.session != nil && s.rollback.netConnection != nil
+	// A watcher's match counts too: it has no NetConnection, and its
+	// preMatchTime comes from the host (watch.go).
+	rollbackMatchStarting := s.rollback.session != nil &&
+		(s.rollback.netConnection != nil || s.rollback.session.spectating)
 	if s.matchTime == 0 && !rollbackMatchStarting && s.replayFile == nil {
 		s.preMatchTime = s.frameCounter
 	}
@@ -1251,6 +1255,8 @@ func (s *System) synchronize() error {
 		s.replayFile.Synchronize()
 	} else if s.netConnection != nil {
 		return s.netConnection.Synchronize()
+	} else if s.watch.active && s.rollback.session != nil && s.rollback.session.spectating {
+		return s.watch.synchronize()
 	}
 	return nil
 }

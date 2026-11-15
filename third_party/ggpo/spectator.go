@@ -9,7 +9,12 @@ import (
 	"github.com/ikemen-engine/ggpo/transport"
 )
 
-const SpectatorFrameBufferSize int = 32
+// How many frames of the host's input a watcher holds. A watcher takes in
+// (and acknowledges) only frames that fit, so the host keeps the rest and a
+// watcher can never lose a frame to its own buffer; one that stays behind for
+// longer than the host keeps frames for it is dropped from the match with a
+// reason (protocol.SpectatorMaxPendingFrames). 256 frames is about 4 s.
+const SpectatorFrameBufferSize int = 256
 const DefaultMaxFramesBehind int = 10
 const DefaultCatchupSpeed int = 1
 
@@ -29,6 +34,8 @@ type Spectator struct {
 	localPort       int
 	currentFrame    int
 	messageChannel  chan transport.MessageChannelItem
+	failReason      string
+	disconnectSent  bool
 }
 
 func NewSpectator(cb Session, localPort int, numPlayers int, inputSize int, hostIp string, hostPort int) Spectator {
@@ -40,9 +47,13 @@ func NewSpectator(cb Session, localPort int, numPlayers int, inputSize int, host
 	s.session = cb
 	s.synchonizing = true
 
+	// Every slot starts at frame -1, "nothing here yet". This must index the
+	// slice: `for _, i := range inputs { i.Frame = -1 }` set a copy and left
+	// every slot at frame 0, so slot 0 passed for the host's frame 0, with no
+	// input in it, before frame 0 had arrived.
 	inputs := make([]input.GameInput, SpectatorFrameBufferSize)
-	for _, i := range inputs {
-		i.Frame = -1
+	for i := range inputs {
+		inputs[i].Frame = -1
 	}
 	s.inputs = inputs
 	//port := strconv.Itoa(hostPort)
@@ -58,6 +69,9 @@ func NewSpectator(cb Session, localPort int, numPlayers int, inputSize int, host
 }
 
 func (s *Spectator) Idle(timeout int, timeFunc ...polling.FuncTimeType) error {
+	// Take in only what the buffer can hold without overwriting a frame not
+	// yet simulated.
+	s.host.SetRecvLimit(s.nextInputToSend + SpectatorFrameBufferSize - 1)
 	s.HandleMessages()
 	if len(timeFunc) == 0 {
 		s.poll.Pump()
@@ -66,15 +80,11 @@ func (s *Spectator) Idle(timeout int, timeFunc ...polling.FuncTimeType) error {
 	}
 	s.PollUdpProtocolEvents()
 
-	if s.framesBehind > 0 {
-		for s.nextInputToSend < s.currentFrame {
-			s.session.AdvanceFrame(0)
-			util.Log.Printf("In Spectator: skipping frame %d\n", s.nextInputToSend)
-			s.nextInputToSend++
-		}
-		s.framesBehind = 0
-	}
-
+	// No catch-up by skipping. The old loop here stepped over frames whose
+	// input was gone, calling AdvanceFrame with none: the watcher carried on
+	// simulating a different match from the players, silently. A watcher
+	// cannot lose a frame any more (see SpectatorFrameBufferSize); if one is
+	// ever missing, SyncInput ends the watch with a reason instead.
 	return nil
 }
 
@@ -93,8 +103,13 @@ func (s *Spectator) SyncInput(disconnectFlags *int) ([][]byte, error) {
 	}
 	if input.Frame > s.nextInputToSend {
 		s.framesBehind = input.Frame - s.nextInputToSend
-		// The host is way way way far ahead of the spetator. How'd this
-		// happen? Any, the input we need is gone forever.
+		// The input for this frame is gone: never guess, stop watching.
+		s.fail("this watcher fell behind the match and lost frame " + itoa(s.nextInputToSend))
+		return nil, Error{Code: ErrorCodeGeneralFailure, Name: "ErrorCodeGeneralFailure"}
+
+	}
+	if len(input.Bits) != s.inputSize*s.numPlayers {
+		s.fail("the host sent a frame of the wrong size")
 		return nil, Error{Code: ErrorCodeGeneralFailure, Name: "ErrorCodeGeneralFailure"}
 	}
 	//s.framesBehind = 0
@@ -173,6 +188,17 @@ func (s *Spectator) OnUdpProtocolEvent(evt *protocol.UdpProtocolEvent) {
 		s.session.OnEvent(&info)
 
 	case protocol.DisconnectedEvent:
+		if s.disconnectSent {
+			return
+		}
+		s.disconnectSent = true
+		if s.failReason == "" {
+			// the endpoint's own reason (a malformed packet) when it has one
+			s.failReason = s.host.FailReason()
+		}
+		if s.failReason == "" {
+			s.failReason = "the host ended the connection"
+		}
 		info.Code = EventCodeDisconnectedFromPeer
 		info.Player = 0
 		s.session.OnEvent(&info)
@@ -216,8 +242,16 @@ func (s *Spectator) SetDisconnectTimeout(timeout int) error {
 func (s *Spectator) SetDisconnectNotifyStart(timeout int) error {
 	return Error{Code: ErrorCodeInvalidRequest, Name: "ErrorCodeInvalidRequest"}
 }
+
+// Close stops this watcher's endpoint and its transport reader; the next
+// match builds a new Spectator over the same page connection.
 func (s *Spectator) Close() error {
-	return Error{Code: ErrorCodeInvalidRequest, Name: "ErrorCodeInvalidRequest"}
+	if s.host.IsInitialized() {
+		s.host.Close()
+	} else if s.connection != nil {
+		s.connection.Close()
+	}
+	return nil
 }
 func (s *Spectator) InitializeConnection(c ...transport.Connection) error {
 	if len(c) == 0 {
@@ -239,7 +273,77 @@ func (s *Spectator) Start() {
 	go s.connection.Read(s.messageChannel)
 
 	s.host = protocol.NewUdpProtocol(s.connection, 0, s.hostIp, s.hostPort, nil)
+	s.host.SetWatcherLine()
+	// A host that vanishes ends the watch instead of leaving it waiting forever
+	// (the endpoint had no timeout at all before).
+	s.host.SetDisconnectTimeout(DefaultDisconnectTimeout)
+	s.host.SetDisconnectNotifyStart(DefaultDisconnectNotifyStart)
 	s.poll.RegisterLoop(&s.host, nil)
 	s.host.Synchronize()
 
+}
+
+// fail ends this watch with a reason: one EventCodeDisconnectedFromPeer to the
+// session, and the host is told, best effort.
+func (s *Spectator) fail(reason string) {
+	if s.failReason == "" {
+		s.failReason = reason
+	}
+	if s.host.IsInitialized() && !s.host.IsDisconnected() {
+		s.host.Fail(reason)
+	}
+	if !s.disconnectSent {
+		s.disconnectSent = true
+		info := Event{Code: EventCodeDisconnectedFromPeer}
+		s.session.OnEvent(&info)
+	}
+}
+
+// FailReason says why this watch ended ("" while it is running).
+func (s *Spectator) FailReason() string {
+	if s.failReason != "" {
+		return s.failReason
+	}
+	return s.host.FailReason()
+}
+
+// Frame is the next frame this watcher will simulate.
+func (s *Spectator) Frame() int {
+	return s.nextInputToSend
+}
+
+// Buffered is how many frames have arrived and wait to be simulated.
+func (s *Spectator) Buffered() int {
+	n := s.host.LastReceivedFrame() - s.nextInputToSend + 1
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+// Running reports whether the watcher has synced with the host and not ended.
+func (s *Spectator) Running() bool {
+	return !s.synchonizing && !s.disconnectSent
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		b[i] = '-'
+	}
+	return string(b[i:])
 }

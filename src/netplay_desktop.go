@@ -152,6 +152,9 @@ func platformRankStatus() string { return "" }
 
 func platformOnlineNames() string { return "" }
 
+// platformLobby: winner-stays lobbies are the browser page's (netplay_js.go).
+func platformLobby(cmd, arg string) string { return "" }
+
 // platformReportResult is likewise browser-only: there is no leaderboard
 // endpoint to report to from a desktop build.
 func platformReportResult(winSide int, p1Char, p2Char string) {}

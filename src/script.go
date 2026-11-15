@@ -2584,6 +2584,22 @@ func systemScriptInit(l *lua.LState) {
 		l.Push(lua.LString(platformRankStatus()))
 		return 1
 	})
+	luaRegister(l, "netLobby", func(l *lua.LState) int {
+		/*The page's winner-stays lobby (browser builds; empty elsewhere).
+		@function netLobby
+		@tparam string cmd 'open', 'next', 'text', 'result', 'leave' or 'rounds'
+		@tparam string arg the argument ('result': the winning side, 1 or 2, 0 a
+		  draw, -1 no result)
+		@treturn string the page's answer, never blocking; empty when the page has
+		  no lobby
+		function netLobby(cmd, arg) end*/
+		arg := ""
+		if l.GetTop() >= 2 {
+			arg = strArg(l, 2)
+		}
+		l.Push(lua.LString(platformLobby(strArg(l, 1), arg)))
+		return 1
+	})
 	luaRegister(l, "enterReplay", func(*lua.LState) int {
 		/*Enter replay playback mode from a replay file.
 		@function enterReplay
@@ -5055,6 +5071,103 @@ func systemScriptInit(l *lua.LState) {
 		// Reset the pre-match loading rendezvous each time we start a load.
 		if sys.netConnection != nil {
 			sys.netConnection.ResetLoadingPhase()
+		}
+		// Offer the match to watchers (only on a host page that allows them).
+		if sys.netConnection != nil && sys.netConnection.host {
+			watchHostSelect(strArg(l, 1))
+		}
+		return 0
+	})
+	luaRegister(l, "watchNext", func(l *lua.LState) int {
+		/*Watcher only: the next match to load from the host.
+		@function watchNext
+		@treturn table|nil|boolean `{stage = ref, chars = {{side, ref, pal}, ...},
+		  teamMode = {m1, m2}, numChars = {n1, n2}, params = string}` once the host
+		  offers a match (its characters and stage are added to the select list
+		  and the host's sync settings are in effect), `nil` while waiting,
+		  `false` once the host is gone.
+		function watchNext() end*/
+		sys.watch.active = true
+		m, alive := sys.watch.nextMatch()
+		if !alive {
+			watchEndOverride()
+			l.Push(lua.LFalse)
+			return 1
+		}
+		if m == nil {
+			l.Push(lua.LNil)
+			return 1
+		}
+		chars, stageRef, err := sys.watch.apply(m)
+		if err != nil {
+			platformWatchLog("cannot watch this match: " + err.Error())
+			sys.watch.sel = nil
+			l.Push(lua.LNil)
+			return 1
+		}
+		t := l.NewTable()
+		t.RawSetString("stage", lua.LNumber(stageRef))
+		ct := l.NewTable()
+		for _, c := range chars {
+			e := l.NewTable()
+			e.Append(lua.LNumber(c[0]))
+			e.Append(lua.LNumber(c[1]))
+			e.Append(lua.LNumber(c[2]))
+			ct.Append(e)
+		}
+		t.RawSetString("chars", ct)
+		tm, nc := l.NewTable(), l.NewTable()
+		for i := 0; i < 2; i++ {
+			tm.Append(lua.LNumber(m.TeamMode[i]))
+			nc.Append(lua.LNumber(m.NumChars[i]))
+		}
+		t.RawSetString("teamMode", tm)
+		t.RawSetString("numChars", nc)
+		t.RawSetString("params", lua.LString(m.Params))
+		l.Push(t)
+		return 1
+	})
+	luaRegister(l, "watchAvailable", func(l *lua.LState) int {
+		/*Whether this engine can watch a match (the browser build's page).
+		@function watchAvailable
+		@treturn boolean
+		function watchAvailable() end*/
+		l.Push(lua.LBool(platformWatchAvailable()))
+		return 1
+	})
+	luaRegister(l, "watchStart", func(l *lua.LState) int {
+		/*Open the page's "Watch a match" panel and become a watcher.
+		@function watchStart
+		@treturn boolean false when this engine cannot watch
+		function watchStart() end*/
+		// A new watch; the characters and stages added before stay added.
+		sys.watch = watchState{added: sys.watch.added, stages: sys.watch.stages}
+		l.Push(lua.LBool(platformWatchBegin()))
+		return 1
+	})
+	luaRegister(l, "watchLeave", func(l *lua.LState) int {
+		/*Stop watching (the watcher's connection closes).
+		@function watchLeave
+		function watchLeave() end*/
+		platformWatchLeave()
+		watchEndOverride()
+		return 0
+	})
+	luaRegister(l, "watchResult", func(l *lua.LState) int {
+		/*Watcher only: the winning side of the match just watched.
+		@function watchResult
+		@treturn int 1 or 2, 0 for a draw, -1 when none was decided
+		function watchResult() end*/
+		l.Push(lua.LNumber(watchResultSide()))
+		return 1
+	})
+	luaRegister(l, "watchApply", func(l *lua.LState) int {
+		/*Watcher only: after the selection is made, set the host's rules and arm
+		this engine's next game() as a watcher.
+		@function watchApply
+		function watchApply() end*/
+		if sys.watch.sel != nil {
+			sys.watch.applyRules(sys.watch.sel)
 		}
 		return 0
 	})

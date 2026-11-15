@@ -309,7 +309,33 @@ func (nc *NetConnection) Connect(server string, port int) {
 		nc.webrtcStartQueue("casual")
 		return
 	}
+	// 'webrtc-lobby' -> a winner-stays lobby's match: the lobby server
+	// assigned this page its role (host or guest) for the match, and the page
+	// hands it over like a queue's (queueRole), so it shares the queue path.
+	if server == "webrtc-lobby" {
+		nc.webrtcStartQueue("lobby")
+		return
+	}
 	nc.webrtcStart(false)
+}
+
+// platformLobby is the page's winner-stays lobby (webrtc.js ikemenNet.lobby):
+// one command in, one line of text out, never blocking. Commands: 'open' (show
+// the lobby sidebar to create or join one), 'next' (the next assignment once:
+// empty while there is none, 'play:N', 'watch:N', 'gone' when this page is not in
+// a lobby), 'text' (the lobby screen's lines), 'result' (arg: the winning side
+// of the match just played, 1 or 2, 0 a draw, -1 none), 'leave', 'rounds' (a
+// dev switch: rounds to win, or empty). Empty when the page has no lobby.
+func platformLobby(cmd, arg string) string {
+	bridge := js.Global().Get("ikemenNet")
+	if !bridge.Truthy() || bridge.Get("lobby").Type() != js.TypeFunction {
+		return ""
+	}
+	v := bridge.Call("lobby", cmd, arg)
+	if v.Type() != js.TypeString {
+		return ""
+	}
+	return v.String()
 }
 
 // platformOnlineNames feeds the in-match name plates (Lua binding

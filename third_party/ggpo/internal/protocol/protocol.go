@@ -87,7 +87,76 @@ type UdpProtocol struct {
 
 	RemoteChecksumsThisFrame util.OrderedMap[int, uint32]
 	RemoteChecksums          util.OrderedMap[int, uint32]
+
+	// HOST SIDE OF A WATCHER. A spectator endpoint is the host's line to a
+	// watcher, and everything that arrives on it comes from a stranger: it is
+	// never allowed to panic or stall the host. See SetSpectatorEndpoint.
+	spectatorEndpoint bool
+	maxPending        int
+	failReason        string
+	// The upload to a watcher, paced (sendSpectatorPending): the newest
+	// confirmed frame queued (the clock pacing counts in), the newest frame
+	// sent at least once, when each queued frame was last sent, and the byte
+	// budget every message to the watcher is spent from (spendSpectatorBytes).
+	specClock   int
+	specSent    int
+	specSentAt  []int
+	specTokens  int
+	specTokenAt int
+
+	// WATCHER SIDE. The highest frame this endpoint may take in; frames past
+	// it are left unacknowledged so the host keeps them (flow control for a
+	// spectator's fixed buffer). -1, the default, is no limit: a player's
+	// endpoint never sets it.
+	recvLimit int
+	// A watcher's line to the match host (SetWatcherLine): what the host
+	// sends can end the watch, with a reason, but never panic the watcher.
+	watcherLine bool
 }
+
+// Frames a host keeps for one watcher that has not acknowledged them, and the
+// most bytes of input one packet carries (the packet's byte count is a single
+// byte, and one watcher frame is both players' inputs).
+const (
+	SpectatorMaxPendingFrames = 240
+	maxInputPacketBytes       = 255
+	// One send to a watcher carries at most this many packets (15 frames each
+	// at 16 bytes a frame, so up to two seconds at 60 fps), oldest first. The
+	// frames a watcher can receive per round trip are what is in flight, so
+	// one packet a send capped a watcher at 15 frames per round trip: under 60
+	// fps past about 250 ms.
+	spectatorPacketsPerSend = 8
+	// PACING. Each confirmed frame goes to a watcher once, when it is queued;
+	// the unacknowledged frames are sent again (from the oldest, at most
+	// spectatorPacketsPerSend packets) only when the oldest was last sent this
+	// many of the host's frames ago (200 ms at 60 fps). GGPO's own retry sends
+	// the pending window on every poll, several times a frame, so a watcher's
+	// cost grew with its round trip (the window) and with how long it held
+	// back its acknowledgments. Now a frame is sent at most once per interval
+	// whatever the watcher does, and its acknowledgments only decide which
+	// frames those are. With 16-byte frames: about 60 packets of one frame a
+	// second (about 3.5 KB/s) for a watcher that keeps up, and at most 8
+	// packets of 15 frames per interval on top (about 11.5 KB/s) for one that
+	// is far, slow, lossy or holding back its acknowledgments.
+	spectatorResendFrames = 12
+	// A new frame goes out with up to this many frames in all: the unacknowledged
+	// ones just before it ride along, so a watcher that lost a packet or two
+	// carries on from the next one. A watcher that acknowledges promptly has
+	// few frames unacknowledged, so for it the packets stay small.
+	spectatorRedundantFrames = 4
+	// THE CEILING. Every message to a watcher (inputs, keep-alives, replies
+	// to its quality reports and sync requests) is spent from a budget of
+	// this many bytes per host frame (24,000 bytes a second at 60 fps), held
+	// to a burst of spectatorBudgetBurst bytes; what is over is not sent (an
+	// input packet goes again at the next resend). Above the paced upload's
+	// worst case, so it never touches an honest watcher, and it holds even if
+	// a watcher finds another way to make the host answer it.
+	spectatorBudgetPerFrame = 400
+	spectatorBudgetBurst    = 4800
+	// A watcher stops taking frames in while this many events wait to be
+	// read, so a burst can never overflow the event queue (64).
+	spectatorEventSoftCap = 48
+)
 
 type NetworkStats struct {
 	Network  NetworkNetworkStats
@@ -250,6 +319,7 @@ func NewUdpProtocol(connection transport.Connection, queue int, ip string, port 
 		lastAckedInput:           lastAckedInput,
 		RemoteChecksums:          util.NewOrderedMap[int, uint32](16),
 		RemoteChecksumsThisFrame: util.NewOrderedMap[int, uint32](16),
+		recvLimit:                -1,
 	}
 	//poll.RegisterLoop(&protocol, nil)
 	return protocol
@@ -348,7 +418,9 @@ func (u *UdpProtocol) OnLoopPoll(timeFunc polling.FuncTimeType) bool {
 		}
 
 		if u.disconnectTimeout > 0 && (u.lastRecvTime+u.disconnectTimeout < now) {
-			if !u.disconnectEventSent {
+			if u.spectatorEndpoint {
+				u.Fail(fmt.Sprintf("the watcher stopped answering for %d ms", u.disconnectTimeout))
+			} else if !u.disconnectEventSent {
 				util.Log.Printf("Endpoint has stopped receiving packets for %d ms.  Disconnecting.\n",
 					u.disconnectTimeout)
 				u.QueueEvent(&UdpProtocolEvent{
@@ -372,6 +444,9 @@ func (u *UdpProtocol) OnLoopPoll(timeFunc polling.FuncTimeType) bool {
 // go globs can do a lot of that for us, so i've forgone much of that logic
 // https://github.com/pond3r/ggpo/blob/7ddadef8546a7d99ff0b3530c6056bc8ee4b9c0a/src/lib/ggpo/network/udp_proto.cpp#L111
 func (u *UdpProtocol) SendPendingOutput() error {
+	if u.spectatorEndpoint {
+		return u.sendSpectatorPending()
+	}
 	msg := messages.NewUDPMessage(messages.InputMsg)
 	inputMsg := msg.(*messages.InputPacket)
 
@@ -453,6 +528,11 @@ func (u *UdpProtocol) GetEvent() (*UdpProtocolEvent, error) {
 
 func (u *UdpProtocol) QueueEvent(evt *UdpProtocolEvent) {
 	util.Log.Printf("Queueing event %s", *evt)
+	if u.spectatorEndpoint && u.eventQueue.Size() >= spectatorEventSoftCap && evt.eventType != DisconnectedEvent {
+		// Never panic over a watcher: past the soft cap only the one event
+		// that matters, the disconnect, is still queued.
+		return
+	}
 	err := u.eventQueue.Push(*evt)
 	// if there's no more room left in the queue, make room.
 	if err != nil {
@@ -478,6 +558,9 @@ func (u *UdpProtocol) SendSyncRequest() {
 
 func (u *UdpProtocol) SendMsg(msg messages.UDPMessage) {
 	util.Log.Printf("In UdpProtocol send %s", msg)
+	if u.spectatorEndpoint && !u.spendSpectatorBytes(msg.PacketSize()) {
+		return // over the watcher's budget (spectatorBudgetPerFrame)
+	}
 	u.packetsSent++
 	u.lastSendTime = time.Now().UnixMilli()
 	u.bytesSent += msg.PacketSize()
@@ -501,6 +584,9 @@ func (u *UdpProtocol) SendMsg(msg messages.UDPMessage) {
 
 func (u *UdpProtocol) OnInput(msg messages.UDPMessage, length int) (bool, error) {
 	inputMessage := msg.(*messages.InputPacket)
+	if u.spectatorEndpoint {
+		return u.onSpectatorInput(inputMessage)
+	}
 
 	// If a disconnect is requested, go ahead and disconnect now.
 	disconnectRequested := inputMessage.DisconectRequested
@@ -516,6 +602,9 @@ func (u *UdpProtocol) OnInput(msg messages.UDPMessage, length int) (bool, error)
 		// update the peer connection status if this peer is still considered to be part
 		// of the network
 		remoteStatus := inputMessage.PeerConnectStatus
+		if u.watcherLine && len(remoteStatus) < len(u.peerConnectStatus) {
+			return false, errors.New("ggpo UdpProtocol OnInput: fewer connect statuses than players")
+		}
 		for i := 0; i < len(u.peerConnectStatus); i++ {
 			if remoteStatus[i].LastFrame < u.peerConnectStatus[i].LastFrame {
 				return false, errors.New("ggpo UdpProtocol OnInput: remoteStatus[i].LastFrame < u.peerConnectStatus[i].LastFrame")
@@ -523,6 +612,25 @@ func (u *UdpProtocol) OnInput(msg messages.UDPMessage, length int) (bool, error)
 			u.peerConnectStatus[i].Disconnected = u.peerConnectStatus[i].Disconnected || remoteStatus[i].Disconnected
 			u.peerConnectStatus[i].LastFrame = util.Max(u.peerConnectStatus[i].LastFrame, remoteStatus[i].LastFrame)
 		}
+	}
+
+	if n := len(inputMessage.Bits); u.watcherLine && n > 0 && (inputMessage.InputSize == 0 || n%int(inputMessage.InputSize) != 0) {
+		// Whole frames only: the loop below slices InputSize bytes per frame,
+		// and a short tail panicked a watcher's engine ("slice bounds out of
+		// range"; it got such frames from a host whose other player had left,
+		// and a hostile host can send them on purpose). Nothing in such a
+		// packet is used: the watch ends with a reason, never a panic. A
+		// player's endpoint is left as GGPO has it.
+		return false, errors.New("ggpo UdpProtocol OnInput: input that is not whole frames")
+	}
+
+	if u.recvLimit >= 0 && int(inputMessage.StartFrame) > u.lastRecievedInput.Frame+1 && len(inputMessage.Bits) > 0 {
+		// WATCHER SIDE: the host sends a long window as several packets, and
+		// on an unordered channel a later one can arrive first (or alone). A
+		// watcher has no room for frames past a gap, so that packet is left
+		// for the host to send again (it resends until acknowledged). A
+		// watcher starts at frame 0, as the host keeps every frame from 0.
+		return true, nil
 	}
 
 	// Decompress the input (gob should already have done this)
@@ -542,6 +650,12 @@ func (u *UdpProtocol) OnInput(msg messages.UDPMessage, length int) (bool, error)
 			return false, errors.New("ggpo UdpProtocol OnInput: currentFrame > uint32(u.lastRecievedInput.Frame + 1)")
 		}
 		useInputs := currentFrame == uint32(u.lastRecievedInput.Frame+1)
+		if useInputs && u.recvLimit >= 0 &&
+			(int(currentFrame) > u.recvLimit || u.eventQueue.Size() >= spectatorEventSoftCap) {
+			// A watcher's buffer is full: leave this frame and the rest
+			// unacknowledged, and the host sends them again later.
+			break
+		}
 		if useInputs {
 			if currentFrame != uint32(u.lastRecievedInput.Frame)+1 {
 				return false, errors.New("ggpo UdpProtocol OnInput: currentFrame != uint32(u.lastRecievedInput.Frame) +1")
@@ -730,6 +844,10 @@ func (u *UdpProtocol) HandlesMsg(ipAddress string, port int) bool {
 }
 
 func (u *UdpProtocol) SendInput(input *input.GameInput) {
+	if u.spectatorEndpoint {
+		u.sendSpectatorInput(input)
+		return
+	}
 	if u.connection != nil {
 		if u.currentState == RunningState {
 			// check to see if this is a good time to adjust for the rift
@@ -817,6 +935,9 @@ func (u *UdpProtocol) OnMsg(msg messages.UDPMessage, length int) {
 		u.OnKeepAlive,
 		u.OnInputAck}
 
+	if u.spectatorEndpoint && u.currentState == DisconnectedState {
+		return // a dropped watcher is not listened to
+	}
 	// filter out messages that don't match what we expect
 	seq := msg.Header().SequenceNumber
 	if msg.Header().HeaderType != uint8(messages.SyncRequestMsg) && msg.Header().HeaderType != uint8(messages.SyncReplyMsg) {
@@ -841,6 +962,14 @@ func (u *UdpProtocol) OnMsg(msg messages.UDPMessage, length int) {
 		handled, err = table[int(msg.Header().HeaderType)](msg, length)
 	}
 	if err != nil {
+		if u.spectatorEndpoint {
+			u.Fail("bad packet from the watcher: " + err.Error())
+			return
+		}
+		if u.watcherLine {
+			u.Fail("bad packet from the match host: " + err.Error())
+			return
+		}
 		panic(err)
 	}
 
@@ -908,4 +1037,267 @@ func (u *UdpProtocol) IsSynchronized() bool {
 
 func (u *UdpProtocol) IsRunning() bool {
 	return u.currentState == RunningState
+}
+
+// SetSpectatorEndpoint marks this endpoint as the host's line to a watcher.
+// From then on nothing the watcher sends can panic the host: a bad packet, or a
+// watcher that never syncs, stops acknowledging or falls behind, is dropped
+// with a reason (FailReason) and one DisconnectedEvent instead. maxPending is
+// how many frames the host keeps for it unacknowledged before giving up; they
+// are kept from the first frame even while it is still syncing, so a watcher
+// that finishes connecting a little after the players start still gets the
+// whole match, and one that takes longer is dropped from it.
+func (u *UdpProtocol) SetSpectatorEndpoint(maxPending int) {
+	if maxPending < 2 {
+		maxPending = 2
+	}
+	u.spectatorEndpoint = true
+	u.maxPending = maxPending
+	// A ring buffer holds one less than its capacity.
+	u.pendingOutput = buffer.NewRingBuffer[input.GameInput](maxPending + 1)
+	u.specSent = -1
+	u.specClock = -1
+	u.specSentAt = make([]int, maxPending+1)
+	u.specTokens = spectatorBudgetBurst
+	u.specTokenAt = 0
+}
+
+// spendSpectatorBytes takes n bytes from a watcher's budget; false when the
+// message must not be sent. The budget refills by spectatorBudgetPerFrame per
+// host frame queued (specClock), up to spectatorBudgetBurst.
+func (u *UdpProtocol) spendSpectatorBytes(n int) bool {
+	if u.specClock > u.specTokenAt {
+		u.specTokens += (u.specClock - u.specTokenAt) * spectatorBudgetPerFrame
+		if u.specTokens > spectatorBudgetBurst {
+			u.specTokens = spectatorBudgetBurst
+		}
+		u.specTokenAt = u.specClock
+	}
+	if u.specTokens < n {
+		return false
+	}
+	u.specTokens -= n
+	return true
+}
+
+// FailReason is why this endpoint was dropped ("" while it is fine).
+func (u *UdpProtocol) FailReason() string {
+	return u.failReason
+}
+
+// IsDisconnected reports whether this endpoint has been shut down.
+func (u *UdpProtocol) IsDisconnected() bool {
+	return u.currentState == DisconnectedState
+}
+
+// SetWatcherLine marks this endpoint as a watcher's line to the match host:
+// a packet from the host that this end cannot use ends the watch with a reason
+// (FailReason, one DisconnectedEvent) instead of a panic.
+func (u *UdpProtocol) SetWatcherLine() {
+	u.watcherLine = true
+}
+
+// SetRecvLimit sets the highest frame a watcher's endpoint takes in (-1: no
+// limit).
+func (u *UdpProtocol) SetRecvLimit(frame int) {
+	u.recvLimit = frame
+}
+
+// LastReceivedFrame is the newest frame taken in, in order (-1: none).
+func (u *UdpProtocol) LastReceivedFrame() int {
+	return u.lastRecievedInput.Frame
+}
+
+// Fail drops this endpoint with a reason: it stops listening to it, tells the
+// other end once, best effort, and queues one DisconnectedEvent for the
+// backend. Safe to call more than once; the first reason stays.
+func (u *UdpProtocol) Fail(reason string) {
+	if u.failReason == "" {
+		u.failReason = reason
+	}
+	util.Log.Printf("dropping endpoint %d: %s\n", u.queue, reason)
+	if u.currentState != DisconnectedState {
+		u.currentState = DisconnectedState
+		u.shutdownTimeout = time.Now().UnixMilli() + UDPShutdownTimer
+		if u.connection != nil && u.peerAddress != "" {
+			notice := messages.NewUDPMessage(messages.InputMsg).(*messages.InputPacket)
+			notice.DisconectRequested = true
+			notice.AckFrame = int32(u.lastRecievedInput.Frame)
+			notice.PeerConnectStatus = make([]messages.UdpConnectStatus, messages.UDPMsgMaxPlayers)
+			u.SendMsg(notice)
+		}
+	}
+	if !u.disconnectEventSent {
+		u.disconnectEventSent = true
+		u.QueueEvent(&UdpProtocolEvent{eventType: DisconnectedEvent})
+	}
+}
+
+// onSpectatorInput is the host's reading of an input packet from a watcher. A
+// watcher has no inputs: all it may say is how far it has received and that
+// it is leaving. Anything else is refused, and nothing in the packet is used
+// to index anything.
+func (u *UdpProtocol) onSpectatorInput(m *messages.InputPacket) (bool, error) {
+	if m.DisconectRequested {
+		u.Fail("the watcher left")
+		return true, nil
+	}
+	if len(m.Bits) != 0 || m.InputSize != 0 {
+		return false, errors.New("a watcher sent inputs")
+	}
+	u.dropAcknowledged(m.AckFrame)
+	return true, nil
+}
+
+func (u *UdpProtocol) dropAcknowledged(ackFrame int32) {
+	for u.pendingOutput.Size() > 0 {
+		in, err := u.pendingOutput.Front()
+		if err != nil || int32(in.Frame) >= ackFrame {
+			return
+		}
+		u.lastAckedInput = in
+		if u.pendingOutput.Pop() != nil {
+			return
+		}
+	}
+}
+
+// sendSpectatorPending is the paced upload to a watcher (see
+// spectatorResendFrames). The frames it has never been sent go out at once,
+// oldest first; the ones it has not acknowledged go again, from the oldest,
+// only when the oldest was last sent spectatorResendFrames host frames ago.
+// Either way at most spectatorPacketsPerSend packets of at most
+// maxInputPacketBytes of input each (a packet's byte count is one byte), each
+// starting where the previous one ended, and the first one sent again always
+// starts at the oldest unacknowledged frame, as in the players' protocol. Calls
+// with nothing due send nothing: GGPO calls this on every poll.
+func (u *UdpProtocol) sendSpectatorPending() error {
+	size := u.pendingOutput.Size()
+	if size == 0 {
+		return nil
+	}
+	front, err := u.pendingOutput.Front()
+	if err != nil {
+		return err
+	}
+	if !(u.lastAckedInput.Frame == -1 || u.lastAckedInput.Frame+1 == front.Frame) {
+		return errors.New("ggpo UdpProtocol sendSpectatorPending: the window does not follow the last acknowledged frame")
+	}
+	per := 1
+	if front.Size > 0 && maxInputPacketBytes/front.Size > 1 {
+		per = maxInputPacketBytes / front.Size
+	}
+	most := per * spectatorPacketsPerSend
+	ring := len(u.specSentAt)
+	// Again: the oldest unacknowledged frame was sent long enough ago. Until
+	// the watcher has acknowledged a frame, on every call, as GGPO always did:
+	// its own line may still be syncing and drop the first packets. That lasts
+	// at most maxPending frames (it is dropped after), and the budget holds.
+	after := spectatorResendFrames
+	if u.lastAckedInput.Frame == -1 {
+		after = 0
+	}
+	if front.Frame <= u.specSent && u.specClock-u.specSentAt[front.Frame%ring] >= after {
+		n := size
+		if n > most {
+			n = most
+		}
+		if err := u.sendSpectatorFrames(0, n, per); err != nil {
+			return err
+		}
+	}
+	// New: the frames never sent (an acknowledgment can be past them), with
+	// up to spectatorRedundantFrames-1 unacknowledged ones before them, so a
+	// lost packet is covered by the next one without waiting for a resend.
+	first := 0
+	if u.specSent >= front.Frame {
+		first = u.specSent - front.Frame + 1
+	}
+	if first < size {
+		from := first - (spectatorRedundantFrames - 1)
+		if from < 0 {
+			from = 0
+		}
+		n := size - from
+		if n > most {
+			n = most
+		}
+		return u.sendSpectatorFrames(from, from+n, per)
+	}
+	return nil
+}
+
+// sendSpectatorFrames sends pendingOutput items [from, to) as packets of per
+// frames. The frames are copied before anything is sent: an acknowledgment
+// handled during a send (a synchronous transport) moves the front of
+// pendingOutput.
+func (u *UdpProtocol) sendSpectatorFrames(from, to, per int) error {
+	window := make([]input.GameInput, 0, to-from)
+	for j := from; j < to; j++ {
+		current, err := u.pendingOutput.Item(j)
+		if err != nil {
+			return err
+		}
+		window = append(window, current)
+	}
+	ring := len(u.specSentAt)
+	for first := 0; first < len(window); first += per {
+		inputMsg := messages.NewUDPMessage(messages.InputMsg).(*messages.InputPacket)
+		for j := first; j < first+per && j < len(window); j++ {
+			current := window[j]
+			if j == first {
+				inputMsg.StartFrame = uint32(current.Frame)
+				inputMsg.InputSize = uint8(current.Size)
+			}
+			inputMsg.Checksum = current.Checksum
+			inputMsg.Bits = append(inputMsg.Bits, current.Bits...)
+			u.lastSentInput = current
+			u.specSentAt[current.Frame%ring] = u.specClock
+			if current.Frame > u.specSent {
+				u.specSent = current.Frame
+			}
+		}
+		inputMsg.AckFrame = int32(u.lastRecievedInput.Frame)
+		inputMsg.NumBits = uint16(inputMsg.InputSize)
+		inputMsg.DisconectRequested = u.currentState == DisconnectedState
+		if u.localConnectStatus != nil {
+			inputMsg.PeerConnectStatus = make([]messages.UdpConnectStatus, len(*u.localConnectStatus))
+			copy(inputMsg.PeerConnectStatus, *u.localConnectStatus)
+		} else {
+			inputMsg.PeerConnectStatus = make([]messages.UdpConnectStatus, messages.UDPMsgMaxPlayers)
+		}
+		u.SendMsg(inputMsg)
+	}
+	return nil
+}
+
+// sendSpectatorInput queues one confirmed frame for a watcher. Frames are kept
+// from the first one even before the watcher has synced, and sent once it
+// has; a watcher that lets maxPending frames pile up (it never synced, went
+// silent, or fell behind its buffer) is dropped from the match.
+func (u *UdpProtocol) sendSpectatorInput(in *input.GameInput) {
+	if u.connection == nil || u.currentState == DisconnectedState {
+		return
+	}
+	if u.pendingOutput.Size() >= u.maxPending {
+		if u.currentState == RunningState {
+			u.Fail(fmt.Sprintf("the watcher fell %d frames behind", u.pendingOutput.Size()))
+		} else {
+			u.Fail(fmt.Sprintf("the watcher was not connected %d frames after the match started", u.pendingOutput.Size()))
+		}
+		return
+	}
+	if err := u.pendingOutput.Push(*in); err != nil {
+		u.Fail("the watcher's queue is full")
+		return
+	}
+	if in.Frame > u.specClock {
+		u.specClock = in.Frame
+	}
+	if u.currentState != RunningState {
+		return
+	}
+	if err := u.SendPendingOutput(); err != nil {
+		u.Fail(err.Error())
+	}
 }

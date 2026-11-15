@@ -207,6 +207,7 @@ type NetConnection struct {
 	uiInputDebounced bool
 	headerWritten    bool
 	loadingPhase     LoadingPhase
+	lastSeed         int32 // the seed the last Synchronize agreed (a watcher's start message)
 }
 
 func NewNetConnection() *NetConnection {
@@ -489,6 +490,7 @@ func (nc *NetConnection) Synchronize() error {
 		}
 	}
 	Srand(seed)
+	nc.lastSeed = seed
 
 	// Synchronize to host's pre-match time
 	var pmTime int32

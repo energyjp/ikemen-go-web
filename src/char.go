@@ -2875,6 +2875,13 @@ func (p *Projectile) tick() {
 			p.freezeflag = true // This flag makes projectiles halt in place between multiple hits
 		}
 	}
+
+	// Step the animation here, in the simulation, and not in cueDraw()
+	// Rollback re-simulation and skipped render frames never draw, and collision reads the animation's current frame
+	// Action() refreshes the sprite before it advances, so cueDraw() shows the frame this tick's collision used
+	if p.anim != nil && !p.pauseBool && p.hitpause <= 0 {
+		p.anim.Action()
+	}
 }
 
 func (p *Projectile) cueDraw() {
@@ -2888,11 +2895,9 @@ func (p *Projectile) cueDraw() {
 
 	isPaused := p.hitpause > 0 || p.pauseBool
 
-	// TODO: Gating UpdateSprite() during pauses makes it go out of sync with the animation data
+	// The animation is stepped and its sprite refreshed in tick()
+	// TODO: During pauses the sprite is not refreshed, which makes it go out of sync with the animation data
 	// In the case of projectiles this can be seen with Clsn display
-	if !isPaused && sys.tickFrame() {
-		p.anim.UpdateSprite()
-	}
 
 	// Projectile Clsn display
 	if sys.clsnDisplay {
@@ -2910,10 +2915,6 @@ func (p *Projectile) cueDraw() {
 					p.clsnAngle*p.facing)
 			}
 		}
-	}
-
-	if sys.tickNextFrame() && !isPaused {
-		p.anim.Action() // TODO: Placing this in cueDraw is a bit unusual. Confirm if it's right
 	}
 
 	// Set position

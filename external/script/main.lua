@@ -1156,11 +1156,19 @@ function main.f_commandLine()
 		table.insert(t_params, 'pausemenu=false')
 	end
 	loadStart(table.concat(t_params, ', '))
-	while loading() do
+	-- A netplay quick match (-ip) waits for both peers to finish loading, the
+	-- rendezvous start.lua's VS screen makes: without it each peer's delay
+	-- clock ran on through its own load, and the match's synchronize() failed
+	-- with "Synchronization error" whenever the two loads took different times.
+	local netReady = flags['-ip'] == nil
+	while loading() or not netReady do
 		-- Pump the engine while waiting: on the single-threaded wasm build the
 		-- loader can only make progress when the main loop runs, so a bare
 		-- busy-wait here deadlocks the whole quick-match path. (The -ip wait
 		-- loop above already does this.)
+		if not loading() and not netReady then
+			netReady = netLoadingReady()
+		end
 		refresh()
 	end
 	game()
@@ -1173,6 +1181,187 @@ end
 --initiate quick match only if -loadmotif flag is missing
 if getCommandLineValue("-p1") ~= nil and getCommandLineValue("-p2") ~= nil and getCommandLineValue("-loadmotif") == nil then
 	main.f_commandLine()
+end
+
+--Watching a rollback match (spectating), src/watch.go. The online menu's
+--WATCH A MATCH (main.t_itemname.watchmatch, below) opens the page's watch
+--panel and runs this until the watcher leaves; the page's dev switch starts
+--the engine with -watch, which runs it after the screenpack has loaded and
+--exits after. Each match the host offers is loaded the way a quick match loads
+--its own, then game() runs it as a watcher from the host's confirmed inputs.
+--Between matches: a waiting screen; Esc leaves.
+local function f_watchWaiting(txt)
+	if motif == nil or motif.title_info == nil then
+		return
+	end
+	clearColor(motif[main.background].bgclearcolor[1], motif[main.background].bgclearcolor[2], motif[main.background].bgclearcolor[3])
+	bgDraw(motif[main.background].BGDef, 0)
+	rectDraw(motif.title_info.connecting.overlay.RectData)
+	textImgReset(motif.title_info.connecting.TextSpriteData)
+	textImgSetText(motif.title_info.connecting.TextSpriteData, (txt ~= nil and txt ~= '') and txt or 'Watching: waiting for the next match (Esc to leave)')
+	textImgDraw(motif.title_info.connecting.TextSpriteData)
+	bgDraw(motif[main.background].BGDef, 1)
+end
+--once: a lobby's match (main.f_lobby): watch that one match, tell the page
+--who won (the lobby counts watchers' results as a tiebreak), and return.
+function main.f_watch(fromMenu, once)
+	setGameMode('quickvs')
+	setCredits(-1)
+	local bootMode = gameOption('Config.BootLoadingMode')
+	modifyGameOption('Config.BootLoadingMode', 0)
+	while true do
+		local sel = nil
+		while sel == nil do
+			sel = watchNext()
+			if sel == nil and esc() then
+				esc(false)
+				watchLeave()
+				sel = false
+			end
+			if sel == false then
+				modifyGameOption('Config.BootLoadingMode', bootMode)
+				if fromMenu then
+					return
+				end
+				os.exit()
+			end
+			f_watchWaiting(once and netLobby('text', '') or nil)
+			refresh()
+		end
+		setFightScreenElements({guardbar = gameOption('Options.GuardBreak'), stunbar = gameOption('Options.Dizzy'), redlifebar = gameOption('Options.RedLife')})
+		clearSelected()
+		selectStage(sel.stage)
+		setTeamMode(1, sel.teamMode[1], sel.numChars[1])
+		setTeamMode(2, sel.teamMode[2], sel.numChars[2])
+		for _, c in ipairs(sel.chars) do
+			selectChar(c[1], c[2], c[3])
+		end
+		watchApply()
+		loadStart(sel.params)
+		while loading() do
+			refresh()
+		end
+		game()
+		esc(false)
+		if once then
+			local ok, side = pcall(watchResult)
+			netLobby('result', tostring((ok and type(side) == 'number') and side or -1))
+			watchLeave()
+			modifyGameOption('Config.BootLoadingMode', bootMode)
+			return
+		end
+	end
+end
+
+--WINNER-STAYS LOBBY (the browser build's page only: webrtc.js holds the lobby,
+--the lobby server decides who plays). The online menu's LOBBY opens the page's
+--lobby sidebar (create or join one); this loop then runs whatever the lobby
+--assigns this page, match after match, without reloading: PLAY it as that
+--match's netplay host or guest (the character select, ONE match, then the
+--session ends and the winning side goes to the page), or WATCH it
+--(main.f_watch, one match). Between matches: the lobby screen with the page's
+--lines ("next: A vs B"). Esc there leaves the lobby.
+local function f_lobbyScreen()
+	f_watchWaiting(netLobby('text', ''))
+end
+--One match per assignment: right after game() (and the engine's
+--postMatchSetup, so outside the rollback window), on both players' engines on
+--the same frame, the select loop is told to end, the way a ranked set ends.
+local lobbyMatch = nil
+local lobbyGameWrapped = false
+local function f_lobbyWrapGame()
+	if lobbyGameWrapped or start == nil or type(start.f_game) ~= 'function' then
+		return
+	end
+	lobbyGameWrapped = true
+	local orig = start.f_game
+	start.f_game = function(...)
+		local rets = {orig(...)}
+		if lobbyMatch ~= nil then
+			local ok, side = pcall(getWinnerTeam)
+			lobbyMatch.winner = (ok and type(side) == 'number') and side or -1
+			start.exit = true
+		end
+		return unpack(rets)
+	end
+end
+--Connect to this match's other player. The page says 'stale' when the lobby
+--moved on meanwhile (the other player left before connecting).
+local function f_lobbyConnect()
+	--Which local input is this side's is decided at connect time from the AI
+	--levels (GetHostGuestRemap: the first two players without AI). The title's
+	--attract demo leaves AI on for players 1 and 2, and with it neither page's
+	--keyboard reached the character select: both are humans here.
+	setCom(1, 0)
+	setCom(2, 0)
+	enterNetPlay('webrtc-lobby')
+	while not connected() do
+		if esc() or netLobby('stale', '') == 'yes' then
+			esc(false)
+			exitNetPlay()
+			return false
+		end
+		f_lobbyScreen()
+		refresh()
+	end
+	replayRecord('save/replays/' .. os.date("%Y-%m-%d_%Hh%Mm%Ss") .. '.replay')
+	return true
+end
+function main.f_lobbyPlay()
+	f_lobbyWrapGame()
+	local winner = -1
+	if f_lobbyConnect() then
+		if synchronize() then
+			--2P VERSUS, single 1v1 only: straight to the character select, as
+			--the queues do (vfslib.js), with no lobby menu.
+			main.f_clearShuffleTables()
+			main.f_default()
+			local rounds = tonumber(netLobby('rounds', '') or '')
+			if rounds ~= nil and rounds >= 1 then
+				main.matchWins.single = {rounds, rounds}
+			end
+			lobbyMatch = {winner = -1}
+			local versus = main.t_itemname.netplayversus({{itemname = 'netplayversus', displayname = 'VERSUS 2P'}}, 1)
+			main.f_unlock(false)
+			if versus ~= nil then
+				versus()
+			end
+			winner = lobbyMatch.winner
+			lobbyMatch = nil
+			main.f_default()
+			main.f_unlock(false)
+		end
+		replayStop()
+		exitNetPlay()
+		exitReplay()
+	end
+	lobbyMatch = nil
+	esc(false)
+	netLobby('result', tostring(winner))
+end
+function main.f_lobby()
+	while true do
+		local a = netLobby('next', '') or ''
+		if a == 'gone' then
+			break
+		elseif a:match('^play') then
+			main.f_lobbyPlay()
+		elseif a:match('^watch') then
+			if watchStart() then
+				main.f_watch(true, true)
+			end
+			esc(false)
+		else
+			if esc() then
+				esc(false)
+				netLobby('leave', '')
+				break
+			end
+			f_lobbyScreen()
+			refresh()
+		end
+	end
+	esc(false)
 end
 
 --;===========================================================
@@ -2273,6 +2462,35 @@ main.t_itemname = {
 			exitReplay()
 			showSessionWarning()
 		end
+		return nil
+	end,
+	--WATCH A MATCH (spectating; the browser build's page only, see main.f_watch)
+	['watchmatch'] = function(t, item)
+		if not watchAvailable() then
+			return nil
+		end
+		main.f_waitForPreloads(true)
+		local doneSnd = motif[main.group].cursor.done.snd.serverconnect or motif[main.group].cursor.done.snd.default
+		sndPlay(motif.Snd, doneSnd[1], doneSnd[2])
+		hook.run("main.t_itemname", t, item)
+		if watchStart() then
+			main.f_watch(true)
+			main.f_default()
+		end
+		return nil
+	end,
+	--LOBBY (winner stays; the browser build's page only, see main.f_lobby)
+	['lobby'] = function(t, item)
+		if type(netLobby) ~= 'function' or netLobby('open', '') ~= 'ok' then
+			return nil
+		end
+		main.f_waitForPreloads(true)
+		local doneSnd = motif[main.group].cursor.done.snd.serverconnect or motif[main.group].cursor.done.snd.default
+		sndPlay(motif.Snd, doneSnd[1], doneSnd[2])
+		hook.run("main.t_itemname", t, item)
+		main.f_lobby()
+		main.f_default()
+		esc(false)
 		return nil
 	end,
 	--SERVER HOST
@@ -4065,6 +4283,11 @@ options.f_start()
 
 if getCommandLineValue("-p1") ~= nil and getCommandLineValue("-p2") ~= nil and getCommandLineValue("-loadmotif") ~= nil then
 	main.f_commandLine()
+end
+
+--watching from the page's dev switch (-watch): see main.f_watch
+if getCommandLineValue("-watch") ~= nil then
+	main.f_watch(false)
 end
 
 main.f_loadingRefresh()

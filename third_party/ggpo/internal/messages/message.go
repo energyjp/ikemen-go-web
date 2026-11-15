@@ -349,10 +349,24 @@ func (i *InputPacket) FromBytes(buffer []byte) error {
 		return errors.New("invalid packet")
 	}
 
-	i.MessageHeader.FromBytes(buffer)
+	// Every length below comes from the sender. A watcher is a stranger, and
+	// this runs on the transport's reader goroutine, where an index past the
+	// end of the buffer is not an error but the end of the whole program: so
+	// the counts are checked against the bytes that actually arrived first.
+	// A well-formed packet decodes exactly as before.
 	totalConnectionStatus := buffer[5]
+	if int(totalConnectionStatus) > UDPMsgMaxPlayers {
+		return errors.New("invalid packet: too many connect statuses")
+	}
+	var pcs UdpConnectStatus
+	pcsSize := pcs.Size()
+	// After the statuses: start frame 4, disconnect 1, ack 4, checksum 4,
+	// bit count 2, input size 1, byte count 1.
+	if len(buffer) < 6+int(totalConnectionStatus)*pcsSize+17 {
+		return errors.New("invalid packet: truncated")
+	}
+	i.MessageHeader.FromBytes(buffer)
 	i.PeerConnectStatus = make([]UdpConnectStatus, totalConnectionStatus)
-	pcsSize := i.PeerConnectStatus[0].Size()
 	offset := 6
 	for p := 0; p < int(totalConnectionStatus); p++ {
 		i.PeerConnectStatus[p].FromBytes(buffer[offset : offset+pcsSize])
@@ -376,6 +390,9 @@ func (i *InputPacket) FromBytes(buffer []byte) error {
 	offset++
 	totalBits := buffer[offset]
 	offset++
+	if len(buffer) < offset+int(totalBits) {
+		return errors.New("invalid packet: truncated input")
+	}
 	i.Bits = make([]byte, totalBits)
 	copy(i.Bits, buffer[offset:offset+int(totalBits)])
 	offset += int(totalBits)

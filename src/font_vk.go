@@ -1,4 +1,4 @@
-//go:build !kinc && !android && !js
+//go:build !js
 
 package main
 
@@ -22,17 +22,25 @@ import (
 )
 
 type Font_VK struct {
-	fontChar    map[rune]*character
-	ttf         *truetype.Font
-	scale       int32
-	vao         uint32
-	vbo         uint32
-	program     uint32
-	color       color
-	shaderPalFX ShaderPalFX
-	resolution  [2]float32
-	textures    []*TextureAtlas
-	descriptors []*list.Element
+	fontChar     map[rune]*character
+	ttf          *truetype.Font
+	metrics      font.Metrics
+	scale        int32
+	vao          uint32
+	vbo          uint32
+	program      uint32
+	color        color
+	blendEq      BlendEquation
+	blendSrc     BlendFunc
+	blendDst     BlendFunc
+	shaderPalFX  ShaderPalFX
+	resolution   [2]float32
+	textures     []*TextureAtlas
+	descriptors  []*list.Element
+	customShader CustomShaderRenderData
+
+	// Glyphs for other on-screen sizes, by pixel size
+	rasterFonts map[int32]*Font_VK
 }
 
 type FontRenderer_VK struct {
@@ -40,6 +48,7 @@ type FontRenderer_VK struct {
 	program         *VulkanProgramInfo
 	descriptorPools []vk.DescriptorPool
 	freeDescriptors list.List
+	coveragePalTex  Texture
 }
 
 func (r *FontRenderer_VK) Init(rendererVk interface{}) {
@@ -203,80 +212,68 @@ func (r *FontRenderer_VK) Init(rendererVk interface{}) {
 		StencilTestEnable: vk.False,
 	}
 
-	attachmentStates := make([]vk.PipelineColorBlendAttachmentState, 0, 2)
-	colorBlendStates := make([]vk.PipelineColorBlendStateCreateInfo, 0, 2)
-	pipelineCreateInfos := make([]vk.GraphicsPipelineCreateInfo, 0, 2)
+	// Pipeline 0 has no blending. The others cover every blend state sprites use,
+	// so text with a set alpha blends the same way.
+	type blendState struct {
+		op       vk.BlendOp
+		src, dst vk.BlendFactor
+		key      VulkanBlendState
+	}
+	blends := []blendState{{op: vk.BlendOpAdd, src: vk.BlendFactorOne, dst: vk.BlendFactorZero}}
+	ops := map[BlendEquation]vk.BlendOp{BlendAdd: vk.BlendOpAdd, BlendReverseSubtract: vk.BlendOpReverseSubtract}
+	factors := map[BlendFunc]vk.BlendFactor{BlendOne: vk.BlendFactorOne, BlendSrcAlpha: vk.BlendFactorSrcAlpha, BlendZero: vk.BlendFactorZero,
+		BlendOneMinusSrcAlpha: vk.BlendFactorOneMinusSrcAlpha}
+	for _, op := range []BlendEquation{BlendAdd, BlendReverseSubtract} {
+		for _, src := range []BlendFunc{BlendOne, BlendSrcAlpha, BlendZero} {
+			for _, dst := range []BlendFunc{BlendOneMinusSrcAlpha, BlendOne, BlendZero} {
+				blends = append(blends, blendState{ops[op], factors[src], factors[dst], VulkanBlendState{op: op, src: src, dst: dst}})
+			}
+		}
+	}
+	attachmentStates := make([]vk.PipelineColorBlendAttachmentState, len(blends))
+	colorBlendStates := make([]vk.PipelineColorBlendStateCreateInfo, len(blends))
+	pipelineCreateInfos := make([]vk.GraphicsPipelineCreateInfo, len(blends))
 	pipelineIndexMap := map[interface{}]int{}
-	attachmentStates = append(attachmentStates, vk.PipelineColorBlendAttachmentState{
-		ColorWriteMask: vk.ColorComponentFlags(
-			vk.ColorComponentRBit | vk.ColorComponentGBit |
-				vk.ColorComponentBBit | vk.ColorComponentABit,
-		),
-		BlendEnable:         vk.True,
-		SrcColorBlendFactor: vk.BlendFactorOne,
-		DstColorBlendFactor: vk.BlendFactorZero,
-		ColorBlendOp:        vk.BlendOpAdd,
-		SrcAlphaBlendFactor: vk.BlendFactorOne,
-		DstAlphaBlendFactor: vk.BlendFactorZero,
-		AlphaBlendOp:        vk.BlendOpAdd,
-	})
-	colorBlendStates = append(colorBlendStates, vk.PipelineColorBlendStateCreateInfo{
-		SType:           vk.StructureTypePipelineColorBlendStateCreateInfo,
-		LogicOpEnable:   vk.False,
-		LogicOp:         vk.LogicOpCopy,
-		AttachmentCount: 1,
-		PAttachments:    []vk.PipelineColorBlendAttachmentState{attachmentStates[0]},
-	})
-	pipelineCreateInfos = append(pipelineCreateInfos, vk.GraphicsPipelineCreateInfo{
-		SType:               vk.StructureTypeGraphicsPipelineCreateInfo,
-		StageCount:          2, // vert + frag
-		PStages:             shaderStages,
-		PVertexInputState:   &vertexInputState,
-		PInputAssemblyState: &inputAssemblyState,
-		PViewportState:      &viewportState,
-		PRasterizationState: &rasterState,
-		PMultisampleState:   &multisampleState,
-		PColorBlendState:    &colorBlendStates[0],
-		PDynamicState:       &dynamicState,
-		Layout:              program.pipelineLayout,
-		RenderPass:          renderer.mainRenderPass.renderPass,
-		PDepthStencilState:  &depthStencilState,
-	})
-	attachmentStates = append(attachmentStates, vk.PipelineColorBlendAttachmentState{
-		ColorWriteMask: vk.ColorComponentFlags(
-			vk.ColorComponentRBit | vk.ColorComponentGBit |
-				vk.ColorComponentBBit | vk.ColorComponentABit,
-		),
-		BlendEnable:         vk.True,
-		SrcColorBlendFactor: vk.BlendFactorSrcAlpha,
-		DstColorBlendFactor: vk.BlendFactorOneMinusSrcAlpha,
-		ColorBlendOp:        vk.BlendOpAdd,
-		SrcAlphaBlendFactor: vk.BlendFactorOne,
-		DstAlphaBlendFactor: vk.BlendFactorZero,
-		AlphaBlendOp:        vk.BlendOpAdd,
-	})
-	colorBlendStates = append(colorBlendStates, vk.PipelineColorBlendStateCreateInfo{
-		SType:           vk.StructureTypePipelineColorBlendStateCreateInfo,
-		LogicOpEnable:   vk.False,
-		LogicOp:         vk.LogicOpCopy,
-		AttachmentCount: 1,
-		PAttachments:    []vk.PipelineColorBlendAttachmentState{attachmentStates[1]},
-	})
-	pipelineCreateInfos = append(pipelineCreateInfos, vk.GraphicsPipelineCreateInfo{
-		SType:               vk.StructureTypeGraphicsPipelineCreateInfo,
-		StageCount:          2, // vert + frag
-		PStages:             shaderStages,
-		PVertexInputState:   &vertexInputState,
-		PInputAssemblyState: &inputAssemblyState,
-		PViewportState:      &viewportState,
-		PRasterizationState: &rasterState,
-		PMultisampleState:   &multisampleState,
-		PColorBlendState:    &colorBlendStates[1],
-		PDynamicState:       &dynamicState,
-		Layout:              program.pipelineLayout,
-		RenderPass:          renderer.mainRenderPass.renderPass,
-		PDepthStencilState:  &depthStencilState,
-	})
+	for i, blend := range blends {
+		attachmentStates[i] = vk.PipelineColorBlendAttachmentState{
+			ColorWriteMask: vk.ColorComponentFlags(
+				vk.ColorComponentRBit | vk.ColorComponentGBit |
+					vk.ColorComponentBBit | vk.ColorComponentABit,
+			),
+			BlendEnable:         vk.True,
+			SrcColorBlendFactor: blend.src,
+			DstColorBlendFactor: blend.dst,
+			ColorBlendOp:        blend.op,
+			SrcAlphaBlendFactor: vk.BlendFactorOne,
+			DstAlphaBlendFactor: vk.BlendFactorZero,
+			AlphaBlendOp:        vk.BlendOpAdd,
+		}
+		colorBlendStates[i] = vk.PipelineColorBlendStateCreateInfo{
+			SType:           vk.StructureTypePipelineColorBlendStateCreateInfo,
+			LogicOpEnable:   vk.False,
+			LogicOp:         vk.LogicOpCopy,
+			AttachmentCount: 1,
+			PAttachments:    []vk.PipelineColorBlendAttachmentState{attachmentStates[i]},
+		}
+		pipelineCreateInfos[i] = vk.GraphicsPipelineCreateInfo{
+			SType:               vk.StructureTypeGraphicsPipelineCreateInfo,
+			StageCount:          2, // vert + frag
+			PStages:             shaderStages,
+			PVertexInputState:   &vertexInputState,
+			PInputAssemblyState: &inputAssemblyState,
+			PViewportState:      &viewportState,
+			PRasterizationState: &rasterState,
+			PMultisampleState:   &multisampleState,
+			PColorBlendState:    &colorBlendStates[i],
+			PDynamicState:       &dynamicState,
+			Layout:              program.pipelineLayout,
+			RenderPass:          renderer.mainRenderPass[0].renderPass,
+			PDepthStencilState:  &depthStencilState,
+		}
+		if i > 0 {
+			pipelineIndexMap[blend.key] = i
+		}
+	}
 	pipelines := make([]vk.Pipeline, len(pipelineCreateInfos))
 	err = vk.Error(vk.CreateGraphicsPipelines(renderer.device,
 		renderer.pipelineCache, uint32(len(pipelineCreateInfos)), pipelineCreateInfos, nil, pipelines))
@@ -362,6 +359,7 @@ func (f *Font_VK) GenerateGlyphs(low, high rune) error {
 		DPI:     72,
 		Hinting: font.HintingFull,
 	})
+	f.metrics = ttfFace.Metrics()
 
 	// Add padding to prevent cropping
 	// https://github.com/ikemen-engine/Ikemen-GO/issues/3085
@@ -401,9 +399,8 @@ func (f *Font_VK) GenerateGlyphs(low, high rune) error {
 			}
 		}
 
-		//The glyph's ascent and descent equal -bounds.Min.Y and +bounds.Max.Y.
+		// Distance from the glyph's top to its baseline.
 		gAscent := int(-gBnd.Min.Y) >> 6
-		gdescent := int(gBnd.Max.Y) >> 6
 
 		//set w,h and adv, bearing V and bearing H in char
 		//char.width = int(gw)
@@ -413,7 +410,8 @@ func (f *Font_VK) GenerateGlyphs(low, high rune) error {
 		char.width = (paddedWidth + 3) &^ 3 // Force 4-byte alignment
 		char.height = int(gh) + (padding * 2)
 		char.advance = int(gAdv)
-		char.bearingV = gdescent
+		// Account for the raster baseline at padding + gAscent inside the texture.
+		char.bearingV = char.height - (padding + gAscent)
 		//char.bearingH = (int(gBnd.Min.X) >> 6)
 		char.bearingH = (int(gBnd.Min.X) >> 6) - padding
 
@@ -466,30 +464,7 @@ func (f *Font_VK) GenerateGlyphs(low, high rune) error {
 		for uv, ok = f.textures[textureIndex].AddImage(int32(rgba.Rect.Dx()), int32(rgba.Rect.Dy()), stride, pix); !ok; uv, ok = f.textures[textureIndex].AddImage(int32(rgba.Rect.Dx()), int32(rgba.Rect.Dy()), stride, pix) {
 			textureIndex += 1
 			if textureIndex >= len(f.textures) {
-				f.textures = append(f.textures, CreateTextureAtlas(256, 256, 8, true))
-				descriptorSet := gfxFont.(*FontRenderer_VK).freeDescriptors.Front()
-				gfxFont.(*FontRenderer_VK).freeDescriptors.Remove(descriptorSet)
-				f.descriptors = append(f.descriptors, descriptorSet)
-				imageInfo := []vk.DescriptorImageInfo{
-					{
-						ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
-						ImageView:   f.textures[textureIndex].texture.(*Texture_VK).imageView,
-						Sampler:     gfx.(*Renderer_VK).spriteSamplers[1],
-					},
-				}
-
-				descriptorWrites := []vk.WriteDescriptorSet{
-					{
-						SType:           vk.StructureTypeWriteDescriptorSet,
-						DstSet:          descriptorSet.Value.(vk.DescriptorSet), //
-						DstBinding:      0,
-						DstArrayElement: 0,
-						DescriptorCount: 1,
-						DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
-						PImageInfo:      imageInfo,
-					},
-				}
-				vk.UpdateDescriptorSets(gfxFont.(*FontRenderer_VK).device, uint32(len(descriptorWrites)), descriptorWrites, 0, nil)
+				f.addAtlas()
 			}
 		}
 
@@ -507,12 +482,74 @@ func (f *Font_VK) GenerateGlyphs(low, high rune) error {
 
 		char.uv = uv
 		char.textureID = uint32(textureIndex)
+		char.texture = gfx.newSubTexture(f.textures[textureIndex].texture, int32(char.width), int32(char.height), char.uv)
 
 		//add char to fontChar list
 		f.fontChar[ch] = char
 	}
 
 	return nil
+}
+
+// Adds a glyph atlas page with its descriptor set
+func (f *Font_VK) addAtlas() {
+	r := gfxFont.(*FontRenderer_VK)
+	atlas := CreateTextureAtlas(sys.cfg.Video.FontTextureAtlasSize, sys.cfg.Video.FontTextureAtlasSize, 8, true)
+	atlas.texture.MarkNonSwappable()
+	f.textures = append(f.textures, atlas)
+	descriptorSet := r.freeDescriptors.Front()
+	r.freeDescriptors.Remove(descriptorSet)
+	f.descriptors = append(f.descriptors, descriptorSet)
+	imageInfo := []vk.DescriptorImageInfo{
+		{
+			ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
+			ImageView:   atlas.texture.(*Texture_VK).imageView,
+			Sampler:     gfx.(*Renderer_VK).spriteSamplers[1],
+		},
+	}
+
+	descriptorWrites := []vk.WriteDescriptorSet{
+		{
+			SType:           vk.StructureTypeWriteDescriptorSet,
+			DstSet:          descriptorSet.Value.(vk.DescriptorSet), //
+			DstBinding:      0,
+			DstArrayElement: 0,
+			DescriptorCount: 1,
+			DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+			PImageInfo:      imageInfo,
+		},
+	}
+	vk.UpdateDescriptorSets(r.device, uint32(len(descriptorWrites)), descriptorWrites, 0, nil)
+}
+
+// Returns the glyphs for text drawn at yscl. The DEF size uses f itself.
+func (f *Font_VK) rasterFont(yscl float32) *Font_VK {
+	size := ttfRasterSize(f.scale, yscl)
+	if size == f.scale {
+		return f
+	}
+	size = ttfPickRasterSize(f.rasterFonts, size)
+	if rf, ok := f.rasterFonts[size]; ok {
+		return rf
+	}
+	if f.rasterFonts == nil {
+		f.rasterFonts = make(map[int32]*Font_VK)
+	}
+	// Holds glyphs only, drawing settings stay on f
+	rf := &Font_VK{
+		fontChar: make(map[rune]*character),
+		ttf:      f.ttf,
+		scale:    size,
+	}
+	rf.addAtlas()
+	runtime.SetFinalizer(rf, func(rf *Font_VK) {
+		r := gfxFont.(*FontRenderer_VK)
+		for i := range rf.descriptors {
+			r.freeDescriptors.PushBack(rf.descriptors[i].Value)
+		}
+	})
+	f.rasterFonts[size] = rf
+	return rf
 }
 
 func (r *FontRenderer_VK) LoadTrueTypeFont(reader io.Reader, scale int32, low, high rune, dir Direction) (Font, error) {
@@ -537,36 +574,23 @@ func (r *FontRenderer_VK) LoadTrueTypeFont(reader io.Reader, scale int32, low, h
 	f.scale = scale
 	f.SetColor(1.0, 1.0, 1.0, 1.0) //set default white
 	f.SetPalFX(NewShaderPalFX())
-	f.textures = append(f.textures, CreateTextureAtlas(256, 256, 8, true))
-	descriptorSet := r.freeDescriptors.Front()
-	r.freeDescriptors.Remove(descriptorSet)
-	f.descriptors = append(f.descriptors, descriptorSet)
-	imageInfo := []vk.DescriptorImageInfo{
-		{
-			ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
-			ImageView:   f.textures[0].texture.(*Texture_VK).imageView,
-			Sampler:     gfx.(*Renderer_VK).spriteSamplers[1],
-		},
-	}
-
-	descriptorWrites := []vk.WriteDescriptorSet{
-		{
-			SType:           vk.StructureTypeWriteDescriptorSet,
-			DstSet:          descriptorSet.Value.(vk.DescriptorSet), //
-			DstBinding:      0,
-			DstArrayElement: 0,
-			DescriptorCount: 1,
-			DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
-			PImageInfo:      imageInfo,
-		},
-	}
-	vk.UpdateDescriptorSets(r.device, uint32(len(descriptorWrites)), descriptorWrites, 0, nil)
+	f.addAtlas()
 	err = f.GenerateGlyphs(low, high)
 	if err != nil {
 		return nil, err
 	}
 	return f, nil
 }
+
+// HasRune reports whether the font has a glyph for r (font.go ttfRuneFont).
+func (f *Font_VK) HasRune(r rune) bool {
+	return f.ttf != nil && f.ttf.Index(r) != 0
+}
+
+func (f *Font_VK) Metrics() font.Metrics {
+	return f.metrics
+}
+
 func (f *Font_VK) SetColor(red float32, green float32, blue float32, alpha float32) {
 	f.color.r = red
 	f.color.g = green
@@ -575,8 +599,17 @@ func (f *Font_VK) SetColor(red float32, green float32, blue float32, alpha float
 	return
 }
 
+// SetBlending sets how Printf blends the text when blending is on.
+func (f *Font_VK) SetBlending(eq BlendEquation, src, dst BlendFunc) {
+	f.blendEq, f.blendSrc, f.blendDst = eq, src, dst
+}
+
 func (f *Font_VK) SetPalFX(state ShaderPalFX) {
 	f.shaderPalFX = state
+}
+
+func (f *Font_VK) SetCustomShader(shader CustomShaderRenderData) {
+	f.customShader = shader
 }
 
 func (f *Font_VK) UpdateResolution(windowWidth int, windowHeight int) {
@@ -588,6 +621,16 @@ func (f *Font_VK) UpdateResolution(windowWidth int, windowHeight int) {
 func (f *Font_VK) Printf(x, y float32, xscl, yscl float32, spacingXAdd float32, align int32, blend bool, window [4]int32,
 	rxadd float32, rot Rotation, projectionMode int32, fLength float32, rcx, rcy float32,
 	fs string, argv ...interface{}) error {
+	if f.customShader.name != "" {
+		r := gfx.(*Renderer_VK)
+		if id, ok := r.customShaderMap[f.customShader.name]; ok {
+			if _, ok := r.customPrograms[id]; ok {
+				return f.printfCustom(x, y, xscl, yscl, spacingXAdd, align, blend, window,
+					rxadd, rot, projectionMode, fLength, rcx, rcy, fs, argv...)
+			}
+		}
+	}
+
 	r := gfx.(*Renderer_VK)
 	switchedProgram := r.VKState.boundProgram != gfxFont.(*FontRenderer_VK).program
 	r.VKState.boundProgram = gfxFont.(*FontRenderer_VK).program
@@ -605,7 +648,7 @@ func (f *Font_VK) Printf(x, y float32, xscl, yscl float32, spacingXAdd float32, 
 	//setup blending mode
 	pipelineIndex := 0
 	if blend {
-		pipelineIndex = 1
+		pipelineIndex = gfxFont.(*FontRenderer_VK).program.pipelineIndexMap[VulkanBlendState{op: f.blendEq, src: f.blendSrc, dst: f.blendDst}]
 	}
 	pipeline := gfxFont.(*FontRenderer_VK).program.pipelines[pipelineIndex]
 	if switchedProgram || pipeline != r.VKState.currentPipeline {
@@ -620,14 +663,8 @@ func (f *Font_VK) Printf(x, y float32, xscl, yscl float32, spacingXAdd float32, 
 		vk.CmdBindVertexBuffers(r.commandBuffers[0], 0, 1, []vk.Buffer{r.vertexBuffers[bufferIndex].buffer}, []vk.DeviceSize{0})
 	}
 	//restrict drawing to a certain part of the window
-	viewports := []vk.Viewport{{
-		MinDepth: 0.0,
-		MaxDepth: 1.0,
-		X:        0,
-		Y:        0,
-		Width:    float32(sys.scrrect[2]),
-		Height:   float32(sys.scrrect[3]),
-	}}
+	viewport := sys.currentDrawViewport()
+	window = sys.viewportScissor(window)
 	scissors := []vk.Rect2D{{
 		Offset: vk.Offset2D{
 			X: int32(Max(int(window[0]), 0)),
@@ -639,7 +676,7 @@ func (f *Font_VK) Printf(x, y float32, xscl, yscl float32, spacingXAdd float32, 
 			Height: uint32(window[3]),
 		},
 	}}
-	vk.CmdSetViewport(r.commandBuffers[0], 0, 1, viewports)
+	r.SetViewport(viewport[0], viewport[1], viewport[2], viewport[3])
 	vk.CmdSetScissor(r.commandBuffers[0], 0, 1, scissors)
 	color := f.color
 	palAddGray := [4]float32{f.shaderPalFX.add[0], f.shaderPalFX.add[1], f.shaderPalFX.add[2], f.shaderPalFX.gray}
@@ -651,14 +688,23 @@ func (f *Font_VK) Printf(x, y float32, xscl, yscl float32, spacingXAdd float32, 
 	vk.CmdPushConstants(r.commandBuffers[0], gfxFont.(*FontRenderer_VK).program.pipelineLayout, vk.ShaderStageFlags(vk.ShaderStageFragmentBit), 8*4, 4*4, unsafe.Pointer(&palMulHue[0]))
 	vk.CmdPushConstants(r.commandBuffers[0], gfxFont.(*FontRenderer_VK).program.pipelineLayout, vk.ShaderStageFlags(vk.ShaderStageFragmentBit), 12*4, 4*4, unsafe.Pointer(&palNegPad[0]))
 	vk.CmdPushConstants(r.commandBuffers[0], gfxFont.(*FontRenderer_VK).program.pipelineLayout, vk.ShaderStageFlags(vk.ShaderStageVertexBit), 16*4, 4*2, unsafe.Pointer(&resolution[0]))
+	// Use glyphs made at the on-screen size, k scales them back to font units
+	rscl := yscl
+	if rscl == 0 {
+		rscl = xscl
+	}
+	gs := f.rasterFont(rscl)
+	k := float32(f.scale) / float32(gs.scale)
+	gxscl, gyscl := xscl*k, yscl*k
+
 	alignScale := xscl
 	if alignScale == 0 {
 		alignScale = yscl
 	}
 	if align == 0 {
-		x -= f.widthRunes(indices, alignScale, spacingXAdd) * 0.5
+		x -= gs.widthRunes(indices, alignScale*k, spacingXAdd*alignScale) * 0.5
 	} else if align < 0 {
-		x -= f.widthRunes(indices, alignScale, spacingXAdd)
+		x -= gs.widthRunes(indices, alignScale*k, spacingXAdd*alignScale)
 	}
 	needsTransform := rxadd != 0 || !rot.IsZero()
 	spacing := spacingXAdd * xscl
@@ -676,13 +722,13 @@ func (f *Font_VK) Printf(x, y float32, xscl, yscl float32, spacingXAdd float32, 
 		runeIndex := indices[i]
 
 		//find rune in fontChar list
-		ch, ok := f.fontChar[runeIndex]
+		ch, ok := gs.fontChar[runeIndex]
 
 		//load missing runes in batches of 32
 		if !ok {
 			low := runeIndex - (runeIndex % 32)
-			f.GenerateGlyphs(low, low+31)
-			ch, ok = f.fontChar[runeIndex]
+			gs.GenerateGlyphs(low, low+31)
+			ch, ok = gs.fontChar[runeIndex]
 		}
 
 		//skip runes that are not in font character range
@@ -698,7 +744,7 @@ func (f *Font_VK) Printf(x, y float32, xscl, yscl float32, spacingXAdd float32, 
 				numVerticesToDraw = 0
 			}
 			descriptorSetIndex = int(ch.textureID)
-			descriptorSet := f.descriptors[descriptorSetIndex]
+			descriptorSet := gs.descriptors[descriptorSetIndex]
 			vk.CmdBindDescriptorSets(r.commandBuffers[0], vk.PipelineBindPointGraphics, gfxFont.(*FontRenderer_VK).program.pipelineLayout, 0, 1, []vk.DescriptorSet{descriptorSet.Value.(vk.DescriptorSet)}, 0, nil)
 		}
 
@@ -707,10 +753,10 @@ func (f *Font_VK) Printf(x, y float32, xscl, yscl float32, spacingXAdd float32, 
 		}
 
 		//calculate position and size for current rune
-		xpos := x + float32(ch.bearingH)*xscl
-		ypos := y - float32(ch.height-ch.bearingV)*yscl
-		w := float32(ch.width) * xscl
-		h := float32(ch.height) * yscl
+		xpos := x + float32(ch.bearingH)*gxscl
+		ypos := y - float32(ch.height-ch.bearingV)*gyscl
+		w := float32(ch.width) * gxscl
+		h := float32(ch.height) * gyscl
 
 		x1, y1 := xpos+w, ypos
 		x2, y2 := xpos, ypos
@@ -736,7 +782,7 @@ func (f *Font_VK) Printf(x, y float32, xscl, yscl float32, spacingXAdd float32, 
 		numVerticesToDraw += 6
 
 		// Now advance cursors for next glyph (note that advance is number of 1/64 pixels)
-		x += float32((ch.advance >> 6)) * xscl // Bitshift by 6 to get value in pixels (2^6 = 64 (divide amount of 1/64th pixels by 64 to get amount of pixels))
+		x += float32((ch.advance >> 6)) * gxscl // Bitshift by 6 to get value in pixels (2^6 = 64 (divide amount of 1/64th pixels by 64 to get amount of pixels))
 		renderedAny = true
 
 		if len(vertexData) >= batchSize {
@@ -758,12 +804,149 @@ func (f *Font_VK) Printf(x, y float32, xscl, yscl float32, spacingXAdd float32, 
 	return nil
 }
 
-func (f *Font_VK) widthRunes(indices []rune, scale float32, spacingXAdd float32) float32 {
+// printfCustom draws text through the sprite pipeline using a custom shader, instead of the font pipeline
+func (f *Font_VK) printfCustom(x, y float32, xscl, yscl float32, spacingXAdd float32, align int32,
+	blend bool, window [4]int32, rxadd float32, rot Rotation, projectionMode int32, fLength float32,
+	rcx, rcy float32, fs string, argv ...interface{}) error {
+
+	text := fmt.Sprintf(fs, argv...)
+	indices := []rune(text)
+	if len(indices) == 0 {
+		return nil
+	}
+
+	// Palette that turns the atlas coverage (index 0-255) into white with that alpha
+	fr := gfxFont.(*FontRenderer_VK)
+	if fr.coveragePalTex == nil {
+		pal := make([]uint32, 256)
+		for i := range pal {
+			pal[i] = 0x00FFFFFF | uint32(i)<<24
+		}
+		fr.coveragePalTex = NewTextureFromPalette(pal)
+	}
+
+	// Must come before anything that depends on the current program (e.g. the param push constants)
+	gfx.SetSpritePipeline(f.customShader.name)
+
+	if blend {
+		gfx.EnableBlending(f.blendEq, f.blendSrc, f.blendDst)
+	} else {
+		gfx.DisableBlending()
+	}
+	gfx.EnableScissor(window[0], window[1], window[2], window[3])
+
+	// Same projection as the GL branch: origin at the top, Y going down
+	resW, resH := float32(f.resolution[0]), float32(f.resolution[1])
+	proj := gfx.OrthographicProjectionMatrix(0, resW, resH, 0, -1, 1)
+	identity := [16]float32{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}
+	gfx.SetUniformMatrix("projection", proj[:])
+	gfx.SetUniformMatrix("modelview", identity[:])
+	gfx.SetUniformF("x1x2x4x3", 0, 0, 0, 0)
+
+	gfx.SetUniformI("isFlat", 0)
+	gfx.SetUniformI("isRgba", 0) // Atlas is 8-bit: go through the palette path
+	gfx.SetTexture("pal", fr.coveragePalTex)
+	gfx.SetUniformI("mask", 0)
+	gfx.SetUniformI("isTrapez", 0)
+	gfx.SetUniformI("neg", int(Btoi(f.shaderPalFX.neg)))
+	gfx.SetUniformF("alpha", f.color.a)
+	gfx.SetUniformFv("add", f.shaderPalFX.add[:])
+	mult := [3]float32{
+		f.shaderPalFX.mult[0] * f.color.r,
+		f.shaderPalFX.mult[1] * f.color.g,
+		f.shaderPalFX.mult[2] * f.color.b,
+	}
+	gfx.SetUniformFv("mult", mult[:])
+	gfx.SetUniformF("gray", f.shaderPalFX.gray)
+	gfx.SetUniformF("hue", f.shaderPalFX.hue)
+	gfx.SetUniformFv("tint", []float32{0, 0, 0, 0})
+	if f.customShader.tex1 != nil {
+		gfx.SetTexture("tex1", f.customShader.tex1)
+	}
+	if f.customShader.tex2 != nil {
+		gfx.SetTexture("tex2", f.customShader.tex2)
+	}
+	f.customShader.setUniforms()
+
+	// Use glyphs made at the on-screen size, k scales them back to font units
+	rscl := yscl
+	if rscl == 0 {
+		rscl = xscl
+	}
+	gs := f.rasterFont(rscl)
+	k := float32(f.scale) / float32(gs.scale)
+	gxscl, gyscl := xscl*k, yscl*k
+
+	alignScale := xscl
+	if alignScale == 0 {
+		alignScale = yscl
+	}
+	if align == 0 {
+		x -= gs.widthRunes(indices, alignScale*k, spacingXAdd*alignScale) * 0.5
+	} else if align < 0 {
+		x -= gs.widthRunes(indices, alignScale*k, spacingXAdd*alignScale)
+	}
+	needsTransform := rxadd != 0 || !rot.IsZero()
+	spacing := spacingXAdd * xscl
+	renderedAny := false
+
+	for _, runeIndex := range indices {
+		ch, ok := gs.fontChar[runeIndex]
+		if !ok {
+			low := runeIndex - (runeIndex % 32)
+			gs.GenerateGlyphs(low, low+31)
+			ch, ok = gs.fontChar[runeIndex]
+		}
+		if !ok {
+			continue
+		}
+
+		if renderedAny {
+			x += spacing
+		}
+
+		xpos := x + float32(ch.bearingH)*gxscl
+		ypos := y - float32(ch.height-ch.bearingV)*gyscl
+		gw := float32(ch.width) * gxscl
+		gh := float32(ch.height) * gyscl
+
+		x1, y1 := xpos+gw, ypos
+		x2, y2 := xpos, ypos
+		x3, y3 := xpos, ypos+gh
+		x4, y4 := xpos+gw, ypos+gh
+		if needsTransform {
+			x1, y1, x2, y2, x3, y3, x4, y4 = transformTextQuad(
+				x1, y1, x2, y2, x3, y3, x4, y4,
+				rxadd, rot, projectionMode, fLength, rcx, rcy,
+			)
+		}
+
+		gfx.SetTexture("tex", ch.texture)
+
+		// Triangle strip: top-left, top-right, bottom-left, bottom-right
+		verts := [16]float32{
+			x2, y2, ch.uv[0], ch.uv[1],
+			x1, y1, ch.uv[2], ch.uv[1],
+			x3, y3, ch.uv[0], ch.uv[3],
+			x4, y4, ch.uv[2], ch.uv[3],
+		}
+		gfx.SetVertexData(verts[:]...)
+		gfx.RenderQuad()
+
+		x += float32(ch.advance>>6) * gxscl
+		renderedAny = true
+	}
+
+	gfx.DisableScissor()
+	return nil
+}
+
+// Text width, with spacing added between glyphs
+func (f *Font_VK) widthRunes(indices []rune, scale float32, spacing float32) float32 {
 	if len(indices) == 0 {
 		return 0
 	}
 
-	spacing := spacingXAdd * scale
 	var width float32
 	renderedAny := false
 
@@ -800,6 +983,11 @@ func (f *Font_VK) widthRunes(indices []rune, scale float32, spacingXAdd float32)
 
 	return width
 }
-func (f *Font_VK) Width(scale float32, spacingXAdd float32, fs string, argv ...interface{}) float32 {
-	return f.widthRunes([]rune(fmt.Sprintf(fs, argv...)), scale, spacingXAdd)
+func (f *Font_VK) Width(rscl, scale float32, spacingXAdd float32, fs string, argv ...interface{}) float32 {
+	gs := f
+	if rscl != 0 {
+		gs = f.rasterFont(rscl)
+	}
+	k := float32(f.scale) / float32(gs.scale)
+	return gs.widthRunes([]rune(fmt.Sprintf(fs, argv...)), scale*k, spacingXAdd*scale)
 }

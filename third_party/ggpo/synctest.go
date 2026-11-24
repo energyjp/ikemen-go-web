@@ -123,6 +123,10 @@ func (s *SyncTest) SyncInput(discconectFlags *int) ([][]byte, error) {
 	return values, nil
 }
 
+func (s *SyncTest) SyncInputConfirmed(disconnectFlags *int) ([][]byte, error) {
+	return s.SyncInput(disconnectFlags)
+}
+
 func (s *SyncTest) AdvanceFrame(checksum uint32) error {
 	s.sync.AdvanceFrame()
 	s.currentInput.Erase()

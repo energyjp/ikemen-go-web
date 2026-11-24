@@ -6,6 +6,7 @@ import (
 	"hash/crc32"
 	"log"
 	"math"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -16,31 +17,43 @@ import (
 type RollbackSystem struct {
 	session          *RollbackSession
 	netConnection    *NetConnection
-	ggpoInputs       []InputBits
-	ggpoAnalogInputs [][6]int8
+	ggpoInputs       []VirtualFrame
+	inputSubmitted bool
+	advanced       bool
+	menuUpdating   bool
 }
 
 type RollbackProperties struct {
+	Port                  int  `ini:"Port"`
 	FrameDelay            int  `ini:"FrameDelay" sync:"host"`
 	DisconnectNotifyStart int  `ini:"DisconnectNotifyStart" sync:"host"`
 	DisconnectTimeout     int  `ini:"DisconnectTimeout" sync:"host"`
-	LogsEnabled           bool `ini:"LogsEnabled" sync:"host"`
+	StateLogsEnabled      bool `ini:"StateLogsEnabled" sync:"host"`
+	GgpoLogsEnabled       bool `ini:"GgpoLogsEnabled" sync:"host"`
 	SaveStageData         bool `ini:"SaveStageData" sync:"host"`
 	DesyncTest            bool `ini:"DesyncTest" sync:"host"`
 	DesyncTestFrames      int  `ini:"DesyncTestFrames" sync:"host"`
 	DesyncTestAI          bool `ini:"DesyncTestAI" sync:"host"`
 }
 
+const netMenuDelay = ggpo.MaxPredictionFrames + 1
+
 // TODO: Merge with system.go
 func (rs *RollbackSystem) hijackRunMatch() bool {
 	// Shared part up until this point already handled by sys.runMatch()
 
 	// Reset variables
-	rs.ggpoInputs = make([]InputBits, 2)
-	rs.ggpoAnalogInputs = make([][6]int8, 2)
+	rs.ggpoInputs = make([]VirtualFrame, 2)
+	rs.inputSubmitted = false
 
 	// Initialize rollback network session and synchronize state
-	rs.preMatchSetup()
+	if err := rs.preMatchSetup(); err != nil {
+		rs.session.Close()
+		sys.netConnection.fail(err)
+		return false
+	}
+	// Zero (no deadline) in the browser build: see platformNetDeadlines.
+	syncDeadline := netDeadline(sys.cfg.Netplay.SyncTimeout)
 
 	var running bool
 
@@ -52,6 +65,21 @@ func (rs *RollbackSystem) hijackRunMatch() bool {
 			int(math.Max(0, float64(rs.session.next-rs.session.now-1))))
 		if err != nil {
 			panic(err)
+		}
+		// The browser page dropped this match because the other player left
+		// the lobby or was kicked (platformMatchGone). End it at once, the way
+		// GGPO's disconnect does, but also in the post-match, where OnEvent
+		// ignores a disconnect, and without the warning box: the page shows
+		// its own notice.
+		if rs.netConnection != nil && platformMatchGone() {
+			rs.session.matchGone()
+			break
+		}
+		// GGPO's disconnect timeout only runs after initial synchronization.
+		if rs.netConnection != nil && !rs.session.synchronized && !syncDeadline.IsZero() && time.Now().After(syncDeadline) {
+			rs.netConnection.fail(fmt.Errorf("Timed out establishing rollback connection to %s (local UDP port %d).\nCheck UDP forwarding and firewall settings on both peers.",
+				net.JoinHostPort(rs.session.remoteIp, fmt.Sprint(rs.netConnection.rollbackRemotePort)), rs.netConnection.rollbackLocalPort))
+			break
 		}
 
 		// Desync/disconnect callbacks may request a session abort outside the normal input path.
@@ -71,8 +99,19 @@ func (rs *RollbackSystem) hijackRunMatch() bool {
 		if sys.esc || !running {
 			break
 		}
+		if !rs.advanced {
+			// Keep the last rendered frame while pumping input and network events.
+			sys.frameSkip = true
+			running = sys.await(sys.gameRenderSpeed(), true)
+			sys.frameSkip = false
+			if !running {
+				break
+			}
+			continue
+		}
 
 		// These are outside runFrame(), so they won't be needlessly executed during a rollback
+		sys.startNextMatchPreload()
 		sys.tickSound()
 		sys.cueDraw()
 		sys.renderFrame()
@@ -90,29 +129,70 @@ func (rs *RollbackSystem) hijackRunMatch() bool {
 	return false
 }
 
-func (rs *RollbackSystem) preMatchSetup() {
+// rollbackPeer sets session.remoteIp and returns the UDP ports for
+// InitP1/InitP2. A platform override comes first: the browser's WebRTC stream
+// has no IP address (a *net.TCPAddr assertion on it would panic), and its peer
+// address and ports are fixed values the transport stamps, which a stream
+// address must not overwrite (fork carry 13; netplay_js.go). Otherwise this is
+// upstream's TCP path, unchanged.
+func (rs *RollbackSystem) rollbackPeer() (localPort, remotePort int, err error) {
+	if remoteIp, lp, rp, ok := platformRollbackPeer(sys.netConnection.host); ok {
+		rs.session.remoteIp = remoteIp
+		log.Printf("Rollback startup: peer=%s; local port %d, remote port %d (platform transport)", remoteIp, lp, rp)
+		return lp, rp, nil
+	}
+
+	// Use the actual TCP peer address (also resolves client-side hostnames).
+	remoteIP := sys.netConnection.conn.RemoteAddr().(*net.TCPAddr).IP
+	localIP := sys.netConnection.conn.LocalAddr().(*net.TCPAddr).IP
+	if remoteIP.To4() == nil {
+		return 0, 0, Error("Rollback currently requires an IPv4 peer address")
+	}
+
+	localPort = sys.netConnection.rollbackLocalPort
+	remotePort = sys.netConnection.rollbackRemotePort
+
+	if localPort < 1 || localPort > 65535 || remotePort < 1 || remotePort > 65535 {
+		return 0, 0, Error("Rollback UDP ports were not negotiated")
+	}
+
+	// A local/proxy peer needs different UDP ports or packets loop back into our own rollback socket.
+	if (remoteIP.IsLoopback() || remoteIP.Equal(localIP)) && localPort == remotePort {
+		return 0, 0, fmt.Errorf("Cannot use UDP port %d for both rollback players on the same machine.\nUse 127.0.0.1 for automatic guest port selection, or configure different Rollback.Port values.", localPort)
+	}
+
+	rs.session.remoteIp = remoteIP.String()
+	log.Printf("Rollback startup: TCP local=%s peer=%s; UDP local=0.0.0.0:%d peer=%s",
+		sys.netConnection.conn.LocalAddr(), sys.netConnection.conn.RemoteAddr(), localPort,
+		net.JoinHostPort(rs.session.remoteIp, fmt.Sprint(remotePort)))
+	return localPort, remotePort, nil
+}
+
+func (rs *RollbackSystem) preMatchSetup() error {
 	if rs.session != nil && sys.netConnection != nil {
+		if !sys.netConnection.IsConnected() || sys.netConnection.isClosing() || sys.esc || sys.gameEnd {
+			return Error("Rollback connection was closed before startup")
+		}
+		localPort, remotePort, err := rs.rollbackPeer()
+		if err != nil {
+			return err
+		}
 		if rs.session.host != "" {
 			// Initialize client as P2
-			rs.session.InitP2(2, 7550, 7600, rs.session.host)
+			err = rs.session.InitP2(2, localPort, remotePort, rs.session.remoteIp)
 			rs.session.playerNo = 2
 		} else {
 			// Initialize host as P1
-			rs.session.InitP1(2, 7600, 7550, rs.session.remoteIp)
+			err = rs.session.InitP1(2, localPort, remotePort, rs.session.remoteIp)
 			rs.session.playerNo = 1
+		}
+		if err != nil {
+			return fmt.Errorf("Cannot start rollback on UDP port %d: %w", localPort, err)
 		}
 
 		// Synchronize matchTime at match start
 		sys.matchTime = rs.session.netTime //s.time = rs.session.netTime // Old typo?
 		sys.preMatchTime = sys.netConnection.preMatchTime
-
-		// Wait until both peers have fully synchronized?
-		//if !rs.session.IsConnected() {
-		//	for !rs.session.synchronized {
-		//		rs.session.backend.Idle(0)
-		//	}
-		//}
-		//sys.netConnection.Close()
 
 		// Borrow netConnection replay recording
 		rs.session.recording = sys.netConnection.recording
@@ -124,7 +204,10 @@ func (rs *RollbackSystem) preMatchSetup() {
 	} else if rs.session != nil && rs.session.spectating {
 		// A watcher: a spectator session fed by the host (watch.go). Its
 		// clock and seed came with the host's start message.
-		rs.session.InitWatch()
+		if err := rs.session.InitWatch(); err != nil {
+			sys.watch.running = false
+			return fmt.Errorf("Cannot start watching: %w", err)
+		}
 		sys.matchTime = rs.session.netTime
 	} else if sys.netConnection == nil && rs.session == nil {
 		// If offline, initialize a local rollback sync test session
@@ -135,6 +218,7 @@ func (rs *RollbackSystem) preMatchSetup() {
 
 	// Reset rollback session timer
 	rs.session.netTime = 0
+	return nil
 }
 
 func (rs *RollbackSystem) postMatchSetup() {
@@ -173,10 +257,17 @@ func (rs *RollbackSystem) postMatchSetup() {
 func (rs *RollbackSystem) runFrame() bool {
 	var buffer []byte
 	var ggpoerr error
+	rs.advanced = false
 
 	if sys.esc {
+		if rs.session.spectating && sys.watch.escKey {
+			sys.watch.leaveLocal()
+		}
 		return false
 	}
+	// A collection a round transition or match load asked for (browser build).
+	platformPendingGC()
+
 	if rs.session.spectating {
 		return rs.runWatchFrame()
 	}
@@ -190,7 +281,7 @@ func (rs *RollbackSystem) runFrame() bool {
 		}
 	}
 
-	if rs.session.syncTest && rs.session.netTime == 0 {
+	if !rs.inputSubmitted && rs.session.syncTest && rs.session.netTime == 0 {
 		if rs.session.config.DesyncTestAI {
 			buffer = getAIInputs(0)
 			ggpoerr = rs.session.backend.AddLocalInput(ggpo.PlayerHandle(0), buffer, len(buffer))
@@ -202,19 +293,25 @@ func (rs *RollbackSystem) runFrame() bool {
 			buffer = rs.getInputs(1)
 			ggpoerr = rs.session.backend.AddLocalInput(ggpo.PlayerHandle(1), buffer, len(buffer))
 		}
-	} else {
+	} else if !rs.inputSubmitted {
 		buffer = rs.getInputs(0)
 		ggpoerr = rs.session.backend.AddLocalInput(rs.session.currentPlayerHandle, buffer, len(buffer))
 	}
 
 	if ggpoerr == nil {
-		// Get speculative inputs for the local player for this frame
+		rs.inputSubmitted = true
+		// Interactive motif screens wait for both players; gameplay may predict.
 		var values [][]byte
 		disconnectFlags := 0
-		values, ggpoerr = rs.session.backend.SyncInput(&disconnectFlags)
+		if sys.motif.me.active || sys.motifOverlayActive() || sys.postMatchFlg {
+			values, ggpoerr = rs.session.backend.SyncInputConfirmed(&disconnectFlags)
+		} else {
+			values, ggpoerr = rs.session.backend.SyncInput(&disconnectFlags)
+		}
 
 		if ggpoerr == nil {
-			rs.ggpoInputs, rs.ggpoAnalogInputs = decodeInputs(values)
+			rs.advanced = true
+			rs.ggpoInputs = decodeInputs(values)
 			if len(rs.session.watchers) > 0 {
 				if p, ok := rs.session.backend.(*ggpo.Peer); ok {
 					rs.session.watchRecord(p.CurrentFrame(), values)
@@ -224,7 +321,7 @@ func (rs *RollbackSystem) runFrame() bool {
 			// Record inputs against the rollback timeline. netTime is part of the saved state,
 			// so any confirmed re-simulation overwrites earlier speculative data for the same frame.
 			if rs.session.recording != nil {
-				rs.session.RecordReplayFrame(rs.session.netTime, rs.ggpoInputs, rs.ggpoAnalogInputs)
+				rs.session.RecordReplayFrame(rs.session.netTime, rs.ggpoInputs)
 				rs.session.netTime++
 			}
 
@@ -242,6 +339,7 @@ func (rs *RollbackSystem) runFrame() bool {
 			}()
 
 			err := rs.session.backend.AdvanceFrame(rs.session.LiveChecksum())
+			rs.inputSubmitted = false
 			if err != nil {
 				panic(err)
 			}
@@ -251,6 +349,11 @@ func (rs *RollbackSystem) runFrame() bool {
 		}
 	}
 
+	if ggpoerr != nil {
+		if err, ok := ggpoerr.(ggpo.Error); !ok || err.Code != ggpo.ErrorCodeNotSynchronized && err.Code != ggpo.ErrorCodePredictionThreshod {
+			panic(ggpoerr)
+		}
+	}
 	return true
 }
 
@@ -269,6 +372,15 @@ func (rs *RollbackSystem) simulateFrame() bool {
 
 	// Update motif state
 	sys.uiAction()
+	if sys.motif.me.active && !rs.session.inRollback {
+		rs.menuUpdating = true
+		state := sys.captureAspectState()
+		if sys.motif.shouldScopeMotifAspect() {
+			state = sys.motifAspectState()
+		}
+		sys.withAspectState(state, func() { sys.motif.me.runLua(&sys.motif) })
+		rs.menuUpdating = false
+	}
 
 	// if rs.handleFlags() {
 	//	return true
@@ -309,27 +421,9 @@ func (rs *RollbackSystem) updateEvents() bool {
 	return true
 }
 
+// AI players read their own inputs locally, so they send an idle controller.
 func getAIInputs(player int) []byte {
-	var ib InputBits
-	ib.SetInputAI(player)
-	return append(encodeInputs(ib), make([]byte, 6)...)
-}
-
-func (ib *InputBits) SetInputAI(in int) {
-	*ib = InputBits(Btoi(sys.aiInput[in].U()) |
-		Btoi(sys.aiInput[in].D())<<1 |
-		Btoi(sys.aiInput[in].L())<<2 |
-		Btoi(sys.aiInput[in].R())<<3 |
-		Btoi(sys.aiInput[in].a())<<4 |
-		Btoi(sys.aiInput[in].b())<<5 |
-		Btoi(sys.aiInput[in].c())<<6 |
-		Btoi(sys.aiInput[in].x())<<7 |
-		Btoi(sys.aiInput[in].y())<<8 |
-		Btoi(sys.aiInput[in].z())<<9 |
-		Btoi(sys.aiInput[in].s())<<10 |
-		Btoi(sys.aiInput[in].d())<<11 |
-		Btoi(sys.aiInput[in].w())<<12 |
-		Btoi(sys.aiInput[in].m())<<13)
+	return VirtualFrame{}.encode()
 }
 
 func readI16(b []byte) int16 {
@@ -346,20 +440,12 @@ func readI32(b []byte) int32 {
 	return int32(b[0]) | int32(b[1])<<8 | int32(b[2])<<16 | int32(b[3])<<24
 }
 
-func decodeInputs(buffer [][]byte) ([]InputBits, [][6]int8) {
-	var inputs = make([]InputBits, len(buffer))
-	var analogInputs = make([][6]int8, len(buffer))
+func decodeInputs(buffer [][]byte) []VirtualFrame {
+	frames := make([]VirtualFrame, len(buffer))
 	for i, b := range buffer {
-		inputs[i] = InputBits(readI16(b))
-		for j := 0; j < len(analogInputs[i]); j++ {
-			if len(b) < 8 {
-				analogInputs[i][j] = 0
-			} else {
-				analogInputs[i][j] = int8(b[2+j])
-			}
-		}
+		frames[i] = decodeVirtualFrame(b)
 	}
-	return inputs, analogInputs
+	return frames
 }
 
 func writeI16(i16 int16) []byte {
@@ -372,60 +458,39 @@ func writeI32(i32 int32) []byte {
 	return b
 }
 
+// Local virtual controller state. The sync test drives both sides locally.
 func (rs *RollbackSystem) getInputs(player int) []byte {
-	// Digital inputs
-	var ib InputBits
-	ib.KeysToBits(rs.netConnection.buf[player].InputReader.LocalInput(0))
-	bytes := writeI16(int16(ib))
-
-	// Analog inputs
-	sbyteAxes := rs.netConnection.buf[player].InputReader.LocalAnalogInput(0)
-	for i := 0; i < len(sbyteAxes); i++ {
-		bytes = append(bytes, byte(sbyteAxes[i]))
+	if !rs.session.syncTest {
+		player = 0
 	}
-
-	return bytes
+	return sys.participantFrame(player).encode()
 }
 
-func (rs *RollbackSystem) readRollbackInput(controller int) [14]bool {
+func (rs *RollbackSystem) readRollbackInput(controller int) VirtualFrame {
 	if controller < 0 || controller >= len(sys.inputRemap) {
-		return [14]bool{}
+		return VirtualFrame{}
 	}
-
 	remap := sys.inputRemap[controller]
 	if remap < 0 || remap >= len(rs.ggpoInputs) {
-		return [14]bool{}
+		return VirtualFrame{}
 	}
-
-	return rs.ggpoInputs[remap].BitsToKeys()
-}
-
-func (rs *RollbackSystem) readRollbackInputAnalog(controller int) [6]int8 {
-	if controller < 0 || controller >= len(sys.inputRemap) {
-		return [6]int8{}
-	}
-
-	remap := sys.inputRemap[controller]
-	if remap < 0 || remap >= len(rs.ggpoInputs) {
-		return [6]int8{}
-	}
-
-	return rs.ggpoAnalogInputs[remap]
+	return rs.ggpoInputs[remap]
 }
 
 func (rs *RollbackSystem) anyButton() bool {
-	for _, b := range rs.ggpoInputs {
-		if b&IB_anybutton != 0 {
+	for _, f := range rs.ggpoInputs {
+		if f.anyButton() {
 			return true
 		}
 	}
 	return false
 }
 
+// Logs are sized for the worst case scenario, where every frame of the buffer carries a max rollback
 type RollbackLogger struct {
 	filename   string
 	currentLog strings.Builder
-	logs       [(MaxSaveStates * 2) + 3]string
+	logs       [(MaxSaveStates + 2) * (MaxSaveStates + 1)]string
 }
 
 func NewRollbackLogger(timestamp string) RollbackLogger {
@@ -448,11 +513,13 @@ func (g *RollbackLogger) logState(action string, stateIdx int, state *GameState)
 }
 
 func (g *RollbackLogger) logRoundSkipCheck(fadeoutStart int32, anyButton, roundnotskip, skipEligible, matchEndDialogue bool) {
-	if sys.rollback.session == nil || !sys.rollback.session.config.LogsEnabled {
+	if sys.rollback.session == nil || !sys.rollback.session.config.StateLogsEnabled {
 		return
 	}
-	var inputs [2]InputBits
-	copy(inputs[:], sys.rollback.ggpoInputs)
+	var inputs [2]uint16
+	for i := 0; i < len(inputs) && i < len(sys.rollback.ggpoInputs); i++ {
+		inputs[i] = sys.rollback.ggpoInputs[i].Buttons
+	}
 	fadeoutActive := false
 	fadeoutRemain := int32(0)
 	if sys.fightScreen.round != nil && sys.fightScreen.round.fadeOut != nil {
@@ -472,7 +539,7 @@ func (g *RollbackLogger) logRoundSkipCheck(fadeoutStart int32, anyButton, roundn
 }
 
 func (g *RollbackLogger) logRoundAdvanceCheck(roundOver, tickFrame, motifEndActive, fightLoopEnd, holdPostMatch, canAdvance bool) {
-	if sys.rollback.session == nil || !sys.rollback.session.config.LogsEnabled {
+	if sys.rollback.session == nil || !sys.rollback.session.config.StateLogsEnabled {
 		return
 	}
 	fmt.Fprintf(&g.currentLog,
@@ -504,8 +571,9 @@ func (g *RollbackLogger) updateStateLogs() {
 }
 
 func (g *RollbackLogger) saveStateLogs() {
-	// Header indicating the number of frames captured
-	fullLog := fmt.Sprintf("Writing save state data from the last %d frames.\n\n", len(g.logs))
+	// Header indicating the number of entries captured
+	// Each save and each load writes one, so this is not quite a frame count
+	fullLog := fmt.Sprintf("Writing save state data from the last %d entries.\n\n", len(g.logs))
 	// Collect all the logs in the buffer
 	for i := range g.logs {
 		fullLog += g.logs[i]
@@ -537,17 +605,12 @@ type RollbackSession struct {
 	currentPlayerHandle ggpo.PlayerHandle
 	remotePlayerHandle  ggpo.PlayerHandle
 	loopTimer           LoopTimer
-	inputs              map[int][MaxPlayerNo]InputBits
-	analogInputs        map[int][MaxPlayerNo][6]int8
 	config              RollbackProperties
 	log                 RollbackLogger
 	timestamp           string
 	checksumHistory     []checksumSnap
 	netTime             int32
-	replayInputs        [][REPLAY_NUM_INPUTS]InputBits
-	replayAnalogInputs  [][REPLAY_NUM_INPUTS][6]int8
-	lastConfirmedInput  [MaxPlayerNo]InputBits
-	inputBits           []InputBits
+	replayInputs        [][REPLAY_NUM_INPUTS]VirtualFrame
 	inRollback          bool
 	replaySaved         bool
 
@@ -561,19 +624,6 @@ type RollbackSession struct {
 	watchFrame int
 }
 
-func (rs *RollbackSession) SetInput(time int32, player int, input InputBits, axes [6]int8) {
-	if _, ok := rs.inputs[int(time)]; !ok {
-		rs.inputs[int(time)] = [MaxPlayerNo]InputBits{}
-		rs.analogInputs[int(time)] = [MaxPlayerNo][6]int8{}
-	}
-	inputArr := rs.inputs[int(time)]
-	analogInputs := rs.analogInputs[int(time)]
-	inputArr[player] = input
-	analogInputs[player] = axes
-	rs.inputs[int(time)] = inputArr
-	rs.analogInputs[int(time)] = analogInputs
-}
-
 func (rs *RollbackSession) ensureReplayFrame(frame int) {
 	if frame < len(rs.replayInputs) {
 		return
@@ -582,11 +632,10 @@ func (rs *RollbackSession) ensureReplayFrame(frame int) {
 		log.Printf("Rollback replay frame gap detected: expected frame %d, got %d; padding missing frames with zeros", len(rs.replayInputs), frame)
 	}
 	missing := frame - len(rs.replayInputs) + 1
-	rs.replayInputs = append(rs.replayInputs, make([][REPLAY_NUM_INPUTS]InputBits, missing)...)
-	rs.replayAnalogInputs = append(rs.replayAnalogInputs, make([][REPLAY_NUM_INPUTS][6]int8, missing)...)
+	rs.replayInputs = append(rs.replayInputs, make([][REPLAY_NUM_INPUTS]VirtualFrame, missing)...)
 }
 
-func (rs *RollbackSession) RecordReplayFrame(time int32, inputs []InputBits, axes [][6]int8) {
+func (rs *RollbackSession) RecordReplayFrame(time int32, frames []VirtualFrame) {
 	if rs == nil || time < 0 {
 		return
 	}
@@ -594,17 +643,9 @@ func (rs *RollbackSession) RecordReplayFrame(time int32, inputs []InputBits, axe
 	rs.ensureReplayFrame(frame)
 
 	// Always clear the frame first so any overwritten rollback frame keeps zeroes in slots not present in the current input payload.
-	rs.replayInputs[frame] = [REPLAY_NUM_INPUTS]InputBits{}
-	rs.replayAnalogInputs[frame] = [REPLAY_NUM_INPUTS][6]int8{}
-
-	for i := 0; i < REPLAY_NUM_INPUTS; i++ {
-		if i < len(inputs) {
-			rs.replayInputs[frame][i] = inputs[i]
-		}
-
-		if i < len(axes) {
-			rs.replayAnalogInputs[frame][i] = axes[i]
-		}
+	rs.replayInputs[frame] = [REPLAY_NUM_INPUTS]VirtualFrame{}
+	for i := 0; i < REPLAY_NUM_INPUTS && i < len(frames); i++ {
+		rs.replayInputs[frame][i] = frames[i]
 	}
 }
 
@@ -618,9 +659,6 @@ func (rs *RollbackSession) TruncateReplayFrom(time int32) {
 	}
 	if frame < len(rs.replayInputs) {
 		rs.replayInputs = rs.replayInputs[:frame]
-	}
-	if frame < len(rs.replayAnalogInputs) {
-		rs.replayAnalogInputs = rs.replayAnalogInputs[:frame]
 	}
 }
 
@@ -637,19 +675,15 @@ func (rs *RollbackSession) SaveReplay() {
 		return
 	}
 
-	if len(rs.replayInputs) < frameCount || len(rs.replayAnalogInputs) < frameCount {
+	if len(rs.replayInputs) < frameCount {
 		frameCount = len(rs.replayInputs)
-		if len(rs.replayAnalogInputs) < frameCount {
-			frameCount = len(rs.replayAnalogInputs)
-		}
 		log.Printf("Missing rollback replay frames after frame %d; truncating replay at this point", frameCount)
 	}
 
 	for frame := 0; frame < frameCount; frame++ {
 		inputFrame := rs.replayInputs[frame]
-		axisFrame := rs.replayAnalogInputs[frame]
 		for i := 0; i < REPLAY_NUM_INPUTS; i++ {
-			if err := writeReplayInput(rs.recording, inputFrame[i], axisFrame[i]); err != nil {
+			if err := writeReplayInput(rs.recording, inputFrame[i]); err != nil {
 				log.Printf("Error while writing rollback replay frame %d controller %d: %v", frame, i, err)
 				return
 			}
@@ -714,30 +748,32 @@ func (r *RollbackSession) SaveGameState(stateIdx int) int {
 	sys.savePool.curStateID = stateIdx
 	sys.rollbackStateID = stateIdx
 	oldest := (stateIdx + 1) % (MaxSaveStates + 2)
-	if _, ok := sys.arenaSaveMap[oldest]; ok {
-		sys.arenaSaveMap[oldest].Free()
-		sys.arenaSaveMap[oldest] = nil
-		delete(sys.arenaSaveMap, oldest)
+	// These slots are no longer restorable; drop their snapshots before freeing pooled data.
+	// The dropped GameStates go back to the pool (like LoadGameState does), so the next save
+	// reuses one instead of allocating a new ~170 KB snapshot every frame: that garbage set
+	// the Go GC rate online, and on js/wasm each GC is one long main-thread stall.
+	for _, idx := range [2]int{oldest, stateIdx} {
+		if gs, ok := r.saveStates[idx]; ok {
+			delete(r.saveStates, idx)
+			if gs != nil {
+				sys.statePool.gameStatePool.Put(gs)
+			}
+		}
 	}
 	sys.savePool.Free(oldest)
-	if _, ok := sys.arenaSaveMap[stateIdx]; ok {
-		sys.arenaSaveMap[stateIdx].Free()
-		sys.arenaSaveMap[stateIdx] = nil
-		delete(sys.arenaSaveMap, stateIdx)
-	}
 	sys.savePool.Free(stateIdx)
 
 	r.saveStates[stateIdx] = sys.statePool.gameStatePool.Get().(*GameState)
 	r.saveStates[stateIdx].SaveState(stateIdx)
 
 	if r.config.DesyncTest {
-		if r.config.LogsEnabled {
+		if r.config.StateLogsEnabled {
 			r.log.logState("Saving", stateIdx, r.saveStates[stateIdx])
 			r.log.updateStateLogs()
 		}
 		return r.saveStates[stateIdx].Checksum()
 	} else {
-		if r.config.LogsEnabled {
+		if r.config.StateLogsEnabled {
 			r.log.logState("Saving", stateIdx, r.saveStates[stateIdx])
 			r.log.updateStateLogs()
 		}
@@ -745,33 +781,19 @@ func (r *RollbackSession) SaveGameState(stateIdx int) int {
 	}
 }
 
-var lastLoadedFrame int = -1
-
 func (r *RollbackSession) LoadGameState(stateIdx int) {
 	sys.loadPool.curStateID = stateIdx
-	if _, ok := sys.arenaLoadMap[stateIdx]; ok {
-		sys.arenaLoadMap[stateIdx].Free()
-		sys.arenaLoadMap[stateIdx] = nil
-		delete(sys.arenaLoadMap, stateIdx)
-	}
-	for sid := range sys.arenaLoadMap {
-		if sid != lastLoadedFrame {
-			sys.arenaLoadMap[sid].Free()
-			sys.arenaLoadMap[sid] = nil
-			delete(sys.arenaLoadMap, sid)
-		}
-	}
 	sys.loadPool.Free(stateIdx)
 
 	r.saveStates[stateIdx].LoadState(stateIdx)
 
-	if r.config.DesyncTest && r.config.LogsEnabled {
+	if r.config.DesyncTest && r.config.StateLogsEnabled {
 		r.log.logState("Loading", stateIdx, r.saveStates[stateIdx])
 	}
 
+	// Drop the entry alongside the Put, or a later Get can hand out a GameState this map still points at
 	sys.statePool.gameStatePool.Put(r.saveStates[stateIdx])
-
-	lastLoadedFrame = stateIdx
+	delete(r.saveStates, stateIdx)
 }
 
 // Called when the GGPO backend needs the game to simulate a single frame
@@ -792,14 +814,14 @@ func (r *RollbackSession) AdvanceFrame(flags int) {
 
 	// Run frame again using confirmed inputs
 	if ggpoerr == nil {
-		sys.rollback.ggpoInputs, sys.rollback.ggpoAnalogInputs = decodeInputs(inputs)
+		sys.rollback.ggpoInputs = decodeInputs(inputs)
 		if len(r.watchers) > 0 {
 			if p, ok := r.backend.(*ggpo.Peer); ok {
 				r.watchRecord(p.CurrentFrame(), inputs)
 			}
 		}
 		if r.recording != nil {
-			r.RecordReplayFrame(r.netTime, sys.rollback.ggpoInputs, sys.rollback.ggpoAnalogInputs)
+			r.RecordReplayFrame(r.netTime, sys.rollback.ggpoInputs)
 			r.netTime++
 		}
 		// As in runFrame(): commit rollback re-simulated frames to GGPO even if this frame exits gameplay.
@@ -848,7 +870,7 @@ func (r *RollbackSession) OnEvent(info *ggpo.Event) {
 		if sys.postMatchFlg {
 			return
 		}
-		if r.config.LogsEnabled {
+		if r.config.StateLogsEnabled {
 			r.log.saveStateLogs()
 		}
 		fmt.Println("EventCodeDisconnectedFromPeer")
@@ -861,7 +883,7 @@ func (r *RollbackSession) OnEvent(info *ggpo.Event) {
 		fmt.Printf("EventCodeTimeSync: FramesAhead %f TimeSyncPeriodInFrames: %d\n", info.FramesAhead, info.TimeSyncPeriodInFrames)
 		r.loopTimer.OnGGPOTimeSyncEvent(info.FramesAhead)
 	case ggpo.EventCodeDesync:
-		if r.config.LogsEnabled {
+		if r.config.StateLogsEnabled {
 			r.log.saveStateLogs()
 		}
 		fmt.Println("EventCodeDesync")
@@ -884,6 +906,11 @@ func (r *RollbackSession) OnEvent(info *ggpo.Event) {
 			detail += "\n(state history expired)"
 		}
 		fmt.Println("DESYNC DETAIL\n" + detail)
+		// The input and menu layer goes to the console only: the warning
+		// screen clips at the bottom (see formatChecksumSnap).
+		if sn := r.checksumSnapFor(info.NumFrameOfDesync); sn != nil {
+			fmt.Println("DESYNC INPUT\n" + formatInputSnap(sn))
+		}
 		// LATCH THE FIRST MISMATCH, NOT THE LAST. EventCodeDesync fires once per
 		// mismatching frame, so an unguarded assignment here overwrites the
 		// message every time and the player ends up reading the LAST divergent
@@ -908,6 +935,18 @@ func (r *RollbackSession) OnEvent(info *ggpo.Event) {
 	}
 }
 
+// matchGone ends a match whose other player is gone for good (the page said
+// so, see platformMatchGone). Not part of the simulation: the peer is gone,
+// so nothing is compared any more.
+func (r *RollbackSession) matchGone() {
+	if r.config.StateLogsEnabled {
+		r.log.saveStateLogs()
+	}
+	fmt.Println("MatchGone: the page dropped the match")
+	log.Printf("Rollback: the other player left; the match ends here")
+	sys.endMatch = true
+}
+
 func NewRollbackSession(config RollbackProperties) RollbackSession {
 	r := RollbackSession{}
 	r.saveStates = make(map[int]*GameState)
@@ -917,10 +956,7 @@ func NewRollbackSession(config RollbackProperties) RollbackSession {
 	r.loopTimer = NewLoopTimer(60, 100)
 	r.timestamp = time.Now().Format("2006-01-02_15-04-05")
 	r.log = NewRollbackLogger(r.timestamp)
-	r.replayInputs = make([][REPLAY_NUM_INPUTS]InputBits, 0)
-	r.replayAnalogInputs = make([][REPLAY_NUM_INPUTS][6]int8, 0)
-	r.inputs = make(map[int][MaxPlayerNo]InputBits)
-	r.analogInputs = make(map[int][MaxPlayerNo][6]int8)
+	r.replayInputs = make([][REPLAY_NUM_INPUTS]VirtualFrame, 0)
 	// Frame -1 marks "never recorded" so ring slot 0 can't false-match frame 0.
 	r.checksumHistory = make([]checksumSnap, checksumHistorySize)
 	for i := range r.checksumHistory {
@@ -928,10 +964,6 @@ func NewRollbackSession(config RollbackProperties) RollbackSession {
 	}
 	return r
 
-}
-
-func encodeInputs(inputs InputBits) []byte {
-	return writeI16(int16(inputs))
 }
 
 // --- Desync diagnostics ----------------------------------------------------
@@ -1015,6 +1047,70 @@ type checksumSnap struct {
 	rngDraws    int32
 	rngByPlayer [MaxPlayerNo]int32
 	rngByMinus  [6]int32
+	// The input and menu layer (modern-input). Peers exchange virtual
+	// controller frames and turn them into buttons with each player's
+	// Button Setup; pause, rematch and setup edits are synchronized menu
+	// frames. A divergence here (a different setup, a menu one peer opened and
+	// the other did not) shows first in these fields, frames before it moves
+	// a character. Diagnostic only, except what LiveChecksum folds in.
+	in            [2]VirtualFrame // the frame's raw GGPO input per channel
+	proj          [2]uint16       // its buttons through the channel's setup
+	setups        uint32          // sessionSetupsHash
+	menuPlayer    int32
+	meActive      bool
+	meState       int32
+	meNetDelay    int32
+	meRematch     bool
+	paused        bool
+	postMatch     bool
+	menuEsc       [2]int32 // menuChannels: frames Esc held
+	menuEscTaken  [2]bool
+	menuMouseGen  [2]uint16 // generation, received
+	menuMouseRecv [2]uint16
+	menuMouseTgt  [2]uint32
+	vsMatches     int32
+	vsWins        [2]int32
+	uiFrame       int32
+}
+
+// sessionSetupsHash hashes the Button Setup of every netplay channel by
+// what decides the buttons (the virtual controls behind each engine button),
+// in channel order, so both peers get the same number for the same setups.
+func sessionSetupsHash() uint32 {
+	if len(sys.sessionSetups) == 0 {
+		return 0
+	}
+	var crc uint32
+	var b [4]byte
+	put := func(v uint32) {
+		binary.BigEndian.PutUint32(b[:], v)
+		crc = crc32.Update(crc, crc32.IEEETable, b[:])
+	}
+	for ch := 0; ch < MaxPlayerNo; ch++ {
+		setup, ok := sys.sessionSetups[ch]
+		if !ok {
+			continue
+		}
+		put(uint32(ch))
+		for i, controls := range setup.controls {
+			put(uint32(i)<<16 | uint32(len(controls)))
+			for _, vc := range controls {
+				put(uint32(vc))
+			}
+		}
+	}
+	return crc
+}
+
+// Buttons of a projected frame as a bit mask (up, down, ... menu).
+func projectedMask(buttons [14]bool) uint16 {
+	var m uint16
+	for i, on := range buttons {
+		if on {
+			m |= 1 << uint(i)
+		}
+	}
+	return m
 }
 
 func (rs *RollbackSession) recordChecksumSnap() {
@@ -1088,6 +1184,24 @@ func (rs *RollbackSession) recordChecksumSnap() {
 	sn.rngDraws = sys.rngDraws
 	sn.rngByPlayer = sys.rngByPlayer
 	sn.rngByMinus = sys.rngByMinus
+	for ch := range sn.in {
+		if ch < len(sys.rollback.ggpoInputs) {
+			f := sys.rollback.ggpoInputs[ch]
+			sn.in[ch] = f
+			sn.proj[ch] = projectedMask(sys.channelSetup(ch).project(f.controller()))
+		}
+		mc := &sys.menuChannels[ch]
+		sn.menuEsc[ch], sn.menuEscTaken[ch] = mc.escape, mc.escapeTaken
+		sn.menuMouseGen[ch], sn.menuMouseRecv[ch] = mc.mouse.generation, mc.mouse.received
+		sn.menuMouseTgt[ch] = mc.mouse.target
+	}
+	sn.setups = sessionSetupsHash()
+	sn.menuPlayer = int32(sys.menuPlayer)
+	me := &sys.motif.me
+	sn.meActive, sn.meState, sn.meNetDelay, sn.meRematch = me.active, int32(me.state), int32(me.netDelay), me.rematch
+	sn.paused, sn.postMatch = sys.paused, sys.postMatchFlg
+	sn.vsMatches, sn.vsWins = sys.versusStats.Matches, sys.versusStats.Wins
+	sn.uiFrame = sys.uiFrameCounter
 	sys.rngDraws = 0
 	sys.rngByPlayer = [MaxPlayerNo]int32{}
 	sys.rngByMinus = [6]int32{}
@@ -1138,6 +1252,21 @@ func formatChecksumSnap(sn *checksumSnap) string {
 	return s
 }
 
+// The input and menu fields of a snapshot, one short line each.
+func formatInputSnap(sn *checksumSnap) string {
+	s := ""
+	for ch := range sn.in {
+		f := sn.in[ch]
+		s += fmt.Sprintf("in%d b=%04x ax=%v pj=%04x\n", ch, f.Buttons, f.Axes, sn.proj[ch])
+		s += fmt.Sprintf("mc%d esc=%d tk=%v gen=%d/%d tgt=%d\n", ch, sn.menuEsc[ch], sn.menuEscTaken[ch],
+			sn.menuMouseGen[ch], sn.menuMouseRecv[ch], sn.menuMouseTgt[ch])
+	}
+	s += fmt.Sprintf("setups=%08x mp=%d ui=%d\n", sn.setups, sn.menuPlayer, sn.uiFrame)
+	s += fmt.Sprintf("me=%v st=%d nd=%d rm=%v\n", sn.meActive, sn.meState, sn.meNetDelay, sn.meRematch)
+	s += fmt.Sprintf("paused=%v post=%v vs=%d %d/%d", sn.paused, sn.postMatch, sn.vsMatches, sn.vsWins[0], sn.vsWins[1])
+	return s
+}
+
 func (rs *RollbackSession) LiveChecksum() uint32 {
 	// System variables. Check always
 	buf := writeI32(sys.randseed)
@@ -1166,6 +1295,18 @@ func (rs *RollbackSession) LiveChecksum() uint32 {
 	for i := range sys.scorePoints {
 		buf = binary.BigEndian.AppendUint32(buf, math.Float32bits(sys.scorePoints[i]))
 		buf = binary.BigEndian.AppendUint32(buf, uint32(sys.comboCount[i]))
+	}
+	// The input layer (modern-input): both peers turn every virtual frame into
+	// buttons with the same Button Setups, and a pause or rematch menu is
+	// open on both or on neither, for the same player. A setup edit in the
+	// pause menu that reached one peer only, or a menu one peer opened alone,
+	// would otherwise stay silent until it moved a character.
+	buf = binary.BigEndian.AppendUint32(buf, sessionSetupsHash())
+	buf = binary.BigEndian.AppendUint32(buf, uint32(sys.menuPlayer))
+	if sys.motif.me.active {
+		buf = append(buf, 1)
+	} else {
+		buf = append(buf, 0)
 	}
 
 	// Round start checks. Ensure both players have the same selection
@@ -1219,23 +1360,15 @@ func (rs *RollbackSession) LiveChecksum() uint32 {
 	return crc32.ChecksumIEEE(buf)
 }
 
-func (rs *RollbackSession) Input(time int32, player int) (input InputBits) {
-	inputs := rs.inputs[int(time)]
-	input = inputs[player]
-	return
+// Both games on one PC can start in the same second, so name the logs after the player too.
+func (rs *RollbackSession) setLogPlayer(player int) {
+	rs.timestamp = fmt.Sprintf("%s_P%d", rs.timestamp, player)
+	rs.log = NewRollbackLogger(rs.timestamp)
 }
 
-func (rs *RollbackSession) AnyButton() bool {
-	for i := 0; i < len(rs.inputs[len(rs.inputs)-1]); i++ {
-		if rs.Input(sys.matchTime, i)&IB_anybutton != 0 {
-			return true
-		}
-	}
-	return false
-}
-
-func (rs *RollbackSession) InitP1(numPlayers int, localPort int, remotePort int, remoteIp string) {
-	if rs.config.LogsEnabled {
+func (rs *RollbackSession) InitP1(numPlayers int, localPort int, remotePort int, remoteIp string) error {
+	rs.setLogPlayer(1)
+	if rs.config.GgpoLogsEnabled {
 		logFileName := fmt.Sprintf("save/logs/Rollback-%s.log", rs.timestamp)
 		f, err := os.OpenFile(logFileName, os.O_CREATE|os.O_RDWR, 0666)
 		if err != nil {
@@ -1246,9 +1379,7 @@ func (rs *RollbackSession) InitP1(numPlayers int, localPort int, remotePort int,
 		ggpo.SetLogger(logger)
 	}
 
-	var inputBits InputBits = 0
-	var inputAxes [6]int8 = [6]int8{}
-	var inputSize int = len(encodeInputs(inputBits)) + len(inputAxes)
+	var inputSize int = virtualFrameBytes
 
 	player := ggpo.NewLocalPlayer(20, 1)
 	player2 := ggpo.NewRemotePlayer(20, 2, remoteIp, remotePort)
@@ -1259,7 +1390,9 @@ func (rs *RollbackSession) InitP1(numPlayers int, localPort int, remotePort int,
 	rs.backend = &peer
 
 	// With no watcher to register this is platformGGPOTransport() as it was.
-	peer.InitializeConnection(rs.watchTransport(platformGGPOTransport())...)
+	if err := peer.InitializeConnection(rs.watchTransport(platformGGPOTransport())...); err != nil {
+		return err
+	}
 
 	var handle ggpo.PlayerHandle
 	result := peer.AddPlayer(&player, &handle)
@@ -1283,10 +1416,12 @@ func (rs *RollbackSession) InitP1(numPlayers int, localPort int, remotePort int,
 	peer.SetFrameDelay(handle, rs.config.FrameDelay)
 
 	peer.Start()
+	return nil
 }
 
-func (rs *RollbackSession) InitP2(numPlayers int, localPort int, remotePort int, remoteIp string) {
-	if rs.config.LogsEnabled {
+func (rs *RollbackSession) InitP2(numPlayers int, localPort int, remotePort int, remoteIp string) error {
+	rs.setLogPlayer(2)
+	if rs.config.GgpoLogsEnabled {
 		logFileName := fmt.Sprintf("save/logs/Rollback-%s.log", rs.timestamp)
 		f, err := os.OpenFile(logFileName, os.O_CREATE|os.O_RDWR, 0666)
 		if err != nil {
@@ -1297,9 +1432,7 @@ func (rs *RollbackSession) InitP2(numPlayers int, localPort int, remotePort int,
 		ggpo.SetLogger(logger)
 	}
 
-	var inputBits InputBits = 0
-	var inputAxes [6]int8 = [6]int8{}
-	var inputSize int = len(encodeInputs(inputBits)) + len(inputAxes)
+	var inputSize int = virtualFrameBytes
 
 	player := ggpo.NewRemotePlayer(20, 1, remoteIp, remotePort)
 	player2 := ggpo.NewLocalPlayer(20, 2)
@@ -1309,7 +1442,9 @@ func (rs *RollbackSession) InitP2(numPlayers int, localPort int, remotePort int,
 	peer := ggpo.NewPeer(rs, localPort, numPlayers, inputSize)
 	rs.backend = &peer
 
-	peer.InitializeConnection(platformGGPOTransport()...)
+	if err := peer.InitializeConnection(platformGGPOTransport()...); err != nil {
+		return err
+	}
 
 	var handle ggpo.PlayerHandle
 	result := peer.AddPlayer(&player, &handle)
@@ -1332,11 +1467,12 @@ func (rs *RollbackSession) InitP2(numPlayers int, localPort int, remotePort int,
 	peer.SetFrameDelay(handle2, rs.config.FrameDelay)
 
 	peer.Start()
+	return nil
 }
 
 func (rs *RollbackSession) InitSyncTest(numPlayers int) {
 	rs.syncTest = true
-	if rs.config.LogsEnabled {
+	if rs.config.GgpoLogsEnabled {
 		logFileName := fmt.Sprintf("save/logs/Rollback-Desync-Test-%s.log", rs.timestamp)
 		f, err := os.OpenFile(logFileName, os.O_CREATE|os.O_RDWR, 0666)
 		if err != nil {
@@ -1347,9 +1483,7 @@ func (rs *RollbackSession) InitSyncTest(numPlayers int) {
 		ggpo.SetLogger(logger)
 	}
 
-	var inputBits InputBits = 0
-	var inputAxes [6]int8 = [6]int8{}
-	var inputSize int = len(encodeInputs(inputBits)) + len(inputAxes)
+	var inputSize int = virtualFrameBytes
 
 	player := ggpo.NewLocalPlayer(20, 1)
 	player2 := ggpo.NewLocalPlayer(20, 2)

@@ -26,8 +26,26 @@ const (
 	REPLAY_NUM_INPUTS  = MaxSimul * 2
 	REPLAY_INPUT_BYTES = 2 + 6
 
-	syncConfigVersion     uint16 = 2
-	replayFormatVersion   uint16 = 2
+	// Fork-only sync version (Decision 11): upstream counts 1, 2, ... and the
+	// fork once picked 2 on its own, the same number upstream's modern-input
+	// later chose for a different format. Fork values live at 1000+ so the
+	// two lines can never collide again; bump it whenever the fork's
+	// handshake or its sync-tagged settings change. 1002: upstream develop's
+	// rollback_port field and the host-synced Netplay.SyncTimeout /
+	// Netplay.LoadingTimeout settings, on top of the round-fade pin (2).
+	// 1003: upstream modern-input (2026-11-15 pin 9237c644): netplay inputs
+	// are virtual controller frames and the handshake carries each player's
+	// Controller Setup, so a 1002 engine must refuse this one.
+	// 1004: the checksum peers exchange every frame (LiveChecksum) also
+	// covers the session's Controller Setups and the open menu. GGPO compares
+	// it whatever DesyncTest says, so a 1003 engine meeting this one would end
+	// every match as a desync on its 16th frame.
+	// 1005: upstream modern-input (2026-11-17 pin 07c692fb): the new
+	// host-synced Options.PauseDelay setting, the [Rematch Info] screen
+	// after a match, and Button Setup (was Controller Setup) as the name of
+	// the setup carried in the handshake.
+	syncConfigVersion     uint16 = 1005
+	replayFormatVersion   uint16 = 3
 	replayMagic                  = "IKRPLCFG"
 	replaySyncMagic              = "IKRPLSYN"
 	replaySyncSearchLimit        = int64(64 << 20)
@@ -69,12 +87,14 @@ type SyncSetting struct {
 }
 
 type SyncHandshake struct {
-	SyncVersion        uint16        `json:"sync_version"`
-	Strict             []SyncSetting `json:"strict,omitempty"`
-	Host               []SyncSetting `json:"host,omitempty"`
-	ContentFingerprint string        `json:"content_fingerprint,omitempty"`
-	RoundFadeTime      int32         `json:"round_fade_time,omitempty"`
-	RoundFadeInTime    int32         `json:"round_fade_in_time,omitempty"`
+	SyncVersion        uint16                 `json:"sync_version"`
+	Strict             []SyncSetting          `json:"strict,omitempty"`
+	Host               []SyncSetting          `json:"host,omitempty"`
+	RollbackPort       int                    `json:"rollback_port,omitempty"`
+	ContentFingerprint string                 `json:"content_fingerprint,omitempty"`
+	RoundFadeTime      int32                  `json:"round_fade_time,omitempty"`
+	RoundFadeInTime    int32                  `json:"round_fade_in_time,omitempty"`
+	Setup              *ButtonSetupProperties `json:"setup,omitempty"` // Button Setup of the sender's player
 }
 
 type ReplayHeader struct {
@@ -85,6 +105,13 @@ type ReplayHeader struct {
 	ContentFingerprint string        `json:"content_fingerprint,omitempty"`
 	RoundFadeTime      int32         `json:"round_fade_time,omitempty"`
 	RoundFadeInTime    int32         `json:"round_fade_in_time,omitempty"`
+	Setups             []ReplaySetup `json:"setups,omitempty"`
+}
+
+// Button Setup that turns one replay channel into game buttons.
+type ReplaySetup struct {
+	Channel int                    `json:"channel"`
+	Setup   *ButtonSetupProperties `json:"setup"`
 }
 
 type SessionConfigOverride struct {
@@ -97,31 +124,25 @@ type SessionConfigOverride struct {
 	ContentFingerprint string
 	RoundFadeTime      int32
 	RoundFadeInTime    int32
+	HostSetup          *ButtonSetupProperties
+	GuestSetup         *ButtonSetupProperties
 }
 
 // -----------------------------------------------------------------------------
 // Replay payload encoding
 // -----------------------------------------------------------------------------
 
-func writeReplayInput(w io.Writer, ibit InputBits, axes [6]int8) error {
-	var buf [REPLAY_INPUT_BYTES]byte
-	binary.LittleEndian.PutUint16(buf[:2], uint16(ibit))
-	for i := 0; i < len(axes); i++ {
-		buf[2+i] = byte(axes[i])
-	}
-	_, err := w.Write(buf[:])
+func writeReplayInput(w io.Writer, f VirtualFrame) error {
+	_, err := w.Write(f.encode())
 	return err
 }
 
-func readReplayInput(r io.Reader, ibit *InputBits, axes *[6]int8) error {
+func readReplayInput(r io.Reader, f *VirtualFrame) error {
 	var buf [REPLAY_INPUT_BYTES]byte
 	if _, err := io.ReadFull(r, buf[:]); err != nil {
 		return err
 	}
-	*ibit = InputBits(int16(binary.LittleEndian.Uint16(buf[:2])))
-	for i := 0; i < len(axes); i++ {
-		axes[i] = int8(buf[2+i])
-	}
+	*f = decodeVirtualFrame(buf[:])
 	return nil
 }
 
@@ -131,45 +152,32 @@ func readReplayInput(r io.Reader, ibit *InputBits, axes *[6]int8) error {
 
 // NetBuffer holds the inputs that are sent between players
 type NetBuffer struct {
-	buf              [NETBUF_NUM_FRAMES]InputBits
-	axisBuf          [NETBUF_NUM_FRAMES][6]int8
+	buf              [NETBUF_NUM_FRAMES]VirtualFrame
 	curT, inpT, senT int32
-	InputReader      *InputReader
 }
 
 func NewNetBuffer() NetBuffer {
-	return NetBuffer{
-		InputReader: NewInputReader(),
-	}
+	return NetBuffer{}
 }
 
 func (nb *NetBuffer) reset(time int32) {
 	nb.curT, nb.inpT, nb.senT = time, time, time
-	nb.InputReader.Reset()
 }
 
-// Convert local player's key inputs into input bits for sending
+// Store the local player's virtual controller state for sending
 func (nb *NetBuffer) writeNetBuffer(in int) {
 	if nb.inpT-nb.curT < NETBUF_NUM_FRAMES {
-		nb.buf[nb.inpT&(NETBUF_NUM_FRAMES-1)].KeysToBits(nb.InputReader.LocalInput(in))
-		nb.axisBuf[nb.inpT&(NETBUF_NUM_FRAMES-1)] = nb.InputReader.LocalAnalogInput(in)
+		nb.buf[nb.inpT&(NETBUF_NUM_FRAMES-1)] = sys.participantFrame(in)
 		nb.inpT++
 	}
 }
 
-// Read input bits from the net buffer
-func (nb *NetBuffer) readNetBuffer() [14]bool {
+// Read the virtual controller state of the current frame
+func (nb *NetBuffer) readNetBuffer() VirtualFrame {
 	if nb.curT < nb.inpT {
-		return nb.buf[nb.curT&(NETBUF_NUM_FRAMES-1)].BitsToKeys()
+		return nb.buf[nb.curT&(NETBUF_NUM_FRAMES-1)]
 	}
-	return [14]bool{}
-}
-
-func (nb *NetBuffer) readNetBufferAnalog() [6]int8 {
-	if nb.curT < nb.inpT {
-		return nb.axisBuf[nb.curT&(NETBUF_NUM_FRAMES-1)]
-	}
-	return [6]int8{}
+	return VirtualFrame{}
 }
 
 // -----------------------------------------------------------------------------
@@ -180,7 +188,32 @@ func (nb *NetBuffer) readNetBufferAnalog() [6]int8 {
 // a WebRTC DataChannel byte stream in the browser.
 type netStream interface {
 	io.ReadWriteCloser
+	SetDeadline(t time.Time) error
 	SetReadDeadline(t time.Time) error
+	SetWriteDeadline(t time.Time) error
+	LocalAddr() net.Addr
+	RemoteAddr() net.Addr
+}
+
+// Netplay deadlines (upstream 4d009150: Netplay.SyncTimeout and
+// Netplay.LoadingTimeout) apply where platformNetDeadlines is true, i.e. on
+// desktop. The browser build keeps 2.4's behavior and waits (Decision 10): a
+// page can take far longer than a minute to load a roster, and the WebRTC
+// channel reports a vanished peer on its own.
+
+// netDeadline returns the deadline ms milliseconds from now, or the zero time
+// (no deadline) on a platform without netplay deadlines.
+func netDeadline(ms int) time.Time {
+	if !platformNetDeadlines {
+		return time.Time{}
+	}
+	return time.Now().Add(time.Duration(ms) * time.Millisecond)
+}
+
+// netTimedOut reports whether ms milliseconds passed since start, and is
+// always false on a platform without netplay deadlines.
+func netTimedOut(start time.Time, ms int) bool {
+	return platformNetDeadlines && time.Since(start) >= time.Duration(ms)*time.Millisecond
 }
 
 // NetConnection manages the communication between players
@@ -188,34 +221,51 @@ type NetConnection struct {
 	// Transport-agnostic: desktop connects over TCP (netplay_desktop.go);
 	// the js/wasm build tunnels the same byte stream through a WebRTC
 	// DataChannel (netplay_js.go + the page's webrtc.js bridge).
-	ln               io.Closer
-	conn             netStream
-	st               NetState
-	sendEnd          chan bool
-	recvEnd          chan bool
-	buf              [MaxSimul * 2]NetBuffer // We skip attached characters here because they never have human inputs
-	locIn            int
-	remIn            int
-	time             int32
-	stoppedcnt       int32
-	delay            int32
-	recording        *os.File
-	host             bool
-	preMatchTime     int32
-	closing          chan struct{}
-	closeOnce        sync.Once
-	uiInputDebounced bool
-	headerWritten    bool
-	loadingPhase     LoadingPhase
-	lastSeed         int32 // the seed the last Synchronize agreed (a watcher's start message)
+	ln          io.Closer
+	conn        netStream
+	pendingConn chan netStream
+	st          NetState
+	sendEnd     chan bool
+	recvEnd     chan bool
+	buf         [MaxSimul * 2]NetBuffer // We skip attached characters here because they never have human inputs
+	locIn       int
+	remIn       int
+	time        int32
+	// stoppedcnt is the 2.4 stopped-state rule (60 updates, then NS_End),
+	// kept for the browser build, which has no netplay deadlines (see
+	// platformNetDeadlines). Desktop uses upstream's stoppedStarted timeout.
+	stoppedcnt         int32
+	stoppedStarted     time.Time
+	delay              int32
+	recording          *os.File
+	host               bool
+	preMatchTime       int32
+	closing            chan struct{}
+	closeOnce          sync.Once
+	uiInputDebounced   bool
+	headerWritten      bool
+	loadingPhase       LoadingPhase
+	loadingStarted     time.Time
+	rollbackLocalPort  int
+	rollbackRemotePort int
+	lastSeed           int32 // the seed the last Synchronize agreed (a watcher's start message)
 }
 
 func NewNetConnection() *NetConnection {
+	// The device that opened netplay is the local player, as participant zero.
+	sys.resetInputForMenus()
+	if !sys.inputs.participantConnected(0) {
+		// Command-line matches and automatic menu entries have no initiating
+		// device. Assign the first keyboard/gamepad pair before locking input.
+		sys.assignAutomaticInputs(0, 1, 1, false)
+	}
+	sys.inputs.ClaimLocked = true
 	nc := &NetConnection{
-		st:      NS_Stop,
-		sendEnd: make(chan bool, 1),
-		recvEnd: make(chan bool, 1),
-		closing: make(chan struct{}),
+		st:          NS_Stop,
+		pendingConn: make(chan netStream),
+		sendEnd:     make(chan bool, 1),
+		recvEnd:     make(chan bool, 1),
+		closing:     make(chan struct{}),
 	}
 	nc.sendEnd <- true
 	nc.recvEnd <- true
@@ -279,6 +329,8 @@ func (nc *NetConnection) Close() {
 	}
 	nc.conn = nil
 	nc.uiInputDebounced = false
+	nc.rollbackLocalPort = 0
+	nc.rollbackRemotePort = 0
 }
 
 func (nc *NetConnection) end() {
@@ -288,10 +340,39 @@ func (nc *NetConnection) end() {
 	nc.Close()
 }
 
-func (nc *NetConnection) Stop() {
+// Abort the whole session so Lua can display the warning without another TCP sync.
+func (nc *NetConnection) fail(err error) {
+	if sys.sessionWarning == "" {
+		sys.sessionWarning = err.Error()
+	}
+	platformNetFail(err.Error())
+	sys.esc = true
+	if nc != nil {
+		nc.end()
+	}
+}
+
+func (nc *NetConnection) Stop() (err error) {
+	if nc.isClosing() {
+		return nil
+	}
+	defer func() {
+		if err != nil {
+			nc.fail(err)
+		}
+	}()
 	if sys.esc {
 		nc.end()
 	} else {
+		if nc.conn == nil {
+			return Error("Cannot connect to the other player")
+		}
+		// Bound both the final write and the drain of the peer's input stream.
+		conn := nc.conn
+		if err = conn.SetDeadline(netDeadline(sys.cfg.Netplay.SyncTimeout)); err != nil {
+			return err
+		}
+		defer conn.SetDeadline(time.Time{})
 		if nc.st != NS_End && nc.st != NS_Error {
 			nc.st = NS_Stop
 		}
@@ -299,37 +380,41 @@ func (nc *NetConnection) Stop() {
 		nc.sendEnd <- true
 		<-nc.recvEnd
 		nc.recvEnd <- true
-	}
-}
-
-func (nc *NetConnection) GetHostGuestRemap() (host, guest int) {
-	host, guest = -1, -1
-	for i, c := range sys.aiLevel {
-		if c == 0 {
-			if host < 0 {
-				host = i
-			} else if guest < 0 {
-				guest = i
-			}
+		if nc.st == NS_Error {
+			return Error("Netplay input synchronization failed or timed out")
 		}
 	}
-	if host < 0 {
-		host = 0
-	}
-	if guest < 0 {
-		guest = (host + 1) % len(nc.buf)
-	}
-	return
+	return nil
 }
 
 // Accept and Connect live in the platform files (netplay_desktop.go /
 // netplay_js.go): TCP listen/dial is desktop-only, the browser build tunnels
 // through the page's WebRTC bridge. Upstream v1.0.0 changed their signatures
 // to take the port as an int (config.Netplay.ListenPort is int now) - both
-// platform implementations follow that signature.
+// platform implementations follow that signature. Upstream develop (ea69d1f3)
+// hands a finished handshake to the main thread through pendingConn instead
+// of writing nc.conn from the goroutine; publishConnection is shared.
+
+// Transfer ownership to the main thread, or close the socket if it cancels.
+// The unbuffered handoff cannot leave an unclaimed socket behind after Close.
+func (nc *NetConnection) publishConnection(conn netStream) {
+	select {
+	case nc.pendingConn <- conn:
+	case <-nc.closing:
+		conn.Close()
+	}
+}
+
 func (nc *NetConnection) IsConnected() bool {
-	if nc == nil {
+	if nc == nil || nc.isClosing() {
 		return false
+	}
+	// Only the main thread adopts a completed handshake and writes nc.conn.
+	if nc.conn == nil {
+		select {
+		case nc.conn = <-nc.pendingConn:
+		default:
+		}
 	}
 	connected := nc.conn != nil
 	// Stop a held button from registering as a fresh press and auto-accepting the first menu.
@@ -345,7 +430,7 @@ func (nc *NetConnection) IsConnected() bool {
 // Wire primitives
 func (nc *NetConnection) readI8() (int8, error) {
 	b := [1]byte{}
-	if _, err := nc.conn.Read(b[:]); err != nil {
+	if _, err := io.ReadFull(nc.conn, b[:]); err != nil {
 		return 0, err
 	}
 	return int8(b[0]), nil
@@ -366,7 +451,7 @@ func (nc *NetConnection) writeU8(u8 byte) error {
 
 func (nc *NetConnection) readI16() (int16, error) {
 	b := [2]byte{}
-	if _, err := nc.conn.Read(b[:]); err != nil {
+	if _, err := io.ReadFull(nc.conn, b[:]); err != nil {
 		return 0, err
 	}
 	return int16(b[0]) | int16(b[1])<<8, nil
@@ -382,7 +467,7 @@ func (nc *NetConnection) writeI16(i16 int16) error {
 
 func (nc *NetConnection) readI32() (int32, error) {
 	b := [4]byte{}
-	if _, err := nc.conn.Read(b[:]); err != nil {
+	if _, err := io.ReadFull(nc.conn, b[:]); err != nil {
 		return 0, err
 	}
 	return int32(b[0]) | int32(b[1])<<8 | int32(b[2])<<16 | int32(b[3])<<24, nil
@@ -434,40 +519,55 @@ func (nc *NetConnection) readJSON(v interface{}) error {
 }
 
 // Gameplay-facing netplay API
-func (nc *NetConnection) readNetInput(i int) [14]bool {
-	if i >= 0 && i < len(nc.buf) {
+func (nc *NetConnection) readNetInput(i int) VirtualFrame {
+	if i >= 0 && i < len(sys.inputRemap) && sys.inputRemap[i] >= 0 && sys.inputRemap[i] < len(nc.buf) {
 		return nc.buf[sys.inputRemap[i]].readNetBuffer()
 	}
-	return [14]bool{}
-}
-
-func (nc *NetConnection) readNetInputAnalog(i int) [6]int8 {
-	if i >= 0 && i < len(nc.buf) {
-		return nc.buf[sys.inputRemap[i]].readNetBufferAnalog()
-	}
-	return [6]int8{}
+	return VirtualFrame{}
 }
 
 func (nc *NetConnection) AnyButton() bool {
 	for _, nb := range nc.buf {
-		if nb.buf[nb.curT&(NETBUF_NUM_FRAMES-1)]&IB_anybutton != 0 {
+		if nb.buf[nb.curT&(NETBUF_NUM_FRAMES-1)].anyButton() {
 			return true
 		}
 	}
 	return false
 }
 
-func (nc *NetConnection) Synchronize() error {
+func (nc *NetConnection) Synchronize() (err error) {
+	// Deferred resynchronization also runs after the user cancels a match.
+	if sys.esc {
+		nc.end()
+		return Error("Netplay session cancelled")
+	}
+	defer func() {
+		// Cancellation during update already closes the session without a warning.
+		if err != nil && !nc.isClosing() {
+			nc.fail(err)
+		}
+	}()
 	if !nc.IsConnected() || nc.st == NS_Error {
 		return Error("Cannot connect to the other player")
 	}
 	// Reset any pending loading rendezvous so it can't interfere with gameplay sync.
-	nc.loadingPhase = LP_Idle
-	nc.Stop()
+	nc.ResetLoadingPhase()
+	if err = nc.Stop(); err != nil {
+		return err
+	}
+	conn := nc.conn
+	if err = conn.SetDeadline(netDeadline(sys.cfg.Netplay.SyncTimeout)); err != nil {
+		return err
+	}
+	defer conn.SetDeadline(time.Time{})
 
 	header, err := sys.synchronizeNetplayConfig(nc)
 	if err != nil {
 		return err
+	}
+	sys.useSessionSetups(nc)
+	if header != nil {
+		header.Setups = sys.replaySetups()
 	}
 	if nc.recording != nil && !nc.headerWritten && header != nil {
 		if err := writeReplayHeader(nc.recording, header); err != nil {
@@ -547,17 +647,16 @@ func (nc *NetConnection) Synchronize() error {
 		for nc.st == NS_Playing {
 			// Check if there are unsent frames
 			if nb.senT < nb.inpT {
-				// Write digital inputs
-				if err := nc.writeI16(int16(nb.buf[nb.senT&(NETBUF_NUM_FRAMES-1)])); err != nil {
+				// Bits 14 and 15 are never set, so a frame can't look like the end marker.
+				f := nb.buf[nb.senT&(NETBUF_NUM_FRAMES-1)]
+				if err := nc.writeI16(int16(f.Buttons)); err != nil {
 					nc.st = NS_Error
 					return
-				} else {
-					// Write analog inputs
-					for j := 0; j < len(nb.axisBuf[nb.senT&(NETBUF_NUM_FRAMES-1)]); j++ {
-						if err = nc.writeI8(nb.axisBuf[nb.senT&(NETBUF_NUM_FRAMES-1)][j]); err != nil {
-							nc.st = NS_Error
-							return
-						}
+				}
+				for _, axis := range f.Axes {
+					if err := nc.writeI8(axis); err != nil {
+						nc.st = NS_Error
+						return
 					}
 				}
 				nb.senT++
@@ -565,7 +664,9 @@ func (nc *NetConnection) Synchronize() error {
 			time.Sleep(time.Millisecond)
 		}
 		// Write termination signal to indicate no more input frames
-		nc.writeI16(-1)
+		if err := nc.writeI16(-1); err != nil {
+			nc.st = NS_Error
+		}
 	})
 
 	// Start receiving inputs from remote peer in a goroutine
@@ -583,42 +684,51 @@ func (nc *NetConnection) Synchronize() error {
 					nc.st = NS_Error
 					return
 				} else {
-					// Read digital inputs
-					nb.buf[nb.inpT&(NETBUF_NUM_FRAMES-1)] = InputBits(tmp)
-					if tmp < 0 {
-						// If remote sent termination signal
+					if tmp == -1 {
+						// The remote peer sent the end marker
 						nc.st = NS_Stopped
 						return
-					} else {
-						// Read analog inputs
-						for j := 0; j < len(nb.axisBuf[nb.inpT&(NETBUF_NUM_FRAMES-1)]); j++ {
-							if tmp2, err := nc.readI8(); err != nil {
-								nc.st = NS_Error
-								return
-							} else {
-								nb.axisBuf[nb.inpT&(NETBUF_NUM_FRAMES-1)][j] = tmp2
-							}
-						}
-						nb.inpT++
-						nb.senT = nb.inpT
 					}
+					if tmp < 0 {
+						nc.st = NS_Error
+						return
+					}
+					b := []byte{byte(tmp), byte(uint16(tmp) >> 8), 0, 0, 0, 0, 0, 0}
+					for j := 2; j < len(b); j++ {
+						axis, err := nc.readI8()
+						if err != nil {
+							nc.st = NS_Error
+							return
+						}
+						b[j] = byte(axis)
+					}
+					nb.buf[nb.inpT&(NETBUF_NUM_FRAMES-1)] = decodeVirtualFrame(b)
+					nb.inpT++
+					nb.senT = nb.inpT
 				}
 			}
 			time.Sleep(time.Millisecond)
 		}
 
-		// There may be padding for the axis buffer so safest to just change this.
-		for tmp := int16(0); tmp != -1; {
-			var err error
-			if tmp, err = nc.readI16(); err != nil {
-				break
-			}
+		// Consume complete frames. Analog bytes may also contain 0xffff;
+		// only a digital-input word can be the termination marker.
+		if err := nc.drainInputs(); err != nil {
+			nc.st = NS_Error
 		}
 	})
 
-	// Update delay-netplay state after sync. Skip rollback-entry samples;
-	// replay frames are appended later from the authoritative GGPO timeline.
-	nc.update(sys.rollback.session == nil)
+	// Only skip the sample before a rollback match. Lua menus consume this
+	// frame too, so their replays must include it.
+	nc.update(!sys.gameRunning || sys.rollback.session == nil)
+	if nc.st == NS_Error {
+		return Error("Netplay input synchronization failed or timed out")
+	}
+	// update pumps window events and can cancel/close TCP while waiting for input.
+	// Do not let runMatch proceed to rollback setup with a closed connection.
+	if sys.esc || sys.gameEnd || nc.isClosing() {
+		nc.end()
+		return Error("Netplay session cancelled")
+	}
 
 	// Log status
 	log.Printf("Network synchronized: seed=%d pmTime=%d time=%d host=%v", seed, pmTime, nc.time, nc.host)
@@ -626,11 +736,30 @@ func (nc *NetConnection) Synchronize() error {
 	return nil
 }
 
+func (nc *NetConnection) drainInputs() error {
+	for {
+		input, err := nc.readI16()
+		if err != nil {
+			return err
+		}
+		if input == -1 {
+			return nil
+		}
+		if input < 0 {
+			return fmt.Errorf("invalid delay netplay input word: %d", input)
+		}
+		if _, err := io.CopyN(io.Discard, nc.conn, REPLAY_INPUT_BYTES-2); err != nil {
+			return err
+		}
+	}
+}
+
 func (nc *NetConnection) ResetLoadingPhase() {
 	if nc == nil {
 		return
 	}
 	nc.loadingPhase = LP_Idle
+	nc.loadingStarted = time.Time{}
 }
 
 func (nc *NetConnection) tryReadU8() (byte, bool, error) {
@@ -654,20 +783,39 @@ func (nc *NetConnection) tryReadU8() (byte, bool, error) {
 }
 
 func (nc *NetConnection) finishLoadingBarrier() {
-	nc.loadingPhase = LP_Idle
+	nc.ResetLoadingPhase()
 	nc.time = 0
+	nc.stoppedStarted = time.Time{}
 	nc.stoppedcnt = 0
 }
 
 // Handshake for both peers finished loading
-func (nc *NetConnection) LoadingReady() (bool, error) {
+func (nc *NetConnection) LoadingReady() (ready bool, err error) {
+	defer func() {
+		if err != nil {
+			nc.fail(err)
+		}
+	}()
 	if sys.esc || sys.gameEnd {
 		return false, nil
 	}
 	if nc == nil || !nc.IsConnected() || nc.st == NS_Error {
 		return false, Error("Cannot connect to the other player")
 	}
-	nc.Stop()
+	if nc.loadingStarted.IsZero() {
+		nc.loadingStarted = time.Now()
+	}
+	if netTimedOut(nc.loadingStarted, sys.cfg.Netplay.LoadingTimeout) {
+		return false, Error("Timed out waiting for the other player to finish loading")
+	}
+	if err := nc.Stop(); err != nil {
+		return false, err
+	}
+	conn := nc.conn
+	if err := conn.SetWriteDeadline(netDeadline(sys.cfg.Netplay.SyncTimeout)); err != nil {
+		return false, err
+	}
+	defer conn.SetWriteDeadline(time.Time{})
 
 	// Host
 	if nc.host {
@@ -752,19 +900,32 @@ func (nc *NetConnection) Update() bool {
 // since it belongs to neither the pre-match replay nor the rollback match replay.
 func (nc *NetConnection) update(recordReplay bool) bool {
 	if nc.st != NS_Stopped {
+		nc.stoppedStarted = time.Time{}
 		nc.stoppedcnt = 0
 	}
 
 	if !sys.gameEnd {
 		switch nc.st {
 		case NS_Stopped:
-			nc.stoppedcnt++
-			if nc.stoppedcnt > 60 {
-				nc.st = NS_End
-				break
+			if platformNetDeadlines {
+				if nc.stoppedStarted.IsZero() {
+					nc.stoppedStarted = time.Now()
+				}
+				if netTimedOut(nc.stoppedStarted, sys.cfg.Netplay.LoadingTimeout) {
+					nc.fail(Error("Timed out waiting for netplay phase transition"))
+					break
+				}
+			} else {
+				// Browser build: 2.4's rule, no deadline (see platformNetDeadlines).
+				nc.stoppedcnt++
+				if nc.stoppedcnt > 60 {
+					nc.st = NS_End
+					break
+				}
 			}
 			fallthrough
 		case NS_Playing:
+			waitStarted := time.Now()
 			for {
 				// Determine the earliest frame that has been processed by both local and remote buffers
 				foo := Min(nc.buf[nc.locIn].senT, nc.buf[nc.remIn].senT)
@@ -786,7 +947,12 @@ func (nc *NetConnection) update(recordReplay bool) bool {
 
 				// Break loop if we have reached the frame that both buffers have sent
 				if nc.time >= foo {
-					if sys.esc || !sys.await(sys.gameRenderSpeed()) || nc.st != NS_Playing {
+					if sys.esc || !sys.await(sys.gameRenderSpeed(), false) || nc.st != NS_Playing {
+						break
+					}
+					// TCP can remain established while packets stop arriving.
+					if netTimedOut(waitStarted, sys.cfg.Netplay.SyncTimeout) {
+						nc.fail(Error("Timed out waiting for netplay input"))
 						break
 					}
 					continue
@@ -800,7 +966,7 @@ func (nc *NetConnection) update(recordReplay bool) bool {
 				if recordReplay && nc.recording != nil {
 					for i := range nc.buf {
 						ringIdx := nc.time & (NETBUF_NUM_FRAMES - 1)
-						if err := writeReplayInput(nc.recording, nc.buf[i].buf[ringIdx], nc.buf[i].axisBuf[ringIdx]); err != nil {
+						if err := writeReplayInput(nc.recording, nc.buf[i].buf[ringIdx]); err != nil {
 							log.Printf("Error while writing replay input for controller %d: %v", i, err)
 							nc.recording = nil
 							break
@@ -909,8 +1075,8 @@ func writeReplaySync(w io.Writer, seed, pmTime int32) error {
 
 type ReplayFile struct {
 	file               *os.File
-	ibit               [REPLAY_NUM_INPUTS]InputBits
-	iaxes              [REPLAY_NUM_INPUTS][6]int8
+	frames             [REPLAY_NUM_INPUTS]VirtualFrame
+	setups             map[int]SessionSetup
 	preMatchTime       int32
 	strictSettings     []SyncSetting
 	hostSettings       []SyncSetting
@@ -943,6 +1109,10 @@ func OpenReplayFile(filename string) *ReplayFile {
 	out.contentFingerprint = header.ContentFingerprint
 	out.roundFadeTime = header.RoundFadeTime
 	out.roundFadeInTime = header.RoundFadeInTime
+	out.setups = make(map[int]SessionSetup)
+	for _, rs := range header.Setups {
+		out.setups[rs.Channel] = newSessionSetup(rs.Setup)
+	}
 
 	log.Printf("Replay file opened: %s", filename)
 	return out
@@ -955,29 +1125,17 @@ func (rf *ReplayFile) Close() {
 	}
 }
 
-// Read input buttons from replay input
-func (rf *ReplayFile) readReplayInput(i int) [14]bool {
-	if i >= 0 && i < len(rf.ibit) {
-		return rf.ibit[sys.inputRemap[i]].BitsToKeys()
+// Read the virtual controller state of a player slot
+func (rf *ReplayFile) readReplayInput(i int) VirtualFrame {
+	if i >= 0 && i < len(sys.inputRemap) && sys.inputRemap[i] >= 0 && sys.inputRemap[i] < len(rf.frames) {
+		return rf.frames[sys.inputRemap[i]]
 	}
-	return [14]bool{}
-}
-
-func (rf *ReplayFile) readReplayInputAnalog(i int) [6]int8 {
-	if i >= 0 && i < len(rf.ibit) {
-		remap := sys.inputRemap[i] // we'll be using this a lot
-
-		// New replay file, read in the axes too
-		if remap >= 0 && remap < len(rf.iaxes) {
-			return rf.iaxes[remap]
-		}
-	}
-	return [6]int8{}
+	return VirtualFrame{}
 }
 
 func (rf *ReplayFile) AnyButton() bool {
-	for _, b := range rf.ibit {
-		if b&IB_anybutton != 0 {
+	for _, f := range rf.frames {
+		if f.anyButton() {
 			return true
 		}
 	}
@@ -1068,17 +1226,15 @@ func (rf *ReplayFile) Update() bool {
 	if rf.file == nil {
 		sys.esc = true
 	} else {
-		if sys.oldNextAddTime > 0 {
+		// The pause menu also pauses the match, but its frames were recorded.
+		if sys.oldNextAddTime > 0 || sys.motif.me.active {
+			rf.frames = [REPLAY_NUM_INPUTS]VirtualFrame{}
 			if rf.atReplaySyncMarker() {
-				rf.ibit = [REPLAY_NUM_INPUTS]InputBits{}
-				rf.iaxes = [REPLAY_NUM_INPUTS][6]int8{}
 				return !sys.gameEnd
 			}
-			rf.ibit = [REPLAY_NUM_INPUTS]InputBits{}
-			rf.iaxes = [REPLAY_NUM_INPUTS][6]int8{}
 
-			for i := 0; i < len(rf.ibit); i++ {
-				if err := readReplayInput(rf.file, &rf.ibit[i], &rf.iaxes[i]); err != nil {
+			for i := 0; i < len(rf.frames); i++ {
+				if err := readReplayInput(rf.file, &rf.frames[i]); err != nil {
 					if err == io.EOF || err == io.ErrUnexpectedEOF {
 						log.Printf("Closing replay file")
 					} else {
@@ -1402,7 +1558,8 @@ func applySyncSettings(cfg *Config, settings []SyncSetting, strict bool) error {
 			log.Printf("Ignoring sync setting %s during best-effort apply: %v", s.Path, err)
 		}
 	}
-	cfg.normalize()
+	// Normalization must not copy temporary host values into the INI.
+	cfg.normalize(false)
 	sys.onSyncConfigChanged()
 	return nil
 }
@@ -1456,6 +1613,8 @@ func (s *System) beginSessionOverride(source string, strict, host []SyncSetting,
 		RoundFadeTime:      roundFadeTime,
 		RoundFadeInTime:    roundFadeInTime,
 	}
+	s.menuChannels = [MaxPlayerNo]MenuChannel{}
+	s.mousePacket = VirtualFrame{}
 	log.Printf("%s sync config override started: strict=%d host=%d fingerprint=%q",
 		strings.Title(source), len(strict), len(host), contentFingerprint)
 	logSyncVerification(strings.Title(source)+" host override verification", host, appliedHost)
@@ -1477,6 +1636,7 @@ func (s *System) endSyncSessionOverride() error {
 	}
 	logSyncVerification(strings.Title(source)+" host restore verification", expected, restoredHost)
 	s.netplayOverride = SessionConfigOverride{}
+	s.sessionSetups = nil
 	return nil
 }
 
@@ -1493,6 +1653,31 @@ func (s *System) currentReplayHeader() *ReplayHeader {
 		RoundFadeTime:      s.netplayOverride.RoundFadeTime,
 		RoundFadeInTime:    s.netplayOverride.RoundFadeInTime,
 	}
+}
+
+// Start with the exchanged setups and keep pause-menu edits between matches.
+func (s *System) useSessionSetups(nc *NetConnection) {
+	if s.sessionSetups != nil {
+		return
+	}
+	host, guest := nc.locIn, nc.remIn
+	if !nc.host {
+		host, guest = guest, host
+	}
+	s.sessionSetups = map[int]SessionSetup{
+		host:  newSessionSetup(s.netplayOverride.HostSetup),
+		guest: newSessionSetup(s.netplayOverride.GuestSetup),
+	}
+}
+
+// Setups stored in the replay header, so playback reads the inputs the same way.
+func (s *System) replaySetups() []ReplaySetup {
+	var out []ReplaySetup
+	for channel, setup := range s.sessionSetups {
+		out = append(out, ReplaySetup{Channel: channel, Setup: setup.definition})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Channel < out[j].Channel })
+	return out
 }
 
 func (s *System) popSessionWarning() string {
@@ -1547,6 +1732,25 @@ func (s *System) applySyncedRoundFade() {
 	}
 }
 
+// Finds a free UDP port for a localhost guest. Best effort: GGPO opens the socket later.
+func pickLoopbackRollbackPort(hostPort int) (int, error) {
+	for i := 0; i < 10; i++ {
+		conn, err := net.ListenUDP("udp4",
+			&net.UDPAddr{IP: net.IPv4zero, Port: 0})
+		if err != nil {
+			return 0, err
+		}
+
+		port := conn.LocalAddr().(*net.UDPAddr).Port
+		conn.Close()
+
+		if port != hostPort {
+			return port, nil
+		}
+	}
+	return 0, fmt.Errorf("could not allocate a distinct UDP port")
+}
+
 func (s *System) synchronizeNetplayConfig(nc *NetConnection) (*ReplayHeader, error) {
 	if s.netplayOverride.Active {
 		return s.currentReplayHeader(), nil
@@ -1563,15 +1767,20 @@ func (s *System) synchronizeNetplayConfig(nc *NetConnection) (*ReplayHeader, err
 	localFingerprint := s.currentContentFingerprint()
 	localRoundFade := s.localRoundFadeTime()
 	localRoundFadeIn := s.localRoundFadeInTime()
+	localRollbackPort := s.cfg.Netplay.Rollback.Port
+	// Peers send their setup's rows, not its name: the same name may bind other buttons.
+	localSetup := s.cfg.ButtonSetup["buttonsetup_"+s.participantSetupID(0)]
 
 	if nc.host {
 		hostPayload := SyncHandshake{
 			SyncVersion:        syncConfigVersion,
 			Strict:             localStrict,
 			Host:               localHost,
+			RollbackPort:       localRollbackPort,
 			ContentFingerprint: localFingerprint,
 			RoundFadeTime:      localRoundFade,
 			RoundFadeInTime:    localRoundFadeIn,
+			Setup:              localSetup,
 		}
 		log.Printf("Netplay sync config host->peer: sending strict=%d host=%d fingerprint=%q",
 			len(localStrict), len(localHost), localFingerprint)
@@ -1597,8 +1806,21 @@ func (s *System) synchronizeNetplayConfig(nc *NetConnection) (*ReplayHeader, err
 		if err := validateContentFingerprint(localFingerprint, guestPayload.ContentFingerprint); err != nil {
 			return nil, err
 		}
+		if s.cfg.Netplay.RollbackNetcode {
+			if localRollbackPort < 1 || localRollbackPort > 65535 {
+				return nil, fmt.Errorf("invalid local rollback UDP port %d", localRollbackPort)
+			}
+			if guestPayload.RollbackPort < 1 || guestPayload.RollbackPort > 65535 {
+				return nil, fmt.Errorf("peer advertised invalid rollback UDP port %d", guestPayload.RollbackPort)
+			}
+		}
 		if err := s.beginSessionOverride("netplay", localStrict, localHost, localFingerprint, localRoundFade, localRoundFadeIn); err != nil {
 			return nil, err
+		}
+		s.netplayOverride.HostSetup, s.netplayOverride.GuestSetup = localSetup, guestPayload.Setup
+		if s.cfg.Netplay.RollbackNetcode {
+			nc.rollbackLocalPort = localRollbackPort
+			nc.rollbackRemotePort = guestPayload.RollbackPort
 		}
 		return s.currentReplayHeader(), nil
 	}
@@ -1614,9 +1836,11 @@ func (s *System) synchronizeNetplayConfig(nc *NetConnection) (*ReplayHeader, err
 		SyncVersion:        syncConfigVersion,
 		Strict:             localStrict,
 		Host:               localHost,
+		RollbackPort:       localRollbackPort,
 		ContentFingerprint: localFingerprint,
 		RoundFadeTime:      localRoundFade,
 		RoundFadeInTime:    localRoundFadeIn,
+		Setup:              localSetup,
 	}
 	sendGuestPayload := func() error {
 		log.Printf("Netplay sync config peer->host ack: sending strict=%d host=%d fingerprint=%q",
@@ -1648,12 +1872,46 @@ func (s *System) synchronizeNetplayConfig(nc *NetConnection) (*ReplayHeader, err
 		}
 		return nil, err
 	}
+	if s.cfg.Netplay.RollbackNetcode {
+		if localRollbackPort < 1 || localRollbackPort > 65535 {
+			if werr := sendGuestPayload(); werr != nil {
+				return nil, werr
+			}
+			return nil, fmt.Errorf("invalid local rollback UDP port %d", localRollbackPort)
+		}
+		if hostPayload.RollbackPort < 1 || hostPayload.RollbackPort > 65535 {
+			if werr := sendGuestPayload(); werr != nil {
+				return nil, werr
+			}
+			return nil, fmt.Errorf("host advertised invalid rollback UDP port %d", hostPayload.RollbackPort)
+		}
+		// Only the localhost guest uses an automatic port: the host retains
+		// its configured port, and remote peers retain their forwarding setup.
+		// The comma-ok keeps a non-TCP stream (the browser's WebRTC channel)
+		// out of this desktop-only path instead of panicking.
+		if tcpAddr, ok := nc.conn.RemoteAddr().(*net.TCPAddr); ok {
+			remoteIP := tcpAddr.IP
+			if remoteIP.To4() != nil && remoteIP.IsLoopback() && localRollbackPort == hostPayload.RollbackPort {
+				localRollbackPort, err = pickLoopbackRollbackPort(hostPayload.RollbackPort)
+				if err != nil {
+					return nil, err
+				}
+				guestPayload.RollbackPort = localRollbackPort
+				log.Printf("Localhost rollback: using UDP port %d instead of %d", localRollbackPort, hostPayload.RollbackPort)
+			}
+		}
+	}
 	if err := s.beginSessionOverride("netplay", hostPayload.Strict, hostPayload.Host, hostPayload.ContentFingerprint, hostPayload.RoundFadeTime, hostPayload.RoundFadeInTime); err != nil {
 		return nil, err
 	}
+	s.netplayOverride.HostSetup, s.netplayOverride.GuestSetup = hostPayload.Setup, localSetup
 
 	if err := sendGuestPayload(); err != nil {
 		return nil, err
+	}
+	if s.cfg.Netplay.RollbackNetcode {
+		nc.rollbackLocalPort = localRollbackPort
+		nc.rollbackRemotePort = hostPayload.RollbackPort
 	}
 
 	return s.currentReplayHeader(), nil
@@ -1663,6 +1921,7 @@ func (s *System) beginReplaySession(rf *ReplayFile) error {
 	if rf == nil {
 		return nil
 	}
+	s.sessionSetups = rf.setups
 	log.Printf("Replay sync header loaded: strict=%d host=%d fingerprint=%q",
 		len(rf.strictSettings), len(rf.hostSettings), rf.contentFingerprint)
 	if len(rf.hostSettings) == 0 && len(rf.strictSettings) == 0 {

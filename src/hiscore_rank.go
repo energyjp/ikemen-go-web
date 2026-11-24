@@ -38,9 +38,9 @@ func defKey(p string) string {
 }
 
 func selectedCharKeys() []string {
-	// side 0 (P1) selection; fall back to empty
+	// Characters of the side running the mode
 	var out []string
-	for _, slot := range sys.sel.selected[0] {
+	for _, slot := range sys.sel.selected[sys.runSideIndex()] {
 		cn := slot[0]
 		if cn >= 0 && cn < len(sys.sel.charlist) {
 			out = append(out, defKey(sys.sel.charlist[cn].def))
@@ -64,6 +64,10 @@ func tallyRun() runTally {
 	matches := sys.statsLog.Matches
 	lastIdx := len(matches) - 1
 	for i, m := range matches {
+		side := m.RunSide
+		if side < 0 || side > 1 {
+			side = 0
+		}
 		// If the last match isn't finalized yet derive its values from live engine state.
 		useLive := false
 		if i == lastIdx && (sys.postMatchFlg || sys.matchOver()) && m.MatchTime == 0 && len(m.Rounds) > 0 {
@@ -76,6 +80,7 @@ func tallyRun() runTally {
 			scoreP1   int
 		)
 		if useLive {
+			side = sys.runSideIndex()
 			// Match time from current engine timers
 			var total int32
 			for _, v := range sys.timerRounds {
@@ -84,27 +89,27 @@ func tallyRun() runTally {
 			matchTime = total
 			// Outcome from current engine state
 			winSide = sys.winTeam
-			p2Wins = sys.wins[1]
+			p2Wins = sys.wins[1-side]
 			// Total score from current engine state (same as StatsLog.finalizeMatch)
 			sc0 := int32(0)
 			if len(sys.scoreStart) > 0 {
-				sc0 = int32(sys.scoreStart[0])
+				sc0 = int32(sys.scoreStart[side])
 			}
 			for _, v := range sys.scoreRounds {
 				if len(v) > 0 {
-					sc0 += int32(v[0])
+					sc0 += int32(v[side])
 				}
 			}
 			scoreP1 = int(sc0)
 		} else {
 			matchTime = m.MatchTime
 			winSide = m.WinSide
-			p2Wins = m.Wins[1]
-			scoreP1 = int(m.TotalScore[0])
+			p2Wins = m.Wins[1-side]
+			scoreP1 = int(m.TotalScore[side])
 		}
 		t.timeTicks += matchTime
 		switch winSide {
-		case 0: // P1 won
+		case side: // Player running the mode won
 			t.winP1++
 			// ConsecutiveWins semantics:
 			// - increments only if opponent won 0 rounds in this match
@@ -114,7 +119,7 @@ func tallyRun() runTally {
 			} else {
 				consec = 0
 			}
-		case 1: // P2 won
+		case 1 - side: // Opponent won
 			t.loseP1++
 			consec = 0
 		default:
@@ -147,7 +152,7 @@ func resultsScreenForMode(mode string) *ResultsScreenProperties {
 }
 
 func modeCleared(mode string, matches int) bool {
-	if sys.winnerTeam() == 1 {
+	if sys.winnerTeam() == int32(sys.runSideIndex()+1) {
 		return true
 	}
 
@@ -174,6 +179,21 @@ func rankingTypeFor(mode string) (string, bool) {
 	return v, ok
 }
 
+// Whether the run can be ranked at all, before comparing it with the saved table.
+// Uses only run data, so netplay peers always agree on it.
+func rankingQualifies(rType string, tal runTally, cleared bool) bool {
+	if (rType == "time" || sys.sel.gameParams.RankingCondition) && !cleared {
+		return false
+	}
+	if rType == "score" && tal.scoreP1 == 0 {
+		return false
+	}
+	if rType == "win" && tal.winP1 == 0 {
+		return false
+	}
+	return true
+}
+
 // Returns true if the just-finished run would produce a ranking entry.
 func rankingWouldPlace(mode string) bool {
 	mode = strings.ToLower(strings.TrimSpace(mode))
@@ -187,15 +207,12 @@ func rankingWouldPlace(mode string) bool {
 	rType = strings.ToLower(strings.TrimSpace(rType))
 	tal := tallyRun()
 	cleared := modeCleared(mode, len(sys.statsLog.Matches))
-	// Ranking exceptions
-	if (rType == "time" || sys.sel.gameParams.RankingCondition) && !cleared {
+	if !rankingQualifies(rType, tal, cleared) {
 		return false
 	}
-	if rType == "score" && tal.scoreP1 == 0 {
-		return false
-	}
-	if rType == "win" && tal.winP1 == 0 {
-		return false
+	// Each netplay peer has its own stats file, so the table can't decide here
+	if sys.netplay() {
+		return true
 	}
 
 	// VisibleItems <= 0 means "no truncation" -> always place.
@@ -249,7 +266,7 @@ func rankingWouldPlace(mode string) bool {
 		Consecutive: tal.consecP1,
 		Name:        "",
 		Chars:       selectedCharKeys(),
-		Tmode:       int32(sys.tmode[0]),
+		Tmode:       int32(sys.tmode[sys.runSideIndex()]),
 		AILevel:     int32(sys.cfg.Options.Difficulty),
 	}
 	entries = append(entries, newE)
@@ -283,6 +300,14 @@ func rankingWouldPlace(mode string) bool {
 	return false
 }
 
+// Writes save/stats.json. A replay plays back a run that was already saved when it was played, so it writes nothing.
+func writeStats(data []byte) error {
+	if sys.replayFile != nil {
+		return nil
+	}
+	return writeStatsPretty(sys.cmdFlags["-stats"], data)
+}
+
 func writeStatsPretty(path string, data []byte) error {
 	var buf bytes.Buffer
 	if err := json.Indent(&buf, data, "", "  "); err == nil {
@@ -293,8 +318,9 @@ func writeStatsPretty(path string, data []byte) error {
 	return os.WriteFile(path, data, 0o644)
 }
 
-// Main entry: computes cleared/placement, writes save/stats.json. Returns (cleared, place).
-func computeAndSaveRanking(mode string) (bool, int32) {
+// Main entry: computes cleared/placement, writes save/stats.json. Returns (cleared, place, nameEntry).
+// nameEntry is also true in netplay when only the other peer placed, so both run the same screen.
+func computeAndSaveRanking(mode string) (bool, int32, bool) {
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	// Tally the just-finished run
 	tal := tallyRun()
@@ -339,23 +365,15 @@ func computeAndSaveRanking(mode string) (bool, int32) {
 	// If hiscore ranking isn't defined for this mode, we're done.
 	rType, ok := rankingTypeFor(mode)
 	if !ok {
-		_ = writeStatsPretty(sys.cmdFlags["-stats"], data)
-		return cleared, 0
+		_ = writeStats(data)
+		return cleared, 0, false
 	}
 	rType = strings.ToLower(strings.TrimSpace(rType))
 
 	// Ranking exceptions
-	if (rType == "time" || sys.sel.gameParams.RankingCondition) && !cleared {
-		_ = writeStatsPretty(sys.cmdFlags["-stats"], data)
-		return cleared, 0
-	}
-	if rType == "score" && tal.scoreP1 == 0 {
-		_ = writeStatsPretty(sys.cmdFlags["-stats"], data)
-		return cleared, 0
-	}
-	if rType == "win" && tal.winP1 == 0 {
-		_ = writeStatsPretty(sys.cmdFlags["-stats"], data)
-		return cleared, 0
+	if !rankingQualifies(rType, tal, cleared) {
+		_ = writeStats(data)
+		return cleared, 0, false
 	}
 
 	// Build existing entries
@@ -393,7 +411,7 @@ func computeAndSaveRanking(mode string) (bool, int32) {
 		Consecutive: tal.consecP1,
 		Name:        "",
 		Chars:       selectedCharKeys(),
-		Tmode:       int32(sys.tmode[0]),
+		Tmode:       int32(sys.tmode[sys.runSideIndex()]),
 		AILevel:     int32(sys.cfg.Options.Difficulty),
 	}
 	entries = append(entries, newE)
@@ -451,7 +469,12 @@ func computeAndSaveRanking(mode string) (bool, int32) {
 	// Serialize back to JSON (preserving other keys)
 	buf, _ := json.Marshal(entries)
 	data, _ = sjson.SetRawBytes(data, rankPath, buf)
-	_ = writeStatsPretty(sys.cmdFlags["-stats"], data)
+	_ = writeStats(data)
 
-	return cleared, place
+	// A replay shows the saved table as it is, since the replayed run is already in it.
+	// Name entry still runs, like for a netplay peer that didn't place, so the inputs end the screen on time.
+	if sys.replayFile != nil {
+		place = 0
+	}
+	return cleared, place, place > 0 || sys.netplay()
 }

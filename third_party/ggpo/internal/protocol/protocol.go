@@ -116,9 +116,13 @@ type UdpProtocol struct {
 
 // Frames a host keeps for one watcher that has not acknowledged them, and the
 // most bytes of input one packet carries (the packet's byte count is a single
-// byte, and one watcher frame is both players' inputs).
+// byte, and one watcher frame is both players' inputs). 480 frames is 8 s:
+// a rematch starts with no versus screen, so a watcher loads it and syncs its
+// line inside this grace, and one lost sync packet costs SyncRetryInterval
+// (2 s); at 240 a watcher 300 ms away with some loss was dropped from most
+// rematches.
 const (
-	SpectatorMaxPendingFrames = 240
+	SpectatorMaxPendingFrames = 480
 	maxInputPacketBytes       = 255
 	// One send to a watcher carries at most this many packets (15 frames each
 	// at 16 bytes a frame, so up to two seconds at 60 fps), oldest first. The
@@ -376,7 +380,7 @@ func (u *UdpProtocol) OnLoopPoll(timeFunc polling.FuncTimeType) bool {
 		}
 		break
 	case RunningState:
-		if u.state.lastInputPacketRecvTime == 0 || u.state.lastInputPacketRecvTime+RunningRetryInterval > now {
+		if u.state.lastInputPacketRecvTime == 0 || u.state.lastInputPacketRecvTime+RunningRetryInterval <= now {
 			util.Log.Printf("Haven't exchanged packets in a while (last received:%d  last sent:%d).  Resending.\n",
 				u.lastRecievedInput.Frame, u.lastSentInput.Frame)
 			err := u.SendPendingOutput()

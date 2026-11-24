@@ -26,7 +26,7 @@ cd "$(dirname "$0")/.."
 # where it is data rather than a hidden build input.
 OUT=bin/ikemen-v2.wasm
 STAMP=bin/ikemen-v2.wasm.build.txt
-BUILD_CMD='GOEXPERIMENT=arenas GOOS=js GOARCH=wasm CGO_ENABLED=0 go build -trimpath -buildvcs=false -o '"$OUT"' ./src'
+BUILD_CMD='GOOS=js GOARCH=wasm CGO_ENABLED=0 go build -trimpath -buildvcs=false -o '"$OUT"' ./src'
 
 # Hash the inputs BEFORE building, so the stamp describes what was compiled even
 # if someone edits a file while the build runs.
@@ -35,7 +35,7 @@ find src third_party -name '*.go' | LC_ALL=C sort > "$srclist"
 tree_hash=$(xargs sha256sum < "$srclist" | sha256sum | cut -d' ' -f1)
 
 echo "building $OUT ..."
-env GOEXPERIMENT=arenas GOOS=js GOARCH=wasm CGO_ENABLED=0 \
+env GOOS=js GOARCH=wasm CGO_ENABLED=0 \
     go build -trimpath -buildvcs=false -o "$OUT" ./src
 
 engine_sha=$(sha256sum "$OUT" | cut -d' ' -f1)

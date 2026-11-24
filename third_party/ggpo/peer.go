@@ -98,6 +98,10 @@ func (p *Peer) Close() error {
 			s.Close()
 		}
 	}
+	// InitializeConnection may succeed before any remote endpoint is added.
+	if p.connection != nil {
+		p.connection.Close()
+	}
 	return nil
 }
 func (p *Peer) Idle(timeout int, timeFunc ...polling.FuncTimeType) error {
@@ -439,6 +443,28 @@ func (p *Peer) CurrentFrame() int {
 	return p.sync.FrameCount()
 }
 
+// Wait for actual inputs before running code that cannot be rolled back.
+func (p *Peer) SyncInputConfirmed(disconnectFlags *int) ([][]byte, error) {
+	if p.synchronizing {
+		return nil, Error{Code: ErrorCodeNotSynchronized, Name: "ErrorCodeNotSynchronized"}
+	}
+	p.sync.CheckSimulation(0)
+	for i := range p.sync.inputQueues {
+		if p.localConnectStatus[i].Disconnected {
+			continue
+		}
+		var frame input.GameInput
+		ok, err := p.sync.inputQueues[i].GetConfirmedInput(p.sync.FrameCount(), &frame)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, Error{Code: ErrorCodePredictionThreshod, Name: "ErrorCodePredictionThreshod"}
+		}
+	}
+	return p.SyncInput(disconnectFlags)
+}
+
 // Maps to top level API AdvanceFrame function
 // sync.IncremenetFrame increments the frame count and saves the
 // current state via user provided callback
@@ -665,9 +691,12 @@ func (p *Peer) DisconnectPlayerQueue(queue int, syncto int) {
 	p.localConnectStatus[queue].Disconnected = true
 	p.localConnectStatus[queue].LastFrame = int32(syncto)
 
-	if syncto < frameCount {
+	// LastFrame may be -1 before the first remote input.
+	// Keep that sentinel out of the saved-state lookup.
+	rollbackFrame := util.Max(syncto, 0)
+	if rollbackFrame < frameCount {
 		util.Log.Printf("adjusting simulation to account for the fact that %d disconnected @ %d.\n", queue, syncto)
-		p.sync.AdjustSimulation(syncto)
+		p.sync.AdjustSimulation(rollbackFrame)
 		util.Log.Printf("Finished adjusting simulation.\n")
 	}
 
@@ -892,7 +921,11 @@ func (p *Peer) CheckDesync() {
 
 func (p *Peer) InitializeConnection(t ...transport.Connection) error {
 	if len(t) == 0 {
-		p.connection = transport.NewUdp(p, p.localPort)
+		connection, err := transport.NewUdp(p, p.localPort)
+		if err != nil {
+			return err
+		}
+		p.connection = connection
 		return nil
 	}
 	p.connection = t[0]

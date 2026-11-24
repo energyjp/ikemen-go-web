@@ -193,8 +193,6 @@ type SelectCharParams struct {
 	ArcadePath    string   `ini:"arcadepath"`
 	Unlock        string   `ini:"unlock"`
 	SlotSelect    string   `ini:"slotselect"`
-	SlotNext      string   `ini:"slotnext"`
-	SlotPrevious  string   `ini:"slotprevious"`
 	Raw           []string `ini:"raw"`
 }
 
@@ -271,10 +269,6 @@ func (p *SelectCharParams) AppendParams(entries []string) {
 			p.Unlock = val
 		case "select":
 			p.SlotSelect = val
-		case "next":
-			p.SlotNext = val
-		case "previous":
-			p.SlotPrevious = val
 		}
 	}
 }
@@ -287,6 +281,7 @@ type SelectStageParams struct {
 	musicEntries []string `ini:"musicentries"`
 	Order        []int32  `ini:"order"`
 	Unlock       string   `ini:"unlock"`
+	SlotSelect   string   `ini:"slotselect"`
 	Raw          []string `ini:"raw"`
 }
 
@@ -319,6 +314,8 @@ func (p *SelectStageParams) AppendParams(entries []string) {
 			p.Order = append(p.Order, Atoi(val))
 		case "unlock":
 			p.Unlock = val
+		case "select":
+			p.SlotSelect = val
 		}
 	}
 }
@@ -351,6 +348,7 @@ type GameParams struct {
 	Time                int32    `ini:"time"`
 	VsScreen            bool     `ini:"vsscreen"`
 	VictoryScreen       bool     `ini:"victoryscreen"`
+	VersusResults       bool     `ini:"versusresults"`
 	WinScreen           bool     `ini:"winscreen"`
 	PauseMenu           bool     `ini:"pausemenu"`
 	RankingCondition    bool     `ini:"rankingcondition"`
@@ -366,6 +364,8 @@ type GameParams struct {
 	CharParamStage      bool     `ini:"charparam.stage"`
 	CharParamTime       bool     `ini:"charparam.time"`
 	TurnsOffset         [2]int32
+	CoopTurns           [2]bool
+	NextChar            int32 `ini:"p2.nextchar"`
 	ocd                 [3][]OverrideCharData
 	Raw                 []string
 }
@@ -382,6 +382,7 @@ func newGameParams() *GameParams {
 		VictoryScreen: true,
 		WinScreen:     true,
 		PauseMenu:     true,
+		NextChar:      -1,
 		ocd: [3][]OverrideCharData{
 			make([]OverrideCharData, 0),
 			make([]OverrideCharData, 0),
@@ -479,6 +480,13 @@ func (p *GameParams) AppendParams(entries []string) {
 			}
 			p.TurnsOffset[1] = v
 			continue
+		case "p1.coopturns", "p2.coopturns":
+			if b, ok := parseBoolLoose(val); ok {
+				p.CoopTurns[Btoi(kl == "p2.coopturns")] = b
+			}
+			continue
+		case "p2.nextchar":
+			p.NextChar = Atoi(val)
 		case "charparam.ai":
 			if b, ok := parseBoolLoose(val); ok {
 				p.CharParamAI = b
@@ -530,6 +538,10 @@ func (p *GameParams) AppendParams(entries []string) {
 		case "victoryscreen":
 			if b, ok := parseBoolLoose(val); ok {
 				p.VictoryScreen = b
+			}
+		case "versusresults":
+			if b, ok := parseBoolLoose(val); ok {
+				p.VersusResults = b
 			}
 		case "winscreen":
 			if b, ok := parseBoolLoose(val); ok {

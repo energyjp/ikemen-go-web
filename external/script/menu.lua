@@ -67,9 +67,9 @@ menu.t_valuename = {
 function menu.f_valueChanged(t, sec)
 	local valueitem = menu[t.itemname] or 1
 	local chk = valueitem
-	if getInput(-1, sec.menu.add.key) then
+	if getAction(-1, sec.menu.add.action) then
 		valueitem = valueitem + 1
-	elseif getInput(-1, sec.menu.subtract.key) then
+	elseif getAction(-1, sec.menu.subtract.action) then
 		valueitem = valueitem - 1
 	end
 	if valueitem > #menu.t_valuename[t.itemname] then
@@ -91,12 +91,22 @@ end
 -- Current pause menu itemname for internal use (key from menu.t_itemname table)
 menu.itemname = ''
 
+function menu.f_finishMatch(action, sec)
+	sndPlay(motif.Snd, sec.cursor.done.snd[1], sec.cursor.done.snd[2], 100, 0, 0, 0, 0, true)
+	if menu.currentMenuId ~= 'rematch' then
+		endMatch()
+	end
+	start[action] = true
+	main.pauseMenuActive = false
+	return false
+end
+
 -- Associative elements table storing functions controlling behaviour of each
 -- pause menu item. Can be appended via external module.
 menu.t_itemname = {
-	--Back
+	-- Back
 	['back'] = function(t, item, cursorPosY, moveTxt, sec)
-		if getInput(-1, sec.menu.done.key) then
+		if getAction(-1, sec.menu.done.action) then
 			if menu.currentMenu[1] == menu.currentMenu[2] then
 				sndPlay(motif.Snd, sec.exit.snd[1], sec.exit.snd[2])
 				menu.pauseExitDelay = gameOption('Input.PauseExitDelay')
@@ -111,155 +121,153 @@ menu.t_itemname = {
 		end
 		return true
 	end,
-	--Dummy Control
+	-- Dummy Control
 	['dummycontrol'] = function(t, item, cursorPosY, moveTxt, sec)
 		local ok, name = menu.f_valueChanged(t.items[item], sec)
 		if ok then
 			if name == 'cooperative' or name == 'manual' then
-				player(2)
+				player(main.opponentSide)
 				setAILevel(0)
 			elseif name == 'ai' then
-				player(2)
+				player(main.opponentSide)
 				setAILevel(menu.ailevel)
 			end
-			player(2)
+			player(main.opponentSide)
 			mapSet('_iksys_trainingDummyControl', menu.dummycontrol - 1)
 		end
 		return true
 	end,
-	--AI Level
+	-- AI Level
 	['ailevel'] = function(t, item, cursorPosY, moveTxt, sec)
 		if menu.f_valueChanged(t.items[item], sec) then
 			if menu.t_valuename.dummycontrol[menu.dummycontrol or 1].itemname == 'ai' then
-				player(2)
+				player(main.opponentSide)
 				setAILevel(menu.ailevel)
 			end
 		end
 		return true
 	end,
-	--Dummy Mode
+	-- Dummy Mode
 	['dummymode'] = function(t, item, cursorPosY, moveTxt, sec)
 		if menu.f_valueChanged(t.items[item], sec) then
-			player(2)
+			player(main.opponentSide)
 			mapSet('_iksys_trainingDummyMode', menu.dummymode - 1)
 		end
 		return true
 	end,
-	--Guard Mode
+	-- Guard Mode
 	['guardmode'] = function(t, item, cursorPosY, moveTxt, sec)
 		if menu.f_valueChanged(t.items[item], sec) then
-			player(2)
+			player(main.opponentSide)
 			mapSet('_iksys_trainingGuardMode', menu.guardmode - 1)
 		end
 		return true
 	end,
-	--Fall Recovery
+	-- Fall Recovery
 	['fallrecovery'] = function(t, item, cursorPosY, moveTxt, sec)
 		if menu.f_valueChanged(t.items[item], sec) then
-			player(2)
+			player(main.opponentSide)
 			mapSet('_iksys_trainingFallRecovery', menu.fallrecovery - 1)
 		end
 		return true
 	end,
-	--Distance
+	-- Distance
 	['distance'] = function(t, item, cursorPosY, moveTxt, sec)
 		if menu.f_valueChanged(t.items[item], sec) then
-			player(2)
+			player(main.opponentSide)
 			mapSet('_iksys_trainingDistance', menu.distance - 1)
 		end
 		return true
 	end,
-	--Button Jam
+	-- Button Jam
 	['buttonjam'] = function(t, item, cursorPosY, moveTxt, sec)
 		if menu.f_valueChanged(t.items[item], sec) then
-			player(2)
+			player(main.opponentSide)
 			mapSet('_iksys_trainingButtonJam', menu.buttonjam - 1)
 		end
 		return true
 	end,
-	--Key Config
-	['keyboard'] = function(t, item, cursorPosY, moveTxt, sec)
-		if getInput(-1, sec.menu.done.key) then
+	-- Button Setup of the player who paused, the same editor as in Options
+	['menuinput'] = function(t, item, cursorPosY, moveTxt, sec, bg)
+		if getAction(-1, sec.menu.done.action) then
 			sndPlay(motif.Snd, sec.cursor.done.snd[1], sec.cursor.done.snd[2])
-			options.f_keyCfgInit('Keys', t.submenu[t.items[item].itemname].title)
-			menu.itemname = t.items[item].itemname
+			options.f_pauseSetup(bg, menu.player, sec.overlay)
+			menu.itemname = 'inputconfig'
 		end
 		return true
 	end,
-	--Joystick Config
-	['gamepad'] = function(t, item, cursorPosY, moveTxt, sec)
-		if getInput(-1, sec.menu.done.key) then
+	-- Controller Mapping of the player who paused
+	['controllermapping'] = function(t, item, cursorPosY, moveTxt, sec, bg)
+		if getAction(-1, sec.menu.done.action) then
 			sndPlay(motif.Snd, sec.cursor.done.snd[1], sec.cursor.done.snd[2])
-			options.f_keyCfgInit('Joystick', t.submenu[t.items[item].itemname].title)
-			menu.itemname = t.items[item].itemname
+			options.f_pauseMapping(bg, menu.player, sec.overlay)
+			menu.itemname = 'inputconfig'
 		end
 		return true
 	end,
-	--Default
-	['inputdefault'] = function(t, item, cursorPosY, moveTxt, sec)
-		if getInput(-1, sec.menu.done.key) then
-			sndPlay(motif.Snd, sec.cursor.done.snd[1], sec.cursor.done.snd[2])
-			options.f_keyDefault()
-			options.f_setKeyConfig('Keys')
-			if getCommandLineValue("-nojoy") == nil then
-				options.f_setKeyConfig('Joystick')
-			end
-			options.f_saveCfg(false)
-		end
-		return true
-	end,
-	--Round Reset
+	-- Round Reset
 	['reset'] = function(t, item, cursorPosY, moveTxt, sec)
-		if getInput(-1, sec.menu.done.key) then
+		if getAction(-1, sec.menu.done.action) then
 			sndPlay(motif.Snd, sec.cursor.done.snd[1], sec.cursor.done.snd[2])
-			--togglePause(false)
+			-- togglePause(false)
 			resetRound()
 			main.pauseMenuActive = false
 			return false
 		end
 		return true
 	end,
-	--Reload (Rematch)
+	-- Restart the current fight
 	['reload'] = function(t, item, cursorPosY, moveTxt, sec)
-		if getInput(-1, sec.menu.done.key) then
+		if getAction(-1, sec.menu.done.action) then
+			if menu.currentMenuId == 'rematch' then
+				return menu.f_finishMatch('rematch', sec)
+			end
 			sndPlay(motif.Snd, sec.cursor.done.snd[1], sec.cursor.done.snd[2])
-			--togglePause(false)
+			-- togglePause(false)
 			reload()
 			main.pauseMenuActive = false
 			return false
 		end
 		return true
 	end,
-	--Command List
+	['rematch'] = function(t, item, cursorPosY, moveTxt, sec)
+		if getAction(-1, sec.menu.done.action) then
+			return menu.f_finishMatch('rematch', sec)
+		end
+		return true
+	end,
+	['orderselect'] = function(t, item, cursorPosY, moveTxt, sec)
+		if getAction(-1, sec.menu.done.action) then
+			return menu.f_finishMatch('orderselect', sec)
+		end
+		return true
+	end,
+	['stageselect'] = function(t, item, cursorPosY, moveTxt, sec)
+		if getAction(-1, sec.menu.done.action) then
+			return menu.f_finishMatch('stageselect', sec)
+		end
+		return true
+	end,
+	-- Command List
 	['commandlist'] = function(t, item, cursorPosY, moveTxt, sec)
-		if getInput(-1, sec.menu.done.key) then
+		if getAction(-1, sec.menu.done.action) then
 			sndPlay(motif.Snd, sec.cursor.done.snd[1], sec.cursor.done.snd[2])
-			menu.f_commandlistParse()
+			menu.f_commandlistParse(sec)
 			menu.itemname = t.items[item].itemname
 		end
 		return true
 	end,
-	--Character Change
+	-- Character Change
 	['characterchange'] = function(t, item, cursorPosY, moveTxt, sec)
-		if getInput(-1, sec.menu.done.key) then
-			sndPlay(motif.Snd, sec.cursor.done.snd[1], sec.cursor.done.snd[2])
-			--togglePause(false)
-			endMatch()
-			start.characterchange = true
-			main.pauseMenuActive = false
-			return false
+		if getAction(-1, sec.menu.done.action) then
+			return menu.f_finishMatch('characterchange', sec)
 		end
 		return true
 	end,
-	--Exit
+	-- Exit
 	['exit'] = function(t, item, cursorPosY, moveTxt, sec)
-		if getInput(-1, sec.menu.done.key) then
-			sndPlay(motif.Snd, sec.cursor.done.snd[1], sec.cursor.done.snd[2])
-			--togglePause(false)
-			endMatch()
-			start.exit = true
-			main.pauseMenuActive = false
-			return false
+		if getAction(-1, sec.menu.done.action) then
+			return menu.f_finishMatch('exit', sec)
 		end
 		return true
 	end,
@@ -281,10 +289,29 @@ function menu.f_createMenu(tbl, sec, bg, bool_main)
 			main.f_menuItemBgAnimReset(sec)
 		end
 		local t = tbl.items
+		if #t == 0 then
+			main.pauseMenuActive = false
+			return
+		end
 		if tbl.reset then
 			tbl.reset = false
 		else
-			main.f_menuCommonDraw(t, tbl.item, tbl.cursorPosY, tbl.moveTxt, sec, bg, true)
+			local name = t[tbl.item].itemname
+			local hintContext = options.f_hintContext(t[tbl.item])
+			if menu.t_valuename[name] ~= nil then
+				hintContext = 'adjust'
+			end
+			local actions = nil
+			if options.t_itemname[name] ~= nil and menu.t_itemname[name] == options.t_itemname[name] then
+				-- Imported Options handlers still read their own action keys.
+				actions = {
+					['menu.done'] = motif.option_info.menu.done.action,
+					['menu.add'] = motif.option_info.menu.add.action,
+					['menu.subtract'] = motif.option_info.menu.subtract.action,
+				}
+			end
+			main.f_menuCommonDraw(t, tbl.item, tbl.cursorPosY, tbl.moveTxt, sec, bg, true,
+				{hintContext = hintContext, hintActions = actions})
 		end
 		-- Draw during fades, but don't accept menu input until they finish.
 		if not main.pauseMenuActive or fadeActive() or menu.pauseExitDelay >= 0 then
@@ -293,7 +320,7 @@ function menu.f_createMenu(tbl, sec, bg, bool_main)
 		tbl.cursorPosY, tbl.moveTxt, tbl.item = main.f_menuCommonCalc(t, tbl.item, tbl.cursorPosY, tbl.moveTxt, sec, sec.cursor)
 		textImgReset(sec.title.TextSpriteData)
 		textImgSetText(sec.title.TextSpriteData, tbl.title)
-		if esc() or getInput(-1, sec.menu.cancel.key) then
+		if esc() or getAction(-1, sec.menu.cancel.action) then
 			if bool_main then
 				sndPlay(motif.Snd, sec.exit.snd[1], sec.exit.snd[2])
 				menu.pauseExitDelay = gameOption('Input.PauseExitDelay')
@@ -306,16 +333,16 @@ function menu.f_createMenu(tbl, sec, bg, bool_main)
 			menu.currentMenu[1] = menu.currentMenu[2]
 			return
 		elseif menu.t_itemname[t[tbl.item].itemname] ~= nil then
-			if not menu.t_itemname[t[tbl.item].itemname](tbl, tbl.item, tbl.cursorPosY, tbl.moveTxt, sec) then
+			if not menu.t_itemname[t[tbl.item].itemname](tbl, tbl.item, tbl.cursorPosY, tbl.moveTxt, sec, bg) then
 				return
 			end
-		elseif getInput(-1, sec.menu.done.key) then
+		elseif getAction(-1, sec.menu.done.action) then
 			local f = t[tbl.item].itemname
 			if tbl.submenu[f].loop ~= nil then
 				sndPlay(motif.Snd, sec.cursor.done.snd[1], sec.cursor.done.snd[2])
 				menu.currentMenu[1] = tbl.submenu[f].loop
 				main.f_menuSnap(sec)
-			elseif not menu.t_itemname[f](tbl, tbl.item, tbl.cursorPosY, tbl.moveTxt, sec) then
+			elseif not menu.t_itemname[f](tbl, tbl.item, tbl.cursorPosY, tbl.moveTxt, sec, bg) then
 				return
 			end
 		end
@@ -367,6 +394,7 @@ end
 menu.t_menus = {
 	{id = 'menu', sec = motif.pause_menu.pause_menu, bg = motif.pausebgdef.pausebgdef, movelist = true},
 	{id = 'training', sec = motif.pause_menu.training_pause_menu, bg = motif.pausebgdef.trainingpausebgdef, movelist = true},
+	{id = 'rematch', sec = motif.rematch_info, movelist = true},
 }
 menu.t_menuIndex = {}
 
@@ -441,13 +469,12 @@ function menu.f_start()
 			items = {}
 		}
 		menu[v.id].loop = menu.f_createMenu(menu[v.id], v.sec, v.bg, true)
-		local w = main.f_menuWindow(v.sec.menu)
-		local t_pos = {} --for storing current table position
+		local t_pos = {} -- for storing current table position
 		local lastNum = 0
 		for i, suffix in ipairs(v.sec.menu.itemname_order) do
-			for j, c in ipairs(main.f_strsplit('_', suffix)) do --split using "_" delimiter
-				--appending the menu table
-				if j == 1 then --first string after menu.itemname (either reserved one or custom submenu assignment)
+			for j, c in ipairs(main.f_strsplit('_', suffix)) do -- split using "_" delimiter
+				-- appending the menu table
+				if j == 1 then -- first string after menu.itemname (either reserved one or custom submenu assignment)
 					if menu[v.id].submenu[c] == nil or c:match("^spacer%d*$") then
 						menu[v.id].submenu[c] = {}
 						menu[v.id].submenu[c].title = main.f_itemnameUpper(v.sec.menu.itemname[suffix], v.sec.menu.title.uppercase)
@@ -472,7 +499,11 @@ function menu.f_start()
 					end
 					t_pos = menu[v.id].submenu[c]
 					t_pos.name = c
-				else --following strings
+				else -- following strings
+					-- Parent is an action item, not a submenu.
+					if t_pos.submenu == nil then
+						break
+					end
 					if t_pos.submenu[c] == nil or c:match("^spacer%d*$") then
 						t_pos.submenu[c] = {}
 						t_pos.submenu[c].title = main.f_itemnameUpper(v.sec.menu.itemname[suffix], v.sec.menu.title.uppercase)
@@ -508,34 +539,10 @@ function menu.f_start()
 			main.f_prunePointers(menu.t_vardisplayPointers, excluded)
 		end
 		-- Menu windows
-		textImgSetWindow(v.sec.menu.item.selected.active.TextSpriteData, w[1], w[2], w[3], w[4])
-		textImgSetWindow(v.sec.menu.item.active.TextSpriteData, w[1], w[2], w[3], w[4])
-		textImgSetWindow(v.sec.menu.item.value.active.TextSpriteData, w[1], w[2], w[3], w[4])
-		textImgSetWindow(v.sec.menu.item.selected.TextSpriteData, w[1], w[2], w[3], w[4])
-		textImgSetWindow(v.sec.menu.item.TextSpriteData, w[1], w[2], w[3], w[4])
-		textImgSetWindow(v.sec.menu.item.value.TextSpriteData, w[1], w[2], w[3], w[4])
-		--for _, v2 in pairs(v.sec.menu.item.bg) do
-		--	animSetWindow(v2.AnimData, w[1], w[2], w[3], w[4])
-		--end
-		--for _, v2 in pairs(v.sec.menu.item.active.bg) do
-		--	animSetWindow(v2.AnimData, w[1], w[2], w[3], w[4])
-		--end
+		main.f_menuWindowSet(v.sec.menu)
 		if gameOption('Debug.DumpLuaTables') then main.f_printTable(menu[v.id], 'debug/t_' .. v.id .. 'Menu.txt') end
-		-- Move list
 		if v.movelist then
-			local t = v.sec.movelist
-			if t.window.margins.y[1] ~= 0 or t.window.margins.y[2] ~= 0 then
-				local fontProps = motif.files.font['font' .. v.sec.movelist.text.font[1]]
-				if fontProps ~= nil then
-					menu.movelistW = {
-						0,
-						math.max(0, t.pos[2] + t.text.offset[2] - t.window.margins.y[1]),
-						t.pos[1] + t.text.offset[1] + t.window.width,
-						t.pos[2] + t.text.offset[2] + (t.window.visibleitems - 1) * main.f_round((fontProps.size[2] + fontProps.spacing[2]) * t.text.scale[2] + t.text.spacing[2]) + t.window.margins.y[2] + math.max(0, t.glyphs.offset[2])
-					}
-					textImgSetWindow(t.text.TextSpriteData, menu.movelistW[1], menu.movelistW[2], menu.movelistW[3], menu.movelistW[4])
-				end
-			end
+			main.f_menuWindowSet(v.sec.movelist.menu, true)
 		end
 	end
 end
@@ -549,13 +556,13 @@ function menu.f_trainingReset()
 	for _, v in ipairs(menu.t_vardisplayPointers) do
 		v.vardisplay = menu.f_vardisplay(v.itemname)
 	end
-	player(2)
+	player(main.opponentSide)
 	setAILevel(0)
 end
 
 hook.add('loop#training', 'trainingSettings', function()
 	if not roundStart() then return end
-	player(2)
+	player(main.opponentSide)
 	setAILevel(menu.dummycontrol == 2 and menu.ailevel or 0)
 	mapSet('_iksys_trainingDummyControl', menu.dummycontrol - 1)
 	mapSet('_iksys_trainingDummyMode', menu.dummymode - 1)
@@ -566,18 +573,26 @@ hook.add('loop#training', 'trainingSettings', function()
 end)
 
 menu.movelistChar = 1
-function menu.f_init()
+-- player: 1-based player who opened the menu. The title can show it with %s.
+function menu.f_init(player, id)
 	esc(false)
+	menu.player = player or 1
 	main.pauseMenuActive = true
-	bgReset(motif.optionbgdef.BGDef)
-	local id = f_pauseMenuIdFromKey(f_pauseMenuKey(gameMode()))
+	if id == nil or id == '' then
+		id = f_pauseMenuIdFromKey(f_pauseMenuKey(gameMode()))
+	end
 	if id == '' or menu.t_menuIndex == nil or menu.t_menuIndex[id] == nil then
 		id = 'menu'
 	end
 	if menu.t_menuIndex ~= nil and menu.t_menuIndex[id] ~= nil then
 		local entry = menu.t_menuIndex[id]
+		if menu[id] ~= nil then
+			menu[id].title = main.f_itemnameUpper(entry.sec.title.text:gsub('%%s', tostring(player or 1)), entry.sec.menu.title.uppercase)
+		end
 		sndPlay(motif.Snd, entry.sec.enter.snd[1], entry.sec.enter.snd[2])
-		bgReset(entry.bg.BGDef)
+		if entry.bg ~= nil then
+			bgReset(entry.bg.BGDef)
+		end
 		if menu[id] ~= nil and menu[id].loop ~= nil then
 			menu.currentMenu = {menu[id].loop, menu[id].loop}
 			menu.currentMenuId = id
@@ -590,6 +605,24 @@ function menu.f_init()
 		bgReset(motif.pausebgdef.pausebgdef.BGDef)
 		menu.currentMenu = {menu.menu.loop, menu.menu.loop}
 		menu.currentMenuId = 'menu'
+	end
+	if netPlay() then
+		-- Only shared match actions, session setup edits and Controller Mapping are available online.
+		local allowed = {back = true, commandlist = true, menuinput = true, controllermapping = true, characterchange = true,
+			rematch = true, orderselect = true, stageselect = true, exit = true}
+		local root = menu[menu.currentMenuId]
+		local entry = menu.t_menuIndex[menu.currentMenuId]
+		local online = {title = root.title, item = 1, cursorPosY = 1, moveTxt = 0, items = {}, submenu = {}}
+		for _, row in ipairs(root.items) do
+			if allowed[row.itemname] then
+				table.insert(online.items, row)
+			end
+		end
+		if #online.items == 0 then
+			table.insert(online.items, {itemname = 'back', displayname = entry.sec.menu.itemname.back or 'Continue'})
+		end
+		local loop = menu.f_createMenu(online, entry.sec, entry.bg, true)
+		menu.currentMenu = {loop, loop}
 	end
 end
 
@@ -611,32 +644,41 @@ function menu.f_run()
 	end
 	local sec = motif.pause_menu.pause_menu
 	local bg = motif.pausebgdef.pausebgdef
-	if entry ~= nil and entry.sec ~= nil and entry.bg ~= nil then
+	if entry ~= nil and entry.sec ~= nil then
 		sec = entry.sec
 		bg = entry.bg
 	end
-	--draw overlay
-	rectDraw(sec.overlay.RectData)
-	--pause exit delay
+	-- draw overlay
+	if menu.currentMenuId ~= 'rematch' then
+		rectDraw(sec.overlay.RectData)
+	end
+	-- pause exit delay
 	if menu.pauseExitDelay >= 0 then
 		if menu.pauseExitDelay > 0 then
 			menu.pauseExitDelay = menu.pauseExitDelay - 1
 		else
 			-- Keep the game paused. Go owns the fade-out/fade-in handoff and unpauses afterwards.
+			-- Leaving the rematch menu goes back to the select screen.
+			if menu.currentMenuId == 'rematch' then
+				start.characterchange = true
+			end
 			main.pauseMenuActive = false
 		end
 	end
-	--Button Config
-	if menu.itemname == 'keyboard' or menu.itemname == 'gamepad' then
-		if menu.itemname == 'keyboard' then
-			options.f_keyCfg('Keys', menu.itemname, bg, true)
-		else
-			options.f_keyCfg('Joystick', menu.itemname, bg, true)
+	-- Input configuration uses the active pause background and the overlay above.
+	if menu.itemname == 'inputconfig' then
+		if options.inputContext == nil or not options.f_inputConfigFrame(options.inputContext) then
+			-- Online, only a Controller Mapping edit is saved, see applyEditor.
+			if options.inputContext ~= nil and (options.inputContext.sessionPlayer == nil or options.modified) then
+				options.f_saveCfg(false)
+			end
+			options.inputContext = nil
+			menu.itemname = ''
 		end
-	--Command List
+	-- Command List
 	elseif menu.itemname == 'commandlist' then
-		menu.f_commandlistRender(sec, menu.t_movelists[menu.movelistChar])
-	--Menu
+		menu.f_commandlistRender(sec, bg)
+	-- Menu
 	else
 		menu.currentMenu[1]()
 	end
@@ -672,9 +714,15 @@ end
 
 function menu.f_reset()
 	-- exit any special screens rendered by menu.f_run()
+	if options.inputContext ~= nil then
+		options.inputContext.closed = true
+		options.f_inputConfigFrame(options.inputContext)
+		options.inputContext = nil
+	end
 	menu.itemname = ''
 	-- Reset movelist selector (command list screen)
 	menu.movelistChar = 1
+	menu._lastMovelist = nil
 	-- Reset tween caches
 	if menu.t_menus ~= nil then
 		for i = 1, #menu.t_menus do
@@ -682,6 +730,10 @@ function menu.f_reset()
 			if sec ~= nil then
 				sec.menuTweenData = nil
 				sec.boxCursorData = nil
+				if sec.movelist ~= nil then
+					sec.movelist.menuTweenData = nil
+					sec.movelist.boxCursorData = nil
+				end
 			end
 		end
 	end
@@ -703,8 +755,8 @@ function menu.f_reset()
 	end
 end
 
-function menuInit()
-	return menu.f_init()
+function menuInit(player, id)
+	return menu.f_init(player, id)
 end
 
 function menuRun()
@@ -718,252 +770,443 @@ end
 --;===========================================================
 --; COMMAND LIST
 --;===========================================================
-function colorFromHex(h)
-	h = tostring(h)
-	if h:sub(0, 1) =="#" then h = h:sub(2, -1) end
-	if h:sub(0, 2) =="0x" then h = h:sub(3, -1) end
-	local r = tonumber(h:sub(1, 2), 16) or 255
-	local g = tonumber(h:sub(3, 4), 16) or 255
-	local b = tonumber(h:sub(5, 6), 16) or 255
-	local src = tonumber(h:sub(7, 8), 16) or 255
-	local dst = tonumber(h:sub(9, 10), 16) or 0
-	return {r = r, g = g, b = b, src = src, dst = dst}
-end
-
-local function f_commandlistData(t, str, align, col)
-	local t_insert = {}
-	str = str .. '<#>'
-	for m1, m2 in str:gmatch('(.-)<([^<>%s]+)>') do
-		if m1 ~= '' then
-			table.insert(t_insert, {glyph = false, text = m1, align = align, col = col})
-		end
-		m2 = m2:gsub('&lt;', '<'):gsub('&gt;', '>'):gsub('&amp;', '&')
-		if not m2:match('^#[A-Za-z0-9]+$') and not m2:match('^/$') and not m2:match('^#$') then
-			table.insert(t_insert, {glyph = true, text = m2, align = align, col = col})
-		elseif m2:match('^#[A-Za-z0-9]+$') then
-			col = colorFromHex(m2)
-		elseif m2:match('^/$') then
-			col = {}
+-- Whether a movelist line has a glyph tag. Color tags don't count.
+local function hasGlyph(line)
+	for tag in line:gmatch('<([^<>]+)>') do
+		if tag ~= '/' and not tag:match('^#') and not tag:match('^color:') then
+			return true
 		end
 	end
-	if align == -1 then
-		for i = #t_insert, 1, -1 do
-			table.insert(t, t_insert[i])
-		end
-	else
-		for i = 1, #t_insert do
-			table.insert(t, t_insert[i])
-		end
-	end
-	return t, col
+	return false
 end
 
-function menu.f_commandlistParse()
+-- Turns the text of one movelist page into menu rows. Returns nil for an empty page.
+local function f_movelistRows(movelist)
+	if not movelist:find('%S') then
+		return nil
+	end
+	-- wrap the plain glyph names in <>, but leave existing tags alone
+	for k, v in main.f_sortKeys(motif.glyphs, function(t, a, b) return string.len(a) > string.len(b) end) do
+		if k:sub(1, 1) ~= '<' then
+			local escaped = k:gsub('&', '&amp;'):gsub('<', '&lt;'):gsub('>', '&gt;')
+			movelist = main.f_textTransform(movelist, function(text)
+				return (text:gsub(main.f_escapePattern(k), function() return '<' .. escaped .. '>' end))
+			end)
+		end
+	end
+	local t = {}
+	movelist = movelist:gsub('\r\n', '\n'):gsub('\n$', '')
+	for line in (movelist .. '\n'):gmatch('(.-)\n') do
+		line = line:gsub('%s+$', '')
+		local spacer
+		line, spacer = line:gsub('^<spacer>', '')
+		local subt = {}
+		for m in line:gmatch('(	*[^	]+)') do
+			local tabs = 0
+			m = m:gsub('^(	*)', function(m1)
+				tabs = string.len(m1)
+				return ''
+			end)
+			local align = 1 -- left align
+			if tabs == 1 then
+				align = 0 -- center align
+			elseif tabs > 1 then
+				align = -1 -- right align
+			end
+			table.insert(subt, {text = m, align = align})
+		end
+		table.insert(t, {
+			itemname = ((spacer > 0 or not hasGlyph(line)) and 'spacer' or '') .. tostring(#t + 1),
+			paramname = tostring(#t + 1),
+			displayname = line,
+			columns = subt,
+		})
+	end
+	return t
+end
+
+function menu.f_commandlistParse(sec)
 	menu.t_movelists = {}
+	local function slot(side, member)
+		return side + (member - 1) * 2
+	end
+	-- With only CPU fighters, every fighter's list can be viewed.
+	local allCpu = true
+	for side, tbl in ipairs({start.p[1].t_selected, start.p[2].t_selected}) do
+		for member in ipairs(tbl) do
+			if player(slot(side, member)) and aiLevel() == 0 then
+				allCpu = false
+			end
+		end
+	end
+	-- Otherwise characters played with the menu owner's controls, e.g. both members in single player Tag,
+	-- and their CPU partners. Other human players open their own pause menu.
+	local owner = getMenuPlayer()
+	local ownerInput = owner > 0 and getRemapInput(owner) or 0
+	local function controlledByOwner(side, pn)
+		-- Turns keeps the active fighter in P1/P2, but a later co-op member
+		-- reads the input slot of the player who selected that member.
+		if start.f_coopSide(side) and teamMode() == 'turns' then
+			pn = slot(side, memberNo())
+		end
+		return ownerInput == 0 or getRemapInput(pn) == ownerInput
+	end
+	local ownerSide = {}
+	for side, tbl in ipairs({start.p[1].t_selected, start.p[2].t_selected}) do
+		for member in ipairs(tbl) do
+			local pn = slot(side, member)
+			if player(pn) and aiLevel() == 0 and controlledByOwner(side, pn) then
+				ownerSide[side] = true
+			end
+		end
+	end
 	for side, tbl in ipairs({start.p[1].t_selected, start.p[2].t_selected}) do
 		for member, sel in ipairs(tbl) do
-			if sel.movelistLine == nil then
-				sel.movelistLine = 1
-			end
-			local pn = side
-			if member > 1 then
-				pn = pn + (member - 1) * 2
-			end
-			if player(pn) and aiLevel() == 0 then
-				local movelist = getMovelist()
-				if sel.movelistText ~= movelist then
-					sel.movelistText = movelist
-					sel.commandlist = nil
-					sel.movelistLine = 1
-					if movelist ~= '' then
-						-- Replace glyph tokens with <token> for later lookup in motif.glyphs.
-						for k, v in main.f_sortKeys(motif.glyphs, function(t, a, b) return string.len(a) > string.len(b) end) do
-							local s = movelist
-							movelist = s:gsub('()' .. main.f_escapePattern(k), function(pos)
-								-- If the match starts immediately after a '<', it's already inside a tag.
-								-- Leave it unchanged to prevent nested replacements.
-								if pos > 1 and s:sub(pos - 1, pos - 1) == '<' then
-									return k
-								end
-								local escaped = k:gsub('&', '&amp;'):gsub('<', '&lt;'):gsub('>', '&gt;')
-								return '<' .. escaped .. '>'
-							end)
+			local pn = slot(side, member)
+			if player(pn) and (allCpu or aiLevel() == 0 and controlledByOwner(side, pn) or aiLevel() > 0 and ownerSide[side]) then
+				if teamMode() == 'turns' then
+					sel = tbl[memberNo()] or sel
+				end
+				local texts = {}
+				local first, count = getMovelist(1)
+				texts[1] = first
+				for page = 2, count do
+					texts[page] = (getMovelist(page))
+				end
+				-- Parse again only when the text changed, e.g. after ChangeMovelist.
+				local key = table.concat(texts, '\0')
+				if sel.movelistText ~= key then
+					sel.movelistText = key
+					sel.movelistPages = {current = 1}
+					for _, text in ipairs(texts) do
+						local rows = f_movelistRows(text)
+						if rows ~= nil then
+							table.insert(sel.movelistPages, {items = rows, state = {item = 1, cursorPosY = 1, moveTxt = 0}})
 						end
-						local t = {}
-						local col = {}
-						for line in movelist:gmatch('([^\n]*)\n?') do
-							line = line:gsub('%s+$', '')
-							local subt = {}
-							for m in line:gmatch('(	*[^	]+)') do
-								local tabs = 0
-								m = m:gsub('^(	*)', function(m1)
-									tabs = string.len(m1)
-									return ''
-								end)
-								local align = 1 --left align
-								if tabs == 1 then
-									align = 0 --center align
-								elseif tabs > 1 then
-									align = -1 --right align
-								end
-								subt, col = f_commandlistData(subt, m, align, col)
-							end
-							table.insert(t, subt)
-						end
-						t[#t] = nil --blank line produced by regexp matching
-						sel.commandlist = t
 					end
 				end
 				table.insert(menu.t_movelists, {
 					pn = pn,
 					name = displayName(),
-					tbl = sel,
-					commandlist = sel.commandlist,
+					pages = sel.movelistPages,
 				})
 			end
 		end
 	end
 	if #menu.t_movelists == 0 then
-		table.insert(menu.t_movelists, {
-			pn = 1,
-			name = "",
-			tbl = {movelistLine = 1},
-			commandlist = nil,
-		})
+		table.insert(menu.t_movelists, {pn = 1, name = "", pages = {current = 1}})
 	end
+	for _, t in ipairs(menu.t_movelists) do
+		-- Page art is only drawn for pages that exist.
+		t.found = #t.pages > 0
+		if not t.found then
+			-- Left aligned like a command list line. The text sprite keeps the last row's alignment.
+			local text = sec.movelist.menu.item.text
+			t.pages = {current = 1, {
+				items = {{itemname = 'empty', paramname = 'empty', displayname = text, columns = {{text = text, align = 1}}}},
+				state = {item = 1, cursorPosY = 1, moveTxt = 0},
+			}}
+		end
+	end
+	menu._lastMovelist = nil
 	if menu.movelistChar > #menu.t_movelists then
 		menu.movelistChar = 1
 	end
 	if gameOption('Debug.DumpLuaTables') then main.f_printTable(menu.t_movelists, "debug/t_movelists.txt") end
 end
 
-function menu.f_commandlistRender(sec, t)
-	local cmdList = {}
-	if t.commandlist ~= nil then
-		cmdList = t.commandlist
-	else
-		table.insert(cmdList, {{glyph = false, text = sec.movelist.text.text, align = 1, col = {}}})
+-- Draws every page's art, active for the current page. Shared entries are drawn once.
+-- Returns page specific art as click targets.
+local function f_movelistPagesDraw(mv, t, reset)
+	local targets = {}
+	if not t.found then
+		return targets
 	end
-	if esc() or getInput(-1, sec.menu.cancel.key, sec.menu.done.key) then
-		sndPlay(motif.Snd, sec.cancel.snd[1], sec.cancel.snd[2])
-		menu.itemname = ''
-		return
-	elseif getInput(-1, sec.menu.subtract.key) and #menu.t_movelists > 1 then
-		sndPlay(motif.Snd, sec.cursor.move.snd[1], sec.cursor.move.snd[2])
-		menu.movelistChar = menu.movelistChar - 1
-		if menu.movelistChar < 1 then
-			menu.movelistChar = #menu.t_movelists
+	local drawn = {}
+	for page = 1, #t.pages do
+		local bg = page == t.pages.current and mv.page.active.bg or mv.page.bg
+		local own = bg[tostring(page)]
+		local el = own or bg.default
+		if el ~= nil and not drawn[el] then
+			drawn[el] = true
+			if reset then
+				animReset(el.AnimData)
+			end
+			local anim = main.f_animPosDraw(el.AnimData, nil, nil, nil, own ~= nil)
+			if anim ~= nil then
+				table.insert(targets, {item = page, anim = anim, layerno = el.layerno})
+			end
+			textImgDraw(el.TextSpriteData)
 		end
-	elseif getInput(-1, sec.menu.add.key) and #menu.t_movelists > 1 then
-		sndPlay(motif.Snd, sec.cursor.move.snd[1], sec.cursor.move.snd[2])
-		menu.movelistChar = menu.movelistChar + 1
-		if menu.movelistChar > #menu.t_movelists then
-			menu.movelistChar = 1
-		end
-	elseif getInput(-1, sec.menu.previous.key) and t.tbl.movelistLine > 1 then
-		sndPlay(motif.Snd, sec.cursor.move.snd[1], sec.cursor.move.snd[2])
-		t.tbl.movelistLine = t.tbl.movelistLine - 1
-	elseif getInput(-1, sec.menu.next.key) and t.tbl.movelistLine <= #cmdList - sec.movelist.window.visibleitems then
-		sndPlay(motif.Snd, sec.cursor.move.snd[1], sec.cursor.move.snd[2])
-		t.tbl.movelistLine = t.tbl.movelistLine + 1
 	end
-	--draw overlay
-	rectDraw(sec.movelist.overlay.RectData)
-	--draw title
-	textImgReset(sec.movelist.title.TextSpriteData)
-	textImgSetText(sec.movelist.title.TextSpriteData, main.f_itemnameUpper(string.format(sec.movelist.title.text, t.name), sec.movelist.title.uppercase))
-	textImgDraw(sec.movelist.title.TextSpriteData)
-	--draw commands
-	local i = 0
-	for n = t.tbl.movelistLine, math.min(t.tbl.movelistLine + sec.movelist.window.visibleitems + 1, #cmdList) do
-		i = i + 1
-		local alignOffset = 0
-		local lengthOffset = 0
-		local align = 1
-		local width = 0
-		for k, v in ipairs(cmdList[n]) do
-			if v.text ~= '' then
-				alignOffset = 0
-				if v.align == 0 then --center align
-					alignOffset = sec.movelist.window.width * 0.5
-				elseif v.align == -1 then --right align
-					alignOffset = sec.movelist.window.width
-				end
-				if v.align ~= align then
-					lengthOffset = 0
-					align = v.align
-				end
-				local fontProps = motif.files.font['font' .. sec.movelist.text.font[1]]
-				--render glyph
-				if v.glyph and motif.glyphs[v.text] ~= nil then
-					local g = motif.glyphs[v.text]
-					if g.Size ~= nil and g.AnimData ~= nil then
-						local scaleX = fontProps.size[2] * sec.movelist.text.scale[2] / g.Size[2] * sec.movelist.glyphs.scale[1]
-						local scaleY = fontProps.size[2] * sec.movelist.text.scale[2] / g.Size[2] * sec.movelist.glyphs.scale[2]
-						if v.align == -1 then
-							alignOffset = alignOffset - g.Size[1] * scaleX
-						end
-						animSetScale(g.AnimData, scaleX, scaleY)
-						--animSetFacing(g.AnimData, facing)
-						animSetPos(
-							g.AnimData,
-							math.floor(sec.movelist.pos[1] + sec.movelist.text.offset[1] + sec.movelist.glyphs.offset[1] + alignOffset + lengthOffset),
-							sec.movelist.pos[2] + sec.movelist.text.offset[2] + sec.movelist.glyphs.offset[2] + main.f_round((fontProps.size[2] + fontProps.spacing[2]) * sec.movelist.text.scale[2] + sec.movelist.text.spacing[2]) * (i - 1)
-						)
-						animSetWindow(g.AnimData, menu.movelistW[1], menu.movelistW[2], menu.movelistW[3], menu.movelistW[4])
-						--animUpdate(g.AnimData)
-						animDraw(g.AnimData)
-						if k < #cmdList[n] then
-							width = g.Size[1] * scaleX + sec.movelist.glyphs.spacing[1]
-						end
-					end
-				--render text
-				else
-					textImgReset(sec.movelist.text.TextSpriteData)
-					local align = v.align
-					if align == 0 and lengthOffset ~= 0 then
-						align = 1
-					end
-					textImgSetAlign(sec.movelist.text.TextSpriteData, align)
-					textImgSetColor(
-						sec.movelist.text.TextSpriteData,
-						v.col.r or sec.movelist.text.font[4],
-						v.col.g or sec.movelist.text.font[5],
-						v.col.b or sec.movelist.text.font[6],
-						v.col.a or sec.movelist.text.font[7]
-					)
-					textImgAddPos(
-						sec.movelist.text.TextSpriteData,
-						alignOffset + lengthOffset,
-						main.f_round((fontProps.size[2] + fontProps.spacing[2]) * sec.movelist.text.scale[2] + sec.movelist.text.spacing[2]) * (i - 1)
-					)
-					textImgSetText(sec.movelist.text.TextSpriteData, v.text)
-					textImgDraw(sec.movelist.text.TextSpriteData)
-					if k < #cmdList[n] then
-						width = textImgGetTextWidth(sec.movelist.text.TextSpriteData, v.text) * sec.movelist.text.scale[1] + sec.movelist.text.spacing[1]
-					end
-				end
-				if v.align == 0 and not v.glyph and lengthOffset == 0 then
-					lengthOffset = lengthOffset + width / 2
-				elseif v.align == -1 then
-					lengthOffset = lengthOffset - width
-				else
-					lengthOffset = lengthOffset + width
-				end
+	return targets
+end
+
+-- The width a page's columns are aligned in: a row's pitch past the widest
+-- name plus the widest command of the page (both measured as drawn, glyphs
+-- included, in the inactive and the active row font), so the names and
+-- commands read as two columns of one table. nil: no row has a command.
+local function f_movelistColumnWidth(items, m)
+	local gap = math.max(m.item.spacing[2], 0)
+	local need = 0
+	for _, row in ipairs(items) do
+		for _, props in ipairs({m.item, m.item.active}) do
+			local left, right = main.f_menuItemColumnWidths(row, props, m)
+			if right > 0 then
+				need = math.max(need, left + (left > 0 and gap or 0) + right)
 			end
 		end
 	end
-	--draw scroll arrows
-	if #cmdList > sec.movelist.window.visibleitems then
-		if t.tbl.movelistLine > 1 then
-			animUpdate(sec.movelist.arrow.up.AnimData)
-			animDraw(sec.movelist.arrow.up.AnimData)
+	if need <= 0 then
+		return nil
+	end
+	-- f_menuItemTextDraw draws right aligned text at width - 1
+	return math.ceil(need) + 1
+end
+
+-- The inner width of a list framed by its rows' art (menu.item.bg, Capcom vs.
+-- SNK 2: a 580-wide strip with the frame's sides), in the list's units: from
+-- where the rows start to as far inside the art's right edge as they start
+-- inside its left edge. nil without such art.
+local function f_movelistFrame(m)
+	local bg = m.item.bg.default
+	if bg == nil or bg.AnimData == nil or m.boxbg.visible then
+		return nil
+	end
+	local lc = bg.localcoord
+	if lc ~= nil and lc[1] ~= nil and lc[1] > 0 and lc[1] ~= motif.info.localcoord[1] then
+		return nil
+	end
+	local info = animGetSpriteInfo(bg.AnimData)
+	if info == nil or info.Size == nil or (info.Size[1] or 0) <= 0 then
+		return nil
+	end
+	local sx = (bg.scale ~= nil and bg.scale[1]) or 1
+	local left = m.pos[1] + (bg.offset ~= nil and bg.offset[1] or 0) - info.Offset[1] * sx
+	local right = left + info.Size[1] * sx
+	local pad = m.pos[1] - left
+	if pad < 0 or right - pad <= m.pos[1] then
+		return nil
+	end
+	return right - pad - m.pos[1]
+end
+
+-- How a page is laid out: {columnWidth, window, offx, boxWider, textx} for
+-- main.f_menuCommonDraw and main.f_menuWindowSet. A line's command (the right
+-- aligned column, two tabs) was drawn at the right edge of the list, far from
+-- a short name, or over a long one. Now:
+--  - columnWidth: the page's own (f_movelistColumnWidth), so the commands sit
+--    next to the names.
+--  - A list with a box (menu.boxbg, the stock ikemen1): the rows' window
+--    reaches the box's right edge, so the cursor spans the box as the box
+--    does. A page whose columns need more than the box (with the box's own
+--    left padding on the right too) gets a wider box, cursor and window, up to
+--    the screen less a margin (the list's left margin, at most 5% of the
+--    screen) on each side, and the whole list moves left by half of what it
+--    grew, so the box stays centered where it was (offx).
+--  - A list without a box: a page that needs more than the list's width gets
+--    it, up to the right edge of the screen less that margin.
+--  - A list framed by its rows' art (Capcom vs. SNK 2's, f_movelistFrame):
+--    the columns are one table for every page of the character (the widest
+--    name and command of all its pages, `pages`), so they stay put when the
+--    page changes, and the table sits in the middle of the frame (textx: the
+--    rows' text moves right, the art stays). Left aligned at the frame's left
+--    edge, the commands ended near its middle and the right third of the frame
+--    stayed empty.
+local function f_movelistLayout(items, m, pages)
+	local width = main.f_menuWidth(m)
+	local need = f_movelistColumnWidth(items, m)
+	local screen = motif.info.localcoord[1]
+	local margin = math.min(math.max(m.pos[1], 0), screen * 0.05)
+	local layout = {columnWidth = need, window = nil, offx = 0, boxWider = 0}
+	if m.boxbg.visible then
+		local c = m.boxcursor.coords
+		local left, right = c[1], c[3] + 1
+		local pad = math.max(0, -left)
+		local grow = 0
+		if need ~= nil and need + pad > right then
+			local most = math.max(0, (screen - 2 * margin) - (right - left))
+			grow = math.min(need + pad - right, most)
+			layout.columnWidth = math.min(need, right + grow - pad)
 		end
-		if t.tbl.movelistLine <= #cmdList - sec.movelist.window.visibleitems then
-			animUpdate(sec.movelist.arrow.down.AnimData)
-			animDraw(sec.movelist.arrow.down.AnimData)
+		if grow > 0 then
+			local boxLeft = m.pos[1] + left
+			-- half to each side, but never past the margins
+			local shift = math.min(math.floor(grow / 2), math.max(0, boxLeft - margin))
+			local over = (m.pos[1] + right + grow - shift) - (screen - margin)
+			if over > 0 then
+				shift = math.min(shift + over, math.max(0, boxLeft - margin))
+			end
+			layout.offx = -shift
+			layout.boxWider = grow
+		end
+		layout.window = right + grow
+	else
+		local frame = f_movelistFrame(m)
+		if frame ~= nil and pages ~= nil then
+			for _, p in ipairs(pages) do
+				local n = f_movelistColumnWidth(p.items, m)
+				if n ~= nil and (need == nil or n > need) then
+					need = n
+				end
+			end
+			layout.columnWidth = need
+		end
+		if frame ~= nil and need ~= nil and need <= frame then
+			layout.textx = math.floor((frame - need) / 2)
+		elseif need ~= nil and need > width then
+			local limit = screen - m.pos[1] - margin
+			if limit > width then
+				layout.columnWidth = math.min(need, math.floor(limit))
+				layout.window = layout.columnWidth
+			else
+				layout.columnWidth = nil
+			end
 		end
 	end
+	return layout
+end
+
+-- THE LIST IN THE PAUSE MENU'S FRAME. A pack can draw its pause menu's frame
+-- with its items' own art: Capcom vs. SNK 2's first item (Continue) has a
+-- picture with the title's box, the frame's top and the first row's strip,
+-- its last item (Exit) one with the frame's bottom, every other row a strip
+-- with the frame's sides. The Command List's rows inherit that art (motif.go:
+-- [Pause Menu] menu.* -> movelist.menu.*), but every row took the middle
+-- strip, so the list had no top, no bottom and no box behind its title. The
+-- first and the last row on screen now take the art of the pause menu's
+-- first and last items (the names main.f_menuCommonDraw's edgeBg looks up),
+-- when the pack gives them art of their own; that art is not clipped to the
+-- rows' window (its frame and the title's box lie outside it). A pack whose
+-- pause items share one picture, or have none: nothing changes.
+local function f_movelistEdgeBg(m)
+	local root = menu.currentMenuId ~= nil and menu[menu.currentMenuId] or menu._lastMenuTbl
+	if root == nil or type(root.items) ~= 'table' or #root.items < 2 then
+		return nil
+	end
+	local first, last = root.items[1].paramname, root.items[#root.items].paramname
+	local edge = {}
+	for key, name in pairs({first = first, last = last}) do
+		if name ~= nil and name ~= 'default' and (m.item.bg[name] ~= nil or m.item.active.bg[name] ~= nil) then
+			edge[key] = name
+		end
+	end
+	if edge.first == nil and edge.last == nil then
+		return nil
+	end
+	local w, h = motif.info.localcoord[1], motif.info.localcoord[2]
+	for _, bg in ipairs({m.item.bg, m.item.active.bg}) do
+		for _, name in pairs(edge) do
+			if bg[name] ~= nil and bg[name].AnimData ~= nil then
+				animSetWindow(bg[name].AnimData, 0, 0, w, h)
+			end
+		end
+	end
+	return edge
+end
+
+-- THE FIGHT BEHIND THE LIST. A pack whose pause menu leaves the fight
+-- undimmed (overlay.alpha = 0, 256: Capcom vs. SNK 2) drew the list's key
+-- line straight over the stage, white on a yellow sign at 1.7:1
+-- (TouhouCasino). Behind the Command List such a pack gets the engine's own
+-- pause dimming (half the fight), drawn with its overlay rectangle on the
+-- bottom layer; its pause menu itself is unchanged. A pack with its own
+-- dimming or a box (the stock ikemen1) is left alone.
+local function f_movelistBacking(sec)
+	local o = sec.overlay
+	if o == nil or o.RectData == nil or sec.movelist.menu.boxbg.visible then
+		return
+	end
+	if (o.alpha[1] or 0) > 0 or (o.alpha[2] or 256) < 255 then
+		return
+	end
+	rectSetLayerno(o.RectData, 0)
+	rectSetAlpha(o.RectData, 0, 128)
+	rectDraw(o.RectData)
+	rectSetAlpha(o.RectData, o.alpha[1], o.alpha[2])
+	rectSetLayerno(o.RectData, o.layerno)
+end
+
+function menu.f_commandlistRender(sec, bg)
+	local mv = sec.movelist
+	local m = mv.menu
+	local acceptInput = main.pauseMenuActive and not fadeActive() and menu.pauseExitDelay < 0
+	local switched = false
+	local t = menu.t_movelists[menu.movelistChar]
+	local clicked = mv.mouseClicked
+	mv.mouseClicked = nil
+	if acceptInput then
+		-- Move list rows can't be selected, so only cancel closes the list.
+		if esc() or getAction(-1, m.cancel.action) then
+			sndPlay(motif.Snd, sec.cancel.snd[1], sec.cancel.snd[2])
+			menu.itemname = ''
+			main.f_menuSnap(sec)
+			return
+		elseif #menu.t_movelists > 1 then
+			local direction = 0
+			if getAction(-1, m.subtract.action) then
+				direction = -1
+			elseif getAction(-1, m.add.action) then
+				direction = 1
+			end
+			if direction ~= 0 then
+				sndPlay(motif.Snd, sec.cursor.move.snd[1], sec.cursor.move.snd[2])
+				menu.movelistChar = (menu.movelistChar - 1 + direction) % #menu.t_movelists + 1
+				t = menu.t_movelists[menu.movelistChar]
+				switched = true
+			end
+		end
+		-- Pages of the shown character.
+		if #t.pages > 1 then
+			local direction = 0
+			if getAction(-1, mv.page.previous.action) then
+				direction = -1
+			elseif getAction(-1, mv.page.next.action) then
+				direction = 1
+			end
+			if direction ~= 0 then
+				sndPlay(motif.Snd, sec.cursor.move.snd[1], sec.cursor.move.snd[2])
+				t.pages.current = (t.pages.current - 1 + direction) % #t.pages + 1
+				switched = true
+			-- A click on a page's art drawn last frame shows that page.
+			elseif not switched and type(clicked) == 'number' and t.pages[clicked] ~= nil and clicked ~= t.pages.current then
+				sndPlay(motif.Snd, sec.cursor.move.snd[1], sec.cursor.move.snd[2])
+				t.pages.current = clicked
+				switched = true
+			end
+		end
+	end
+	local page = t.pages[t.pages.current]
+	local state = page.state
+	local reset = menu._lastMovelist ~= page
+	if reset then
+		menu._lastMovelist = page
+		mv.boxCursorData = nil
+		main.f_menuSnap(mv)
+		main.f_menuItemBgAnimReset(mv)
+		page.layout = f_movelistLayout(page.items, mv.menu, t.pages)
+		-- the rows' clipping window follows the page's, and returns after it
+		main.f_menuWindowSet(mv.menu, true, page.layout.window, {page.layout.offx, 0})
+		mv.edgeBg = f_movelistEdgeBg(mv.menu)
+	end
+	local forcedDir = nil
+	if not acceptInput or switched then
+		forcedDir = 0
+	end
+	state.cursorPosY, state.moveTxt, state.item = main.f_menuCommonCalc(
+		page.items, state.item, state.cursorPosY, state.moveTxt, mv, sec.cursor, forcedDir)
+	textImgReset(mv.title.TextSpriteData)
+	textImgSetText(mv.title.TextSpriteData, main.f_itemnameUpper(string.format(mv.title.text, t.name), m.title.uppercase))
+	f_movelistBacking(sec)
+	local targets = f_movelistPagesDraw(mv, t, reset)
+	-- The hint lists only what can be switched: characters, pages, both, or neither.
+	local context = #menu.t_movelists > 1 and 'character' or ''
+	if #t.pages > 1 then
+		context = context .. 'page'
+	end
+	main.f_menuCommonDraw(page.items, state.item, state.cursorPosY, state.moveTxt, mv, bg, true,
+		{hintContext = context ~= '' and context or nil, mouseTargets = targets, columnWidth = page.layout.columnWidth,
+		offx = page.layout.offx, boxWider = page.layout.boxWider, edgeBg = mv.edgeBg, textx = page.layout.textx})
 end
 
 return menu

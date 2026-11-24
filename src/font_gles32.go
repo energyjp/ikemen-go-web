@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"image"
 	colour "image/color"
+
 	//"image/draw"
 	"io"
 	"io/ioutil"
@@ -21,12 +22,20 @@ import (
 type Font_GLES32 struct {
 	fontChar     map[rune]*character
 	ttf          *truetype.Font
+	metrics      font.Metrics
 	scale        int32
 	windowWidth  int
 	windowHeight int
 	textures     []*TextureAtlas
 	color        color
+	blendEq      BlendEquation
+	blendSrc     BlendFunc
+	blendDst     BlendFunc
 	shaderPalFX  ShaderPalFX
+	customShader CustomShaderRenderData
+
+	// Glyphs for other on-screen sizes, by pixel size
+	rasterFonts map[int32]*Font_GLES32
 }
 
 type FontRenderer_GLES32 struct {
@@ -37,6 +46,8 @@ type FontRenderer_GLES32 struct {
 
 // Init sets up shaders, VAO, and VBO
 func (r *FontRenderer_GLES32) Init(renderer interface{}) {
+	mr := gfx.(*Renderer_GLES32)
+
 	// Configure GLES 3.2 shader
 	r.newProgram(300, vertexFontShader, fragmentFontShader)
 
@@ -46,8 +57,8 @@ func (r *FontRenderer_GLES32) Init(renderer interface{}) {
 	// Configure VAO/VBO for texture quads
 	gl.GenVertexArrays(1, &r.vao)
 	gl.GenBuffers(1, &r.vbo)
-	gl.BindVertexArray(r.vao)
-	gl.BindBuffer(gl.ARRAY_BUFFER, r.vbo)
+	mr.bindVertexArray(r.vao)
+	mr.bindBuffer(gl.ARRAY_BUFFER, r.vbo)
 
 	// Pre-allocate for maximum batch size
 	gl.BufferData(gl.ARRAY_BUFFER, MaxFontBatchSize*6*4*4, nil, gl.DYNAMIC_DRAW)
@@ -62,8 +73,8 @@ func (r *FontRenderer_GLES32) Init(renderer interface{}) {
 	gl.VertexAttribPointer(tLoc, 2, gl.FLOAT, false, 4*4, gl.PtrOffset(2*4))
 
 	// Unbind for safety
-	gl.BindVertexArray(0)
-	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+	mr.bindVertexArray(0)
+	mr.bindBuffer(gl.ARRAY_BUFFER, 0)
 }
 
 // LoadFont builds the font structure
@@ -83,6 +94,15 @@ func (r *FontRenderer_GLES32) LoadFont(file string, scale int32, windowWidth int
 	return f, nil
 }
 
+// HasRune reports whether the font has a glyph for r (font.go ttfRuneFont).
+func (f *Font_GLES32) HasRune(r rune) bool {
+	return f.ttf != nil && f.ttf.Index(r) != 0
+}
+
+func (f *Font_GLES32) Metrics() font.Metrics {
+	return f.metrics
+}
+
 // SetColor allows you to set the text color to be used when you draw the text
 func (f *Font_GLES32) SetColor(red float32, green float32, blue float32, alpha float32) {
 	f.color.r = red
@@ -91,8 +111,17 @@ func (f *Font_GLES32) SetColor(red float32, green float32, blue float32, alpha f
 	f.color.a = alpha
 }
 
+// SetBlending sets how Printf blends the text when blending is on.
+func (f *Font_GLES32) SetBlending(eq BlendEquation, src, dst BlendFunc) {
+	f.blendEq, f.blendSrc, f.blendDst = eq, src, dst
+}
+
 func (f *Font_GLES32) SetPalFX(state ShaderPalFX) {
 	f.shaderPalFX = state
+}
+
+func (f *Font_GLES32) SetCustomShader(shader CustomShaderRenderData) {
+	f.customShader = shader
 }
 
 func (f *Font_GLES32) UpdateResolution(windowWidth int, windowHeight int) {
@@ -111,10 +140,10 @@ func (r *FontRenderer_GLES32) SetFontPipeline() {
 	mr.ChangeProgram(r.shaderProgram.program)
 
 	// Bind VAO
-	gl.BindVertexArray(r.vao)
+	mr.bindVertexArray(r.vao)
 
 	// We need to bind VBO here as well
-	gl.BindBuffer(gl.ARRAY_BUFFER, r.vbo)
+	mr.bindBuffer(gl.ARRAY_BUFFER, r.vbo)
 }
 
 // Printf draws a string to the screen, takes a list of arguments like printf
@@ -132,17 +161,37 @@ func (f *Font_GLES32) Printf(x, y float32, xscl, yscl float32, spacingXAdd float
 		return nil
 	}
 
+	// Activate corresponding render state
+	program := fr.shaderProgram
+	custom := false
+	if f.customShader.name != "" {
+		if id, ok := r.customShaderMap[f.customShader.name]; ok {
+			if shader, ok := r.customShaders[id]; ok {
+				program = shader
+				custom = true
+			}
+		}
+	}
+	if custom {
+		// Like SetFontPipeline, but with the custom program. The glyph data lives in the font's VAO and VBO
+		r.currentProgram = program
+		r.ChangeProgram(program.program)
+		r.bindVertexArray(fr.vao)
+		r.bindBuffer(gl.ARRAY_BUFFER, fr.vbo)
+	} else {
+		fr.SetFontPipeline()
+	}
+
 	// Buffer to store vertex data for multiple glyphs
 	batchSize := Min(MaxFontBatchSize, int32(len(indices)))
+	if custom {
+		batchSize = 1
+	}
 	batchVertices := make([]float32, 0, batchSize*6*4)
-
-	// Activate corresponding render state
-	fr.SetFontPipeline()
-	program := fr.shaderProgram
 
 	//setup blending mode
 	if blend {
-		r.EnableBlending(BlendAdd, BlendSrcAlpha, BlendOneMinusSrcAlpha)
+		r.EnableBlending(f.blendEq, f.blendSrc, f.blendDst)
 	} else {
 		r.DisableBlending()
 	}
@@ -150,24 +199,66 @@ func (f *Font_GLES32) Printf(x, y float32, xscl, yscl float32, spacingXAdd float
 	//restrict drawing to a certain part of the window
 	r.EnableScissor(window[0], window[1], window[2], window[3])
 
-	// Set texture location
-	r.SetUniformISub(program.uniforms["tex"], 0)
+	// Setup Custom Shader
+	if custom {
+		w, h := float32(f.windowWidth), float32(f.windowHeight)
+		proj := gfx.OrthographicProjectionMatrix(0, w, h, 0, -1, 1)
+		identity := []float32{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}
+		r.SetUniformMatrix("projection", proj[:])
+		r.SetUniformMatrix("modelview", identity)
 
-	//set text color
-	r.SetUniformFSub(program.uniforms["textColor"], f.color.r, f.color.g, f.color.b, f.color.a)
+		r.SetUniformISub(program.uniforms["tex"], 0) // Glyph atlas stays on unit 0
+		r.SetUniformI("isFlat", 0)
+		r.SetUniformI("isRgba", 1)
+		r.SetUniformI("mask", 0)
+		r.SetUniformI("isTrapez", 0)
+		r.SetUniformI("useQuad", 0)
+		r.SetUniformI("neg", int(Btoi(f.shaderPalFX.neg)))
+		r.SetUniformF("alpha", f.color.a)
+		r.SetUniformFv("add", f.shaderPalFX.add[:])
+		mult := []float32{f.shaderPalFX.mult[0] * f.color.r, f.shaderPalFX.mult[1] * f.color.g, f.shaderPalFX.mult[2] * f.color.b}
+		r.SetUniformFv("mult", mult)
+		r.SetUniformF("gray", f.shaderPalFX.gray)
+		r.SetUniformF("hue", f.shaderPalFX.hue)
+		r.SetUniformFv("tint", []float32{0, 0, 0, 0})
 
-	// Set PalFX uniforms
-	r.SetUniformFSub(program.uniforms["palAdd"], f.shaderPalFX.add[0], f.shaderPalFX.add[1], f.shaderPalFX.add[2])
-	r.SetUniformFSub(program.uniforms["palMul"], f.shaderPalFX.mult[0], f.shaderPalFX.mult[1], f.shaderPalFX.mult[2])
-	r.SetUniformFSub(program.uniforms["palGray"], f.shaderPalFX.gray)
-	r.SetUniformFSub(program.uniforms["palHue"], f.shaderPalFX.hue)
-	r.SetUniformISub(program.uniforms["palNeg"], int32(Btoi(f.shaderPalFX.neg)))
+		// Same engine-provided values RenderSprite gives custom shaders
+		if f.customShader.tex1 != nil {
+			gfx.SetTexture("tex1", f.customShader.tex1)
+		}
+		if f.customShader.tex2 != nil {
+			gfx.SetTexture("tex2", f.customShader.tex2)
+		}
+		f.customShader.setUniforms()
+	} else {
+		// Set texture location
+		r.SetUniformISub(program.uniforms["tex"], 0)
 
-	//set screen resolution
-	r.SetUniformFSub(program.uniforms["resolution"], float32(f.windowWidth), float32(f.windowHeight))
+		//set text color
+		r.SetUniformFSub(program.uniforms["textColor"], f.color.r, f.color.g, f.color.b, f.color.a)
 
-	gl.ActiveTexture(gl.TEXTURE0)
-	//gl.BindVertexArray(gfxFont.(*FontRenderer_GLES32).vao)
+		// Set PalFX uniforms
+		r.SetUniformFSub(program.uniforms["palAdd"], f.shaderPalFX.add[0], f.shaderPalFX.add[1], f.shaderPalFX.add[2])
+		r.SetUniformFSub(program.uniforms["palMul"], f.shaderPalFX.mult[0], f.shaderPalFX.mult[1], f.shaderPalFX.mult[2])
+		r.SetUniformFSub(program.uniforms["palGray"], f.shaderPalFX.gray)
+		r.SetUniformFSub(program.uniforms["palHue"], f.shaderPalFX.hue)
+		r.SetUniformISub(program.uniforms["palNeg"], int32(Btoi(f.shaderPalFX.neg)))
+
+		//set screen resolution
+		r.SetUniformFSub(program.uniforms["resolution"], float32(f.windowWidth), float32(f.windowHeight))
+	}
+
+	// No explicit unit 0 activation needed anymore
+	//mr.bindVertexArray(gfxFont.(*FontRenderer_GLES32).vao)
+
+	// Use glyphs made at the on-screen size, k scales them back to font units
+	rscl := yscl
+	if rscl == 0 {
+		rscl = xscl
+	}
+	gs := f.rasterFont(rscl)
+	k := float32(f.scale) / float32(gs.scale)
+	gxscl, gyscl := xscl*k, yscl*k
 
 	//calculate alignment position
 	alignScale := xscl
@@ -175,9 +266,9 @@ func (f *Font_GLES32) Printf(x, y float32, xscl, yscl float32, spacingXAdd float
 		alignScale = yscl
 	}
 	if align == 0 {
-		x -= f.widthRunes(indices, alignScale, spacingXAdd) * 0.5
+		x -= gs.widthRunes(indices, alignScale*k, spacingXAdd*alignScale) * 0.5
 	} else if align < 0 {
-		x -= f.widthRunes(indices, alignScale, spacingXAdd)
+		x -= gs.widthRunes(indices, alignScale*k, spacingXAdd*alignScale)
 	}
 	needsTransform := rxadd != 0 || !rot.IsZero()
 	textureID := int32(-1)
@@ -189,13 +280,13 @@ func (f *Font_GLES32) Printf(x, y float32, xscl, yscl float32, spacingXAdd float
 		runeIndex := indices[i]
 
 		//find rune in fontChar list
-		ch, ok := f.fontChar[runeIndex]
+		ch, ok := gs.fontChar[runeIndex]
 
 		//load missing runes in batches of 32
 		if !ok {
 			low := runeIndex - (runeIndex % 32)
-			f.GenerateGlyphs(low, low+31)
-			ch, ok = f.fontChar[runeIndex]
+			gs.GenerateGlyphs(low, low+31)
+			ch, ok = gs.fontChar[runeIndex]
 		}
 
 		//skip runes that are not in font character range
@@ -204,7 +295,7 @@ func (f *Font_GLES32) Printf(x, y float32, xscl, yscl float32, spacingXAdd float
 			continue
 		}
 
-		if int32(len(batchVertices)/24) >= batchSize || (textureID != -1 && textureID != int32(ch.textureID)) {
+		if (int32(len(batchVertices)/24) >= batchSize || (textureID != -1 && textureID != int32(ch.textureID))) && !custom {
 			// Render the current batch
 			f.renderGlyphBatch(batchVertices, uint32(textureID))
 			// Clear the batch buffers
@@ -218,11 +309,11 @@ func (f *Font_GLES32) Printf(x, y float32, xscl, yscl float32, spacingXAdd float
 
 		//calculate position and size for current rune
 		//padding := float32(2)
-		xpos := x + float32(ch.bearingH)*xscl
+		xpos := x + float32(ch.bearingH)*gxscl
 		//ypos := y - (float32(ch.height-ch.bearingV)-padding)*scale
-		ypos := y - float32(ch.height-ch.bearingV)*yscl
-		w := float32(ch.width) * xscl
-		h := float32(ch.height) * yscl
+		ypos := y - float32(ch.height-ch.bearingV)*gyscl
+		w := float32(ch.width) * gxscl
+		h := float32(ch.height) * gyscl
 
 		x1, y1 := xpos+w, ypos
 		x2, y2 := xpos, ypos
@@ -245,8 +336,13 @@ func (f *Font_GLES32) Printf(x, y float32, xscl, yscl float32, spacingXAdd float
 			x1, y1, ch.uv[2], ch.uv[1],
 		)
 		// Now advance cursors for next glyph (note that advance is number of 1/64 pixels)
-		x += float32((ch.advance >> 6)) * xscl // Bitshift by 6 to get value in pixels (2^6 = 64 (divide amount of 1/64th pixels by 64 to get amount of pixels))
+		x += float32((ch.advance >> 6)) * gxscl // Bitshift by 6 to get value in pixels (2^6 = 64 (divide amount of 1/64th pixels by 64 to get amount of pixels))
 		renderedAny = true
+		if custom {
+			f.renderGlyph(batchVertices, ch.texture)
+			// Clear the batch buffers
+			batchVertices = batchVertices[:0]
+		}
 	}
 
 	// Render any remaining glyphs in the batch
@@ -260,12 +356,12 @@ func (f *Font_GLES32) Printf(x, y float32, xscl, yscl float32, spacingXAdd float
 	return nil
 }
 
-func (f *Font_GLES32) widthRunes(indices []rune, scale float32, spacingXAdd float32) float32 {
+// Text width, with spacing added between glyphs
+func (f *Font_GLES32) widthRunes(indices []rune, scale float32, spacing float32) float32 {
 	if len(indices) == 0 {
 		return 0
 	}
 
-	spacing := spacingXAdd * scale
 	var width float32
 	renderedAny := false
 
@@ -307,21 +403,63 @@ func (f *Font_GLES32) widthRunes(indices []rune, scale float32, spacingXAdd floa
 func (f *Font_GLES32) renderGlyphBatch(vertices []float32, textureID uint32) {
 	fr := gfxFont.(*FontRenderer_GLES32)
 
-	gl.BindBuffer(gl.ARRAY_BUFFER, fr.vbo)
+	mr := gfx.(*Renderer_GLES32)
+	mr.bindBuffer(gl.ARRAY_BUFFER, fr.vbo)
 	gl.BufferSubData(gl.ARRAY_BUFFER, 0, len(vertices)*4, gl.Ptr(vertices))
 
-	gl.BindTexture(gl.TEXTURE_2D, textureID)
+	// Sampling bind, safe to skip if this atlas is already bound
+	mr.bindTextureToUnit(0, gl.TEXTURE_2D, nil, textureID)
+	gl.DrawArrays(gl.TRIANGLES, 0, int32(len(vertices))/4)
+}
+
+func (f *Font_GLES32) renderGlyph(vertices []float32, texture Texture) {
+	fr := gfxFont.(*FontRenderer_GLES32)
+
+	mr := gfx.(*Renderer_GLES32)
+	mr.bindBuffer(gl.ARRAY_BUFFER, fr.vbo)
+	gl.BufferSubData(gl.ARRAY_BUFFER, 0, len(vertices)*4, gl.Ptr(vertices))
+	gfx.SetTexture("tex", texture)
 	gl.DrawArrays(gl.TRIANGLES, 0, int32(len(vertices))/4)
 }
 
 func (r *FontRenderer_GLES32) ReleaseFontPipeline() {
-	gl.BindVertexArray(0)
-	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+	mr := gfx.(*Renderer_GLES32)
+	mr.bindVertexArray(0)
+	mr.bindBuffer(gl.ARRAY_BUFFER, 0)
 }
 
 // Width returns the width of a piece of text in pixels
-func (f *Font_GLES32) Width(scale float32, spacingXAdd float32, fs string, argv ...interface{}) float32 {
-	return f.widthRunes([]rune(fmt.Sprintf(fs, argv...)), scale, spacingXAdd)
+func (f *Font_GLES32) Width(rscl, scale float32, spacingXAdd float32, fs string, argv ...interface{}) float32 {
+	gs := f
+	if rscl != 0 {
+		gs = f.rasterFont(rscl)
+	}
+	k := float32(f.scale) / float32(gs.scale)
+	return gs.widthRunes([]rune(fmt.Sprintf(fs, argv...)), scale*k, spacingXAdd*scale)
+}
+
+// Returns the glyphs for text drawn at yscl. The DEF size uses f itself.
+func (f *Font_GLES32) rasterFont(yscl float32) *Font_GLES32 {
+	size := ttfRasterSize(f.scale, yscl)
+	if size == f.scale {
+		return f
+	}
+	size = ttfPickRasterSize(f.rasterFonts, size)
+	if rf, ok := f.rasterFonts[size]; ok {
+		return rf
+	}
+	if f.rasterFonts == nil {
+		f.rasterFonts = make(map[int32]*Font_GLES32)
+	}
+	// Holds glyphs only, drawing settings stay on f
+	rf := &Font_GLES32{
+		fontChar: make(map[rune]*character),
+		ttf:      f.ttf,
+		scale:    size,
+		textures: []*TextureAtlas{CreateTextureAtlas(sys.cfg.Video.FontTextureAtlasSize, sys.cfg.Video.FontTextureAtlasSize, 32, true)},
+	}
+	f.rasterFonts[size] = rf
+	return rf
 }
 
 // GenerateGlyphs builds a set of textures based on a ttf files glyphs
@@ -339,6 +477,7 @@ func (f *Font_GLES32) GenerateGlyphs(low, high rune) error {
 		DPI:     72,
 		Hinting: font.HintingFull,
 	})
+	f.metrics = ttfFace.Metrics()
 
 	// Add padding to prevent cropping
 	// https://github.com/ikemen-engine/Ikemen-GO/issues/3085
@@ -378,9 +517,8 @@ func (f *Font_GLES32) GenerateGlyphs(low, high rune) error {
 			}
 		}
 
-		//The glyph's ascent and descent equal -bounds.Min.Y and +bounds.Max.Y.
+		// Distance from the glyph's top to its baseline.
 		gAscent := int(-gBnd.Min.Y) >> 6
-		gdescent := int(gBnd.Max.Y) >> 6
 
 		//set w,h and adv, bearing V and bearing H in char
 		//char.width = int(gw)
@@ -388,7 +526,8 @@ func (f *Font_GLES32) GenerateGlyphs(low, high rune) error {
 		char.width = int(gw) + (padding * 2)
 		char.height = int(gh) + (padding * 2)
 		char.advance = int(gAdv)
-		char.bearingV = gdescent
+		// Account for the raster baseline at padding + gAscent inside the texture.
+		char.bearingV = char.height - (padding + gAscent)
 		//char.bearingH = (int(gBnd.Min.X) >> 6)
 		char.bearingH = (int(gBnd.Min.X) >> 6) - padding
 
@@ -443,7 +582,7 @@ func (f *Font_GLES32) GenerateGlyphs(low, high rune) error {
 
 		for {
 			if textureIndex >= len(f.textures) {
-				f.textures = append(f.textures, CreateTextureAtlas(256, 256, 32, true))
+				f.textures = append(f.textures, CreateTextureAtlas(sys.cfg.Video.FontTextureAtlasSize, sys.cfg.Video.FontTextureAtlasSize, 32, true))
 			}
 
 			var inserted bool
@@ -470,13 +609,14 @@ func (f *Font_GLES32) GenerateGlyphs(low, high rune) error {
 
 		char.uv = uv
 		char.textureID = texAtlas.texture.(*Texture_GLES32).handle
+		char.texture = gfx.newSubTexture(f.textures[textureIndex].texture, int32(char.width), int32(char.height), char.uv)
 		// Logcat(fmt.Sprintf("GLES: Texture ID: %v", texAtlas.texture.(*Texture_GLES32).handle))
 
 		//add char to fontChar list
 		f.fontChar[ch] = char
 	}
 
-	gl.BindTexture(gl.TEXTURE_2D, 0)
+	gfx.(*Renderer_GLES32).bindTextureToUnit(0, gl.TEXTURE_2D, nil, 0)
 	return nil
 }
 
@@ -503,7 +643,7 @@ func (r *FontRenderer_GLES32) LoadTrueTypeFont(reader io.Reader, scale int32, lo
 	f.scale = scale
 	f.SetColor(1.0, 1.0, 1.0, 1.0) //set default white
 	f.SetPalFX(NewShaderPalFX())
-	f.textures = append(f.textures, CreateTextureAtlas(256, 256, 32, true))
+	f.textures = append(f.textures, CreateTextureAtlas(sys.cfg.Video.FontTextureAtlasSize, sys.cfg.Video.FontTextureAtlasSize, 32, true))
 
 	err = f.GenerateGlyphs(low, high)
 	if err != nil {

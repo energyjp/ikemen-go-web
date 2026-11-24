@@ -33,7 +33,7 @@ package main
 // mid-match needs a state transfer and is later work. The players never wait
 // on a watcher: a watcher is registered when the match starts if it is
 // connected and verified, and if its GGPO line is not through within
-// protocol.SpectatorMaxPendingFrames (4 s) it is dropped from that match.
+// protocol.SpectatorMaxPendingFrames (8 s) it is dropped from that match.
 //
 // THE WAY IN: the online menu's WATCH A MATCH (main.lua main.t_itemname
 // watchmatch, web build only) opens the page's watch panel (watchStart) and
@@ -57,8 +57,8 @@ const (
 	// A watcher simulates two frames per display frame while more than this
 	// many have arrived and wait, so it stays a few frames behind.
 	watchCatchUpFrames = 8
-	// One player's input as GGPO carries it: the digital bits and six axes.
-	watchInputSize = 8
+	// One player's input as GGPO carries it: one virtual controller frame.
+	watchInputSize = virtualFrameBytes
 	// Frames of the host's simulated inputs kept for the end message.
 	watchTailFrames = 256
 	// The address GGPO matches the host and the watchers by; the page
@@ -104,6 +104,11 @@ type watchMsg struct {
 	Seed    int32 `json:"seed"`
 	PmTime  int32 `json:"pmTime"`
 	NetTime int32 `json:"netTime"`
+	// The players' Button Setups (what turns each channel's frames into
+	// buttons, pause menu edits included) and menu channels as the match
+	// begins, so the watcher reads the same inputs the same way.
+	Setups []ReplaySetup      `json:"setups,omitempty"`
+	Menu   []watchMenuChannel `json:"menu,omitempty"`
 
 	// end
 	Last int         `json:"last"`
@@ -115,20 +120,138 @@ type watchTail struct {
 	B []byte `json:"b"` // both players' inputs, as GGPO carries them
 }
 
+// watchMenuChannel is one MenuChannel as the players have it when the match
+// starts. The players keep theirs from the menus before the match (a mouse
+// pointer's context and generation count every menu it was in); a watcher that
+// started with zeroes would take a menu's mouse click where they ignore it,
+// or the other way round.
+type watchMenuChannel struct {
+	Escape      int32                        `json:"esc,omitempty"`
+	EscapeTaken bool                         `json:"escTaken,omitempty"`
+	Capture     bool                         `json:"capture,omitempty"`
+	Context     string                       `json:"ctx,omitempty"`
+	Generation  uint16                       `json:"gen,omitempty"`
+	Received    uint16                       `json:"recv,omitempty"`
+	Target      uint32                       `json:"target,omitempty"`
+	Sequence    byte                         `json:"seq,omitempty"`
+	Seen        bool                         `json:"seen,omitempty"`
+	Active      bool                         `json:"active,omitempty"`
+	Moved       bool                         `json:"moved,omitempty"`
+	Remote      bool                         `json:"remote,omitempty"`
+	Held        [len(mouseButtonNames)]int32 `json:"held"`
+}
+
+func watchMenuSnapshot() []watchMenuChannel {
+	out := make([]watchMenuChannel, len(sys.menuChannels))
+	for i := range sys.menuChannels {
+		c, m := &sys.menuChannels[i], &sys.menuChannels[i].mouse
+		out[i] = watchMenuChannel{Escape: c.escape, EscapeTaken: c.escapeTaken, Capture: c.capture,
+			Context: m.context, Generation: m.generation, Received: m.received, Target: m.target,
+			Sequence: m.sequence, Seen: m.seen, Active: m.input.active, Moved: m.input.moved,
+			Remote: m.input.remote, Held: m.input.held}
+	}
+	return out
+}
+
+// watchMenuRestore puts the host's menu channels in place on a watcher. The
+// stepped latch starts clear, so the first frame steps every channel.
+func watchMenuRestore(in []watchMenuChannel) {
+	sys.menuChannels = [MaxPlayerNo]MenuChannel{}
+	for i := 0; i < len(in) && i < len(sys.menuChannels); i++ {
+		w, c := &in[i], &sys.menuChannels[i]
+		c.escape, c.escapeTaken, c.capture = w.Escape, w.EscapeTaken, w.Capture
+		c.mouse.context, c.mouse.generation, c.mouse.received = w.Context, w.Generation, w.Received
+		c.mouse.target, c.mouse.sequence, c.mouse.seen = w.Target, w.Sequence, w.Seen
+		c.mouse.input.active, c.mouse.input.moved, c.mouse.input.remote = w.Active, w.Moved, w.Remote
+		c.mouse.input.held = w.Held
+	}
+}
+
+// watchSessionSetups is a watcher's sessionSetups from the host's list (the
+// way a replay's header becomes them, readReplay).
+func watchSessionSetups(in []ReplaySetup) map[int]SessionSetup {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[int]SessionSetup, len(in))
+	for _, rs := range in {
+		out[rs.Channel] = newSessionSetup(rs.Setup)
+	}
+	return out
+}
+
 // ---------------------------------------------------------------------------
 // Host side
 
 // watchHostMatch counts the matches this host has offered to watchers.
 var watchHostMatch int
 
-// watchHostSelect offers the match the host's Lua just started loading. With
-// no watcher bridge on the page (the host did not allow watchers, or this is
-// a guest) it does nothing at all.
+// watchHost is the host's offer for the match being set up. loadStart opens
+// it; it goes out once the match's characters are selected: with background
+// loading (Config.VsScreenLoading, on by default since 2.5) the Lua selects
+// them AFTER loadStart, so loadStart alone would describe an empty match.
+var watchHost struct {
+	pending bool   // loadStart ran, the offer waits for the selection
+	offered bool   // this match was offered (a select or a nowatch)
+	ok      bool   // the offer was a select: this match's watchers may be registered
+	params  string // loadStart's params plus each character's override params
+}
+
+// watchHostLoadStart opens the offer of the match the host's Lua started
+// loading, and makes it at once when the selection is already complete.
+func watchHostLoadStart(params string) {
+	if !platformWatchHosting() {
+		return
+	}
+	watchHost.pending, watchHost.offered, watchHost.ok, watchHost.params = true, false, false, params
+	watchHostTryOffer(false)
+}
+
+// watchHostSelected is a character selected on the host while the offer
+// waits: its override params go with the offer, as loadStart params.
+func watchHostSelected(override string) {
+	if !watchHost.pending {
+		return
+	}
+	if override = strings.TrimSpace(override); override != "" {
+		if strings.TrimSpace(watchHost.params) != "" {
+			watchHost.params += ", "
+		}
+		watchHost.params += override
+	}
+	watchHostTryOffer(false)
+}
+
+// watchHostTryOffer makes the waiting offer once the selection is complete
+// (a match that cannot be watched at once), or now when forced.
+func watchHostTryOffer(force bool) {
+	if !watchHost.pending {
+		return
+	}
+	if !force && watchUnwatchable() == "" && !watchSelectionComplete() {
+		return
+	}
+	watchHost.pending = false
+	watchHostSelect(watchHost.params)
+}
+
+// watchSelectionComplete: a stage and a character on each side (only single
+// vs single is watched).
+func watchSelectionComplete() bool {
+	sys.selMutex.RLock()
+	defer sys.selMutex.RUnlock()
+	return sys.sel.selectedStageNo > 0 && len(sys.sel.selected[0]) >= 1 && len(sys.sel.selected[1]) >= 1
+}
+
+// watchHostSelect offers the match the host's Lua is loading. With no watcher
+// bridge on the page (the host did not allow watchers, or this is a guest) it
+// does nothing at all.
 func watchHostSelect(params string) {
 	if !platformWatchHosting() {
 		return
 	}
 	watchHostMatch++
+	watchHost.offered, watchHost.ok = true, false
 	m := watchMsg{T: "select", Match: watchHostMatch}
 	if why := watchUnwatchable(); why != "" {
 		m.T, m.Why = "nowatch", why
@@ -159,9 +282,15 @@ func watchHostSelect(params string) {
 	m.Home, m.AiLevel, m.InputRemap = sys.home, sys.aiLevel, sys.inputRemap
 	m.Params = params
 	m.Motif, m.Fight = sys.motif.Def, sys.fightScreen.def
+	if m.Header != nil {
+		// Known from the second match of a session on (Synchronize sets them
+		// up); the start message carries them for every match.
+		m.Header.Setups = sys.replaySetups()
+	}
 	if m.Stage == "" || len(m.Chars) != 2 || m.Header == nil {
 		m.T, m.Why = "nowatch", "the host's match could not be described to a watcher"
 	}
+	watchHost.ok = m.T == "select"
 	platformWatchOffer(watchHostMatch, mustJSON(&m))
 }
 
@@ -191,7 +320,16 @@ type watchReg struct {
 // watcher slots reach their own connections.
 func (rs *RollbackSession) watchTransport(conns []transport.Connection) []transport.Connection {
 	rs.watchSlots = nil
-	if !platformWatchHosting() || watchUnwatchable() != "" || watchHostMatch == 0 {
+	if platformWatchHosting() && (watchHost.pending || !watchHost.offered) {
+		// Not offered yet: a match that started without a loadStart for it
+		// (a rematch that reuses what is loaded), or one whose selection never
+		// completed. Offer it now; a watcher that loads in time watches it.
+		watchHost.pending = true
+		watchHostTryOffer(true)
+	}
+	// Only the watchers of a select for THIS match: after a nowatch they
+	// are not loading anything and would be dropped once the host gave up on them.
+	if !platformWatchHosting() || watchUnwatchable() != "" || watchHostMatch == 0 || !watchHost.ok {
 		platformWatchHubClose()
 		return conns
 	}
@@ -211,7 +349,8 @@ func (rs *RollbackSession) addWatchers(peer *ggpo.Peer) {
 		return
 	}
 	start := watchMsg{T: "start", Match: watchHostMatch,
-		Seed: sys.netConnection.lastSeed, PmTime: sys.netConnection.preMatchTime, NetTime: rs.netTime}
+		Seed: sys.netConnection.lastSeed, PmTime: sys.netConnection.preMatchTime, NetTime: rs.netTime,
+		Setups: sys.replaySetups(), Menu: watchMenuSnapshot()}
 	for _, slot := range rs.watchSlots {
 		player := ggpo.NewSpectatorPlayer(20, webrtcPeerIPForWatch, watchBasePort+slot)
 		var handle ggpo.PlayerHandle
@@ -289,6 +428,8 @@ func (rs *RollbackSession) watchEnd() {
 	// The match's hub stops reading the page now, watched or not: a next match
 	// with no watcher must not inherit it.
 	platformWatchHubClose()
+	// The next match is offered again, loadStart or not.
+	watchHost.pending, watchHost.offered, watchHost.ok = false, false, false
 	if len(rs.watchers) == 0 {
 		return
 	}
@@ -331,6 +472,23 @@ type watchState struct {
 	added   map[string]int // def path -> char ref, so a rematch reuses it
 	stages  map[string]int // def path -> stage ref
 	notice  string
+	loading int  // the match this watcher loaded (apply)
+	escKey  bool // this watcher's own Esc key, pressed while it watches a match
+	left    bool // ... so it left watching
+}
+
+// leaveLocal: the watcher pressed Esc while it loaded or watched a match. Like
+// a replay, Esc ends watching: the page closes the connection to the host, and
+// the Lua's next watchNext says the host is gone. The players never notice
+// beyond the host dropping a watcher.
+func (w *watchState) leaveLocal() {
+	w.escKey = false
+	if w.left {
+		return
+	}
+	w.left = true
+	platformWatchLog("left watching (Esc)")
+	platformWatchLeave()
 }
 
 // poll moves the host's messages from the page into the watcher's state.
@@ -436,6 +594,10 @@ func (w *watchState) apply(m *watchMsg) (chars [][3]int, stageRef int, err error
 		m.Header.ContentFingerprint, m.Header.RoundFadeTime, m.Header.RoundFadeInTime); err != nil {
 		return nil, 0, err
 	}
+	// The players' setups, as beginReplaySession sets a replay's (after the
+	// override); the start message brings them again as the match begins.
+	sys.sessionSetups = watchSessionSetups(m.Header.Setups)
+	w.loading = m.Match
 	if w.added == nil {
 		w.added, w.stages = map[string]int{}, map[string]int{}
 	}
@@ -481,6 +643,28 @@ func (w *watchState) applyRules(m *watchMsg) {
 // synchronize is the watcher's counterpart of NetConnection.Synchronize: it
 // waits for the host's start message and seeds exactly as the players did.
 func (w *watchState) synchronize() error {
+	err := w.awaitStart()
+	if err != nil {
+		// No match runs: nothing would end this spectator session, and
+		// while it lasts the engine reads no local input (spectating).
+		sys.rollback.session = nil
+		return err
+	}
+	Srand(w.start.Seed)
+	sys.preMatchTime = w.start.PmTime
+	if sys.rollback.session != nil {
+		sys.rollback.session.netTime = w.start.NetTime
+	}
+	// The players' setups and menu channels as their match begins.
+	if len(w.start.Setups) > 0 {
+		sys.sessionSetups = watchSessionSetups(w.start.Setups)
+	}
+	watchMenuRestore(w.start.Menu)
+	w.running = true
+	return nil
+}
+
+func (w *watchState) awaitStart() error {
 	for w.start == nil {
 		w.poll()
 		if w.gone {
@@ -489,32 +673,37 @@ func (w *watchState) synchronize() error {
 		if w.dropped != "" {
 			return Error("dropped from this match: " + w.dropped)
 		}
-		if sys.esc || !sys.await(sys.gameRenderSpeed()) {
+		// The host offered another match while this one loaded (it went
+		// back from its versus screen): load that one instead.
+		if w.sel == nil || w.sel.Match != w.loading {
+			return Error("the host changed the match")
+		}
+		if sys.esc || w.escKey || !sys.await(sys.gameRenderSpeed(), false) {
+			if w.escKey || sys.esc {
+				w.leaveLocal()
+			}
 			return Error("watching canceled")
 		}
 	}
-	Srand(w.start.Seed)
-	sys.preMatchTime = w.start.PmTime
-	if sys.rollback.session != nil {
-		sys.rollback.session.netTime = w.start.NetTime
-	}
-	w.running = true
 	return nil
 }
 
 // InitWatch builds this match's spectator session over the page's link to the
-// host.
-func (rs *RollbackSession) InitWatch() {
-	var inputBits InputBits = 0
-	var inputAxes [6]int8 = [6]int8{}
-	inputSize := len(encodeInputs(inputBits)) + len(inputAxes)
+// host. Without a page transport (desktop) ggpo binds a UDP socket, which can
+// fail; the error goes back to preMatchSetup.
+func (rs *RollbackSession) InitWatch() error {
+	// The players' ggpo input: one virtual controller frame per player.
+	inputSize := virtualFrameBytes
 	spec := ggpo.NewSpectator(rs, watchBasePort, 2, inputSize, webrtcPeerIPForWatch, watchHostPort)
 	rs.backend = &spec
-	spec.InitializeConnection(platformWatchTransport()...)
+	if err := spec.InitializeConnection(platformWatchTransport()...); err != nil {
+		return err
+	}
 	rs.currentPlayer = 1
 	rs.playerNo = 1
 	rs.watchFrame = 0
 	spec.Start()
+	return nil
 }
 
 // runWatchFrame simulates the next frame (or two, to catch up) from the
@@ -522,6 +711,12 @@ func (rs *RollbackSession) InitWatch() {
 func (rs *RollbackSystem) runWatchFrame() bool {
 	s := rs.session
 	w := &sys.watch
+	if w.escKey {
+		// This watcher's own Esc, also while it waits for the host.
+		w.leaveLocal()
+		sys.esc = true
+		return false
+	}
 	w.poll()
 	if w.dropped != "" || w.gone {
 		if sys.sessionWarning == "" {
@@ -565,7 +760,8 @@ func (rs *RollbackSystem) runWatchFrame() bool {
 			}
 			return true // waiting for the host
 		}
-		rs.ggpoInputs, rs.ggpoAnalogInputs = decodeInputs(values)
+		rs.advanced = true
+		rs.ggpoInputs = decodeInputs(values)
 		keepRunning := rs.simulateFrame()
 		crc := s.LiveChecksum()
 		platformWatchTrail(s.watchFrame, crc)

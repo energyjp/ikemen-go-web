@@ -21,6 +21,7 @@ type CharCompiler struct {
 	norange          bool
 	token            string
 	playerNo         int
+	targetGi         *CharGlobalInfo // Decoupled from sys.cgi[playerNo] so a background Turns preload doesn't race sys.cgi
 	scmap            map[string]scFunc
 	block            *StateBlock
 	lines            []string
@@ -100,6 +101,7 @@ func newCharCompiler() *CharCompiler {
 		"removeexplod":       c.removeExplod,
 		"removetext":         c.removeText,
 		"reversaldef":        c.reversalDef,
+		"runstate":           c.runState,
 		"screenbound":        c.screenBound,
 		"selfstate":          c.selfState,
 		"sndpan":             c.sndPan,
@@ -134,6 +136,7 @@ func newCharCompiler() *CharCompiler {
 		"camera":               c.cameraCtrl,
 		"changemovelist":       c.changeMovelist,
 		"depth":                c.depth,
+		"depthbound":           c.depthBound,
 		"dialogue":             c.dialogue,
 		"dizzypointsadd":       c.dizzyPointsAdd,
 		"dizzypointsset":       c.dizzyPointsSet,
@@ -163,6 +166,7 @@ func newCharCompiler() *CharCompiler {
 		"modifysnd":            c.modifySnd,
 		"modifystagebg":        c.modifyStageBG,
 		"modifystagevar":       c.modifyStageVar,
+		"modifystoryboard":     c.modifyStoryboard,
 		"modifytext":           c.modifyText,
 		"overrideclsn":         c.overrideClsn,
 		"parentmapadd":         c.parentMapAdd,
@@ -172,6 +176,7 @@ func newCharCompiler() *CharCompiler {
 		"redlifeadd":           c.redLifeAdd,
 		"redlifeset":           c.redLifeSet,
 		"remapsprite":          c.remapSprite,
+		"removestoryboard":     c.removeStoryboard,
 		"rootmapadd":           c.rootMapAdd,
 		"rootmapset":           c.rootMapSet,
 		"rootvaradd":           c.rootVarAdd,
@@ -263,6 +268,7 @@ var triggerMap = map[string]int{
 	"hitbyattr":         1,
 	"hitcount":          1,
 	"hitdefattr":        1,
+	"hitdefvar":         1,
 	"hitfall":           1,
 	"hitover":           1,
 	"hitpausetime":      1,
@@ -364,12 +370,11 @@ var triggerMap = map[string]int{
 	"alpha":              1,
 	"analog":             1,
 	"angle":              1,
-	"xangle":             1,
-	"yangle":             1,
 	"animelemvar":        1,
 	"animlength":         1,
+	"animloopcount":      1,
 	"animplayerno":       1,
-	"spriteplayerno":     1,
+	"animprefix":         1,
 	"atan2":              1,
 	"attack":             1,
 	"attackmul":          1,
@@ -404,14 +409,15 @@ var triggerMap = map[string]int{
 	"guardpoints":        1,
 	"guardpointsmax":     1,
 	"helperindexexist":   1,
-	"helpervar":          1,
 	"helpername":         1,
+	"helpervar":          1,
 	"hitoverridden":      1,
 	"ikemenversion":      1,
 	"incustomanim":       1,
 	"incustomstate":      1,
 	"index":              1,
 	"inputtime":          1,
+	"inrunstate":         1,
 	"introstate":         1,
 	"isasserted":         1,
 	"ishost":             1,
@@ -463,6 +469,7 @@ var triggerMap = map[string]int{
 	"shader":             1,
 	"sign":               1,
 	"soundvar":           1,
+	"spriteplayerno":     1,
 	"spritevar":          1,
 	"sprpriority":        1,
 	"stagebackedgedist":  1,
@@ -478,7 +485,9 @@ var triggerMap = map[string]int{
 	"winclutch":          1,
 	"winhyper":           1,
 	"winspecial":         1,
+	"xangle":             1,
 	"xshear":             1,
+	"yangle":             1,
 	"zoomvar":            1,
 }
 
@@ -716,11 +725,21 @@ func (c *CharCompiler) number(token string) BytecodeValue {
 }
 
 func (c *CharCompiler) attr(text string, hitdef bool) (int32, error) {
+	// Compile-time literals follow the parser's CNS/ZSS error-tolerance settings
+	strict := c.zssMode || !sys.ignoreMostErrors
+	return attrMask(text, hitdef, strict, func(message string) {
+		sys.appendToConsole(c.charWarn() + message)
+	})
+}
+
+func attrMask(text string, hitdef, strict bool, warn func(string)) (int32, error) {
 	flg := int32(0)
 	att := SplitAndTrim(text, ",")
 	for _, a := range att[0] {
 		switch a {
 		case 'S', 's':
+			// For HitDefs only one state type flag is accepted (last one wins)
+			// TODO: Mugen doesn't seem to do this. Ikemen also probably doesn't need this strictness at all
 			if hitdef {
 				flg = int32(ST_S)
 			} else {
@@ -739,7 +758,7 @@ func (c *CharCompiler) attr(text string, hitdef bool) (int32, error) {
 				flg |= int32(ST_A)
 			}
 		default:
-			if sys.ignoreMostErrors && a < 128 && (a < 'A' || a > 'Z') &&
+			if !strict && a < 128 && (a < 'A' || a > 'Z') &&
 				(a < 'a' || a > 'z') {
 				return flg, nil
 			}
@@ -749,7 +768,7 @@ func (c *CharCompiler) attr(text string, hitdef bool) (int32, error) {
 	//hitdefflg := flg
 	for _, a := range att[1:] {
 		l := len(a)
-		if sys.ignoreMostErrors && l >= 2 {
+		if !strict && l >= 2 {
 			a = strings.TrimSpace(a[:2])
 		}
 		switch strings.ToLower(a) {
@@ -784,11 +803,13 @@ func (c *CharCompiler) attr(text string, hitdef bool) (int32, error) {
 		case "h", "a":
 			flg |= int32(AT_HA | AT_HT | AT_HP)
 		default:
-			if sys.ignoreMostErrors {
+			if !strict {
 				//if hitdef {
 				//	flg = hitdefflg
 				//}
-				sys.appendToConsole(c.charWarn() + "Invalid attr value: " + a)
+				if warn != nil {
+					warn("Invalid attr value: " + a)
+				}
 				return flg, nil
 			}
 			return 0, Error("Invalid attr value: " + a)
@@ -879,6 +900,27 @@ func (c *CharCompiler) trgAttr(in *string) (int32, error) {
 		}
 	}
 	return flg, nil
+}
+
+// Reports whether a token starts an attr literal like SCA, NA or "SCA, NA" rather than an expression
+func isAttrLiteral(tok string) bool {
+	// Quoted values are constant, so they're converted at compile time
+	if tok == "\"" {
+		return true
+	}
+	if i := strings.IndexAny(tok, specialSymbols); i >= 0 {
+		tok = tok[:i]
+	}
+	return tok != "" && strings.Trim(tok, "SCAsca") == ""
+}
+
+// Reports whether a token is a hitflag literal like MAF or "MAF" rather than an expression
+func isHitFlagLiteral(tok string) bool {
+	// Quoted values are constant, so they're converted at compile time
+	if tok == "\"" {
+		return true
+	}
+	return tok != "" && strings.Trim(tok, "HLMAFDPhlmafdp") == ""
 }
 
 func (c *CharCompiler) checkOpeningParenthesis(in *string) error {
@@ -1122,7 +1164,7 @@ func (c *CharCompiler) oneArg(out *BytecodeExp, in *string,
 		bv = bvNone()
 	}
 	if rd && len(be) > 0 {
-		out.appendI32Op(OC_nordrun, int32(len(be)))
+		out.appendI32Op(OC_run_caller, int32(len(be)))
 	}
 	out.append(be...)
 	return bv, nil
@@ -1181,7 +1223,7 @@ func (c *CharCompiler) twoOptArg(out *BytecodeExp, in *string,
 	}
 
 	if rd && len(be) > 0 {
-		out.appendI32Op(OC_nordrun, int32(len(be)))
+		out.appendI32Op(OC_run_caller, int32(len(be)))
 	}
 
 	out.append(be...)
@@ -1299,31 +1341,31 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			}
 			be2.appendValue(bv2)
 			if rd {
-				out.appendI32Op(OC_nordrun, int32(len(be2)))
+				out.appendI32Op(OC_run_caller, int32(len(be2)))
 			}
 			out.append(be2...)
-			out.append(OC_st_)
+			out.append(OC_assign_)
 		}
 		switch [...]bool{sys, f} {
 		case [...]bool{false, false}:
 			oc = OC_var
 			if set {
-				oc = OC_st_var
+				oc = OC_assign_var
 			}
 		case [...]bool{false, true}:
 			oc = OC_fvar
 			if set {
-				oc = OC_st_fvar
+				oc = OC_assign_fvar
 			}
 		case [...]bool{true, false}:
 			oc = OC_sysvar
 			if set {
-				oc = OC_st_sysvar
+				oc = OC_assign_sysvar
 			}
 		case [...]bool{true, true}:
 			oc = OC_sysfvar
 			if set {
-				oc = OC_st_sysfvar
+				oc = OC_assign_sysfvar
 			}
 		}
 		out.append(oc)
@@ -1339,20 +1381,9 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		*in = (*in)[i+1:]
 		return nil
 	}
-	eqne := func(f func() error) error { // Equal, not equal
-		not, err := c.checkEquality(in)
-		if err != nil {
-			return err
-		}
-		if err := f(); err != nil {
-			return err
-		}
-		if not {
-			out.append(OC_blnot)
-		}
-		return nil
-	}
-	eqne2 := func(f func(not bool) error) error { // Like eqne but the "not" operation must be handled manually
+
+	// Helper for equal/not equal. Caller handles the negation itself
+	eqne := func(f func(not bool) error) error {
 		not, err := c.checkEquality(in)
 		if err != nil {
 			return err
@@ -1362,17 +1393,46 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		}
 		return nil
 	}
-	nameSub := func(opct, opc OpCode) error {
-		return eqne(func() error {
-			if err := text(); err != nil {
+
+	// For moveType, stateType and such triggers
+	// Each can either be compared against specific flags or keywords, or used bare to return a string
+	// This helper looks ahead to determine how to handle them
+	// Always leaves c.token at the next token, so callers must return right after
+	flagTrigger := func(pushSelf func(), tryKeyword func(not bool) (matched bool, err error)) error {
+		savedIn := *in
+		peekTok := c.tokenizer(in)
+		*in = savedIn
+		if peekTok != "=" && peekTok != "!=" {
+			pushSelf()
+			c.token = c.tokenizer(in)
+			return nil
+		}
+		return eqne(func(not bool) error {
+			matched, err := tryKeyword(not)
+			if err != nil {
 				return err
 			}
-			out.append(opct)
-			out.appendI32Op(opc, int32(sys.stringPool[c.playerNo].Add(
-				strings.ToLower(c.token))))
+			if matched {
+				c.token = c.tokenizer(in)
+				return nil
+			}
+			pushSelf()
+			var be2 BytecodeExp
+			bv2, err := c.expGrls(&be2, in)
+			if err != nil {
+				return err
+			}
+			out.append(be2...)
+			out.appendValue(bv2)
+			if not {
+				out.append(OC_ne)
+			} else {
+				out.append(OC_eq)
+			}
 			return nil
 		})
 	}
+
 	// Parses a flag. Returns flag and error.
 	flagSub := func() (int32, error) {
 		flg := int32(0)
@@ -1412,11 +1472,119 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		}
 		return flg, nil
 	}
+
+	// The right side of a flag comparison can be a bare literal or the same thing quoted
+	// Unwrap quotes so both parse identically
+	flagRHS := func() error {
+		if c.token == "\"" {
+			return text()
+		}
+		return nil
+	}
+
+	// Checks for "=" or "!=" after a trigger without consuming it
+	nextIsEqne := func() bool {
+		savedIn := *in
+		tok := c.tokenizer(in)
+		*in = savedIn
+		return tok == "=" || tok == "!="
+	}
+
+	// Parses the right side of a comparison as a string expression
+	parseStringExp := func() (BytecodeExp, error) {
+		var be BytecodeExp
+		bv, err := c.expGrls(&be, in)
+		if err != nil {
+			return nil, err
+		}
+		if !bv.IsNone() && bv.vtype != VT_String {
+			return nil, Error("Expected a string expression")
+		}
+		be.appendValue(bv)
+		return be, nil
+	}
+
+	// Compiles "= attr" for attr triggers. Literals are converted now
+	// Anything else is a string expression converted at runtime, so both forms run the same test
+	// Returns a non-nil stringExp for the string form. Leaves c.token at the next token
+	parseAttrComparison := func(allowExpr, tolerateMalformed bool) (attr int32, stringExp BytecodeExp, not bool, err error) {
+		if not, err = c.checkEquality(in); err != nil {
+			return
+		}
+		if allowExpr && !isAttrLiteral(c.token) {
+			// Only HitDefAttr in CNS tolerates bad syntax. Other triggers report the expression error
+			if !tolerateMalformed {
+				stringExp, err = parseStringExp()
+				return
+			}
+			// Restore the whole compiler on failure, since parsing can change more than the token
+			saved, savedIn := *c, *in
+			if stringExp, err = parseStringExp(); err == nil {
+				return
+			}
+			*c, *in = saved, savedIn
+		}
+		if err = flagRHS(); err != nil {
+			return
+		}
+		if attr, err = c.trgAttr(in); err != nil {
+			return
+		}
+		c.token = c.tokenizer(in)
+		return
+	}
+
+	// Same as parseAttrComparison, but for hitflag triggers
+	parseHitFlagComparison := func() (flag int32, stringExp BytecodeExp, not bool, err error) {
+		if not, err = c.checkEquality(in); err != nil {
+			return
+		}
+		if !isHitFlagLiteral(c.token) {
+			stringExp, err = parseStringExp()
+			return
+		}
+		if err = flagRHS(); err != nil {
+			return
+		}
+		if flag, err = flagSub(); err != nil {
+			return
+		}
+		c.token = c.tokenizer(in)
+		return
+	}
+
+	// Emits an attr or hitflag test. The operand is the literal value, or -2 for the string form
+	emitAttrOrHitFlagTest := func(value int32, stringExp BytecodeExp, not bool, ops ...OpCode) {
+		if stringExp != nil {
+			// The right side belongs to the caller, not the redirect target
+			if rd {
+				out.appendI32Op(OC_run_caller, int32(len(stringExp)))
+			}
+			out.append(stringExp...)
+			value = -2
+		}
+		out.append(ops[:len(ops)-1]...)
+		out.appendI32Op(ops[len(ops)-1], value)
+		if not {
+			out.append(OC_blnot)
+		}
+	}
+
 	var be1, be2, be3 BytecodeExp
 	var bv1, bv2, bv3 BytecodeValue
 	var be BytecodeExp
 	var opc OpCode
 	var err error
+	// A quoted string like "Ikemen"
+	// Kept as typed, since it might need to print and eq/ne already compares case-insensitively
+	if c.token == "\"" {
+		if err := text(); err != nil {
+			return bvNone(), err
+		}
+		out.appendI32Op(OC_string, int32(sys.stringPool[c.playerNo].Add(c.token)))
+		c.token = c.tokenizer(in)
+		return bvNone(), nil
+	}
 	switch c.token {
 	case "":
 		// Because empty parameter values are not parsed at all, we don't need to ignore them here
@@ -1508,7 +1676,7 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			}
 		}
 		if rd {
-			out.appendI32Op(OC_nordrun, int32(len(be1)))
+			out.appendI32Op(OC_run_caller, int32(len(be1)))
 		}
 		out.append(be1...)
 		if c.token != "," {
@@ -1576,7 +1744,7 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			be1.appendValue(BytecodeInt(0))
 		}
 		if rd {
-			out.appendI32Op(OC_nordrun, int32(len(be1)))
+			out.appendI32Op(OC_run_caller, int32(len(be1)))
 		}
 		out.append(be1...)
 		if c.token != "," {
@@ -1635,9 +1803,9 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 				return bvNone(), Error("'~' operator cannot be used within a trigger redirection")
 			}
 			out.append(be1...)
-			out.append(OC_not)
+			out.append(OC_bwnot)
 		} else {
-			out.not(&bv)
+			out.bwnot(&bv)
 		}
 		return bv, nil
 	case "!":
@@ -1768,7 +1936,7 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			be1.append(OC_pop)
 			be1.append(be3...)
 			if rd {
-				out.appendI32Op(OC_run, int32(len(be1)))
+				out.appendI32Op(OC_run_redir, int32(len(be1)))
 			}
 			out.append(be1...)
 		} else {
@@ -1829,12 +1997,14 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			return bvNone(), err
 		}
 		out.append(OC_animexist)
+	case "animloopcount":
+		out.append(OC_ex3_, OC_ex3_animloopcount)
+	case "animprefix":
+		out.append(OC_ex3_, OC_ex3_animprefix)
 	case "animtime":
 		out.append(OC_animtime)
 	case "authorname":
-		if err := nameSub(OC_const_, OC_const_authorname); err != nil {
-			return bvNone(), err
-		}
+		out.append(OC_const_, OC_const_authorname)
 	case "backedge":
 		out.append(OC_backedge)
 	case "backedgebodydist":
@@ -1851,12 +2021,13 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		if err := c.checkClosingParenthesis(); err != nil {
 			return bvNone(), err
 		}
-		isStr := false
 		switch vname {
 		case "filename":
 			opct = OC_ex2_
 			opc = OC_ex2_bgmvar_filename
-			isStr = true
+		case "freqmul":
+			opct = OC_ex2_
+			opc = OC_ex2_bgmvar_freqmul
 		case "length":
 			opct = OC_ex2_
 			opc = OC_ex2_bgmvar_length
@@ -1875,6 +2046,9 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		case "position":
 			opct = OC_ex2_
 			opc = OC_ex2_bgmvar_position
+		case "samplerate":
+			opct = OC_ex2_
+			opc = OC_ex2_bgmvar_samplerate
 		case "startposition":
 			opct = OC_ex2_
 			opc = OC_ex2_bgmvar_startposition
@@ -1884,14 +2058,8 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		default:
 			return bvNone(), Error("Invalid BGMVar argument: " + vname)
 		}
-		if isStr {
-			if err := nameSub(opct, opc); err != nil {
-				return bvNone(), err
-			}
-		} else {
-			out.append(opct)
-			out.append(opc)
-		}
+		out.append(opct)
+		out.append(opc)
 	case "bottomedge":
 		out.append(OC_bottomedge)
 	case "botboundbodydist":
@@ -1924,6 +2092,8 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			bv1 = BytecodeInt(2)
 		case "size":
 			bv1 = BytecodeInt(3)
+		case "dummy":
+			bv1 = BytecodeInt(4)
 		default:
 			return bvNone(), Error("Invalid collision box type: " + c1type)
 		}
@@ -1959,7 +2129,7 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		be1.appendValue(bv2)
 		be1.appendValue(bv3)
 		if rd {
-			out.appendI32Op(OC_nordrun, int32(len(be1)))
+			out.appendI32Op(OC_run_caller, int32(len(be1)))
 		}
 		out.append(be1...)
 		out.append(OC_ex_, OC_ex_clsnoverlap)
@@ -1975,6 +2145,8 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			bv1 = BytecodeInt(2)
 		case "size":
 			bv1 = BytecodeInt(3)
+		case "dummy":
+			bv1 = BytecodeInt(4)
 		default:
 			return bvNone(), Error(fmt.Sprintf("Invalid Clsn type: %s", ctype))
 		}
@@ -1993,11 +2165,11 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 
 		switch vname {
 		case "back":
-			opc = OC_ex2_clsnvar_left
+			opc = OC_ex2_clsnvar_back
 		case "top":
 			opc = OC_ex2_clsnvar_top
 		case "front":
-			opc = OC_ex2_clsnvar_right
+			opc = OC_ex2_clsnvar_front
 		case "bottom":
 			opc = OC_ex2_clsnvar_bottom
 		default:
@@ -2014,33 +2186,57 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		be1.appendValue(bv2)
 
 		if rd {
-			out.appendI32Op(OC_nordrun, int32(len(be1)))
+			out.appendI32Op(OC_run_caller, int32(len(be1)))
 		}
 
 		// Just in case anybody else bangs their head against a wall with redirects:
 		// it is imperative that the be1.append(opcodetype, opcode) comes after the
-		// rd out.appendI32Op(OC_nordrun, int32(len(be1)))
+		// rd out.appendI32Op(OC_run_caller, int32(len(be1)))
 		be1.append(OC_ex2_, opc)
 		out.append(be1...)
 	case "command", "selfcommand":
+		// These still work the same as in Mugen. They don't actually push strings
 		opc := OC_command
 		if c.token == "selfcommand" {
-			out.append(OC_ex_)
-			opc = OC_ex_selfcommand
+			opc = OC_selfcommand
 		}
-		if err := eqne(func() error {
-			if err := text(); err != nil {
-				return err
+		if err := eqne(func(not bool) error {
+			var nameExp BytecodeExp
+			if c.token == "\"" {
+				if err := text(); err != nil {
+					return err
+				}
+				if _, ok := c.cmdl.Names[c.token]; !ok {
+					return Error("Command doesn't exist: " + c.token)
+				}
+				nameExp.appendI32Op(OC_string, int32(sys.stringPool[c.playerNo].Add(c.token)))
+				c.token = c.tokenizer(in)
+			} else {
+				// Evaluate dynamic names at runtime, where map and local var values are available
+				bv, err := c.expGrls(&nameExp, in)
+				if err != nil {
+					return err
+				}
+				if !bv.IsNone() && bv.vtype != VT_String {
+					return Error(`Not enclosed in "`)
+				}
+				nameExp.appendValue(bv)
 			}
-			_, ok := c.cmdl.Names[c.token]
-			if !ok {
-				return Error("Command doesn't exist: " + c.token)
+			// The name belongs to the caller. OC_run_caller also keeps the redirect alive for the command opcode
+			if rd {
+				out.appendI32Op(OC_run_caller, int32(len(nameExp)))
 			}
-			out.appendI32Op(opc, int32(sys.stringPool[c.playerNo].Add(c.token)))
+			out.append(nameExp...)
+			out.append(opc)
+			if not {
+				out.append(OC_blnot)
+			}
 			return nil
 		}); err != nil {
 			return bvNone(), err
 		}
+		// The command comparison already read the next token, so don't skip an outer operator
+		return bvNone(), nil
 	case "const":
 		if err := c.checkOpeningParenthesis(in); err != nil {
 			return bvNone(), err
@@ -2352,9 +2548,7 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 	case "ctrl":
 		out.append(OC_ctrl)
 	case "displayname":
-		if err := nameSub(OC_const_, OC_const_displayname); err != nil {
-			return bvNone(), err
-		}
+		out.append(OC_const_, OC_const_displayname)
 	case "drawgame":
 		out.append(OC_ex_, OC_ex_drawgame)
 	case "drawpal":
@@ -2427,8 +2621,12 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			opc = OC_ex2_explodvar_animelem
 		case "animelemtime":
 			opc = OC_ex2_explodvar_animelemtime
+		case "animloopcount":
+			opc = OC_ex2_explodvar_animloopcount
 		case "animplayerno":
 			opc = OC_ex2_explodvar_animplayerno
+		case "animprefix":
+			opc = OC_ex2_explodvar_animprefix
 		case "animtime":
 			opc = OC_ex2_explodvar_animtime
 		case "spriteplayerno":
@@ -2509,6 +2707,8 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			}
 		case "xshear":
 			opc = OC_ex2_explodvar_xshear
+		case "shader":
+			opc = OC_ex2_explodvar_shader
 		default:
 			return bvNone(), Error(fmt.Sprint("Invalid ExplodVar angle argument: %s", vname))
 		}
@@ -2525,11 +2725,11 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		be1.appendValue(bv2)
 
 		if rd {
-			out.appendI32Op(OC_nordrun, int32(len(be1)))
+			out.appendI32Op(OC_run_caller, int32(len(be1)))
 		}
 		// Just in case anybody else bangs their head against a wall with redirects:
 		// it is imperative that the be1.append(opcodetype, opcode) comes after the
-		// rd out.appendI32Op(OC_nordrun, int32(len(be1)))
+		// rd out.appendI32Op(OC_run_caller, int32(len(be1)))
 		be1.append(OC_ex2_, opc)
 		out.append(be1...)
 	case "facing":
@@ -2734,6 +2934,10 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			opc = OC_ex_gethitvar_guardko
 		case "teamside":
 			opc = OC_ex_gethitvar_teamside
+		case "sparkx":
+			opc = OC_ex_gethitvar_sparkx
+		case "sparky":
+			opc = OC_ex_gethitvar_sparky
 		default:
 			return bvNone(), Error("Invalid GetHitVar argument: " + c.token)
 		}
@@ -2742,34 +2946,27 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			return bvNone(), err
 		}
 		switch isFlag {
-		case 1:
-			// attr
-			hda := func() error {
-				if attr, err := c.trgAttr(in); err != nil {
-					return err
+		case 1, 2:
+			// 1 is attr, 2 is hitflag
+			if nextIsEqne() {
+				var value int32
+				var stringExp BytecodeExp
+				var not bool
+				var err error
+				if isFlag == 1 {
+					value, stringExp, not, err = parseAttrComparison(true, false)
 				} else {
-					out.append(OC_ex_)
-					out.appendI32Op(opc, attr)
+					value, stringExp, not, err = parseHitFlagComparison()
 				}
-				return nil
-			}
-			if err := eqne(hda); err != nil {
-				return bvNone(), err
-			}
-		case 2:
-			// hit/guard flag
-			hgf := func() error {
-				if flg, err := flagSub(); err != nil {
-					return err
-				} else {
-					out.append(OC_ex_)
-					out.appendI32Op(opc, flg)
-					return nil
+				if err != nil {
+					return bvNone(), err
 				}
+				emitAttrOrHitFlagTest(value, stringExp, not, OC_ex_, opc)
+				return bvNone(), nil
 			}
-			if err := eqne(hgf); err != nil {
-				return bvNone(), err
-			}
+			// No comparison. Push the current value as a string
+			out.append(OC_ex_)
+			out.appendI32Op(opc, -1)
 		case 0:
 			// no flag
 			out.append(OC_ex_, opc)
@@ -2829,20 +3026,32 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			return bvNone(), err
 		}
 	case "hitdefattr":
-		hda := func() error {
-			if attr, err := c.trgAttr(in); err != nil {
-				return err
-			} else {
-				out.appendI32Op(OC_hitdefattr, attr)
+		savedIn := *in
+		peekTok := c.tokenizer(in)
+		*in = savedIn
+		isEqne := peekTok == "=" || peekTok == "!="
+
+		// Mugen tolerated a lot of malformed expressions for this trigger
+		allowWrongHDA := !c.zssMode && sys.ignoreMostErrors &&
+			peekTok != "" && peekTok != ")" && peekTok != "," && c.isOperator(peekTok) == 0
+
+		if isEqne || allowWrongHDA {
+			// Case 1: valid comparison. Expressions are only tried when the operator is really there
+			attr, stringExp, not, err := parseAttrComparison(isEqne, !c.zssMode && sys.ignoreMostErrors)
+			if err == nil {
+				emitAttrOrHitFlagTest(attr, stringExp, not, OC_hitdefattr)
+				return bvNone(), nil
 			}
-			return nil
-		}
-		if err := eqne(hda); err != nil {
+			// Case 2: malformed attr string
+			// We need to tolerate this case in CNS for the sake of backward compatibility
 			if c.zssMode || !sys.ignoreMostErrors {
 				return bvNone(), err
 			}
 			sys.appendToConsole(c.charWarn() + "HitDefAttr Missing '=' or '!='")
 			out.appendValue(BytecodeBool(false))
+		} else {
+			// Case 3: bare usage. Push the current attr as a string like "SCA, NA"
+			out.appendI32Op(OC_hitdefattr, -1)
 		}
 	case "hitdefvar":
 		if err := c.checkOpeningParenthesis(in); err != nil {
@@ -2965,17 +3174,17 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			return bvNone(), Error("Invalid HitDefVar argument: " + c.token)
 		}
 		if isFlag {
-			if err := eqne(func() error {
-				if flg, err := flagSub(); err != nil {
-					return err
-				} else {
-					out.append(OC_ex3_)
-					out.appendI32Op(opc, flg)
-					return nil
+			if nextIsEqne() {
+				flag, stringExp, not, err := parseHitFlagComparison()
+				if err != nil {
+					return bvNone(), err
 				}
-			}); err != nil {
-				return bvNone(), err
+				emitAttrOrHitFlagTest(flag, stringExp, not, OC_ex3_, opc)
+				return bvNone(), nil
 			}
+			// No comparison. Push the current flag as a string
+			out.append(OC_ex3_)
+			out.appendI32Op(opc, -1)
 		} else {
 			out.append(OC_ex3_)
 			out.append(opc)
@@ -3043,10 +3252,29 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 	case "movereversed":
 		out.append(OC_movereversed)
 	case "movetype", "p2movetype", "prevmovetype":
+		// The flag here is from a fixed set (A/H/I), not a string
+		// It compiles straight to a MoveType number without involving the string pool
 		trname := c.token
-		if err := eqne2(func(not bool) error {
+		pushSelf := func() {
+			if trname == "prevmovetype" {
+				out.append(OC_ex_, OC_ex_prevmovetype, 0)
+			} else if trname == "p2movetype" {
+				// OC_p2's length header must match what actually follows it -
+				// when P2 doesn't exist, JumpToNext uses this length to skip
+				// past the whole block. A hardcoded 0 here would make it land
+				// on OC_movetype instead of past it, running it against the
+				// wrong character and corrupting the stack.
+				var sub BytecodeExp
+				sub.append(OC_movetype, 0)
+				out.appendI32Op(OC_p2, int32(len(sub)))
+				out.append(sub...)
+			} else {
+				out.append(OC_movetype, 0)
+			}
+		}
+		if err := flagTrigger(pushSelf, func(not bool) (bool, error) {
 			if len(c.token) == 0 {
-				return Error(trname + " trigger requires a comparison")
+				return false, Error(trname + " trigger requires a comparison")
 			}
 			var mt MoveType
 			switch c.token[0] {
@@ -3057,23 +3285,37 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			case 'h':
 				mt = MT_H
 			default:
-				return Error("Invalid MoveType: " + c.token)
+				// TODO: Figure out how to keep these explicit errors
+				//return Error("Invalid MoveType: " + c.token)
+				return false, nil
 			}
 			if trname == "prevmovetype" {
 				out.append(OC_ex_, OC_ex_prevmovetype, OpCode(mt>>15))
-			} else {
-				if trname == "p2movetype" {
-					out.appendI32Op(OC_p2, 2+Btoi(not))
+				if not {
+					out.append(OC_blnot)
 				}
+			} else if trname == "p2movetype" {
+				// OC_blnot has to go inside sub, not after it
+				// It needs to run (or not) before the redirect's protected block ends
+				// So the declared length has to account for it too
+				var sub BytecodeExp
+				sub.append(OC_movetype, OpCode(mt>>15))
+				if not {
+					sub.append(OC_blnot)
+				}
+				out.appendI32Op(OC_p2, int32(len(sub)))
+				out.append(sub...)
+			} else {
 				out.append(OC_movetype, OpCode(mt>>15))
+				if not {
+					out.append(OC_blnot)
+				}
 			}
-			if not {
-				out.append(OC_blnot)
-			}
-			return nil
+			return true, nil
 		}); err != nil {
 			return bvNone(), err
 		}
+		return bvNone(), nil
 	case "palfxvar":
 		if err := c.checkOpeningParenthesis(in); err != nil {
 			return bvNone(), err
@@ -3169,9 +3411,7 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		case "p8name":
 			opc = OC_const_p8name
 		}
-		if err := nameSub(OC_const_, opc); err != nil {
-			return bvNone(), err
-		}
+		out.append(OC_const_, opc)
 	case "numenemy":
 		out.append(OC_numenemy)
 	case "numexplod":
@@ -3285,7 +3525,7 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		be1.append(be2...)
 		be1.appendValue(bv3)
 		if rd {
-			out.appendI32Op(OC_nordrun, int32(len(be1)))
+			out.appendI32Op(OC_run_caller, int32(len(be1)))
 		}
 		out.append(be1...)
 		out.append(OC_ex2_, OC_ex2_projclsnoverlap)
@@ -3341,18 +3581,20 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 
 			switch c.token {
 			case "x":
-				opc = OC_ex2_projvar_projxangle
+				opc = OC_ex2_projvar_angle_x
 			case "y":
-				opc = OC_ex2_projvar_projyangle
+				opc = OC_ex2_projvar_angle_y
 			case ")":
-				opc = OC_ex2_projvar_projangle
+				opc = OC_ex2_projvar_angle
 			default:
 				return bvNone(), Error(fmt.Sprint("Invalid ProjVar angle argument: %s", c.token))
 			}
 		case "anim":
-			opc = OC_ex2_projvar_projanim
+			opc = OC_ex2_projvar_anim
 		case "animelem":
 			opc = OC_ex2_projvar_animelem
+		case "animprefix":
+			opc = OC_ex2_projvar_animprefix
 		case "attr":
 			opc = OC_ex2_projvar_attr
 			isFlag = true
@@ -3433,9 +3675,9 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 
 			switch c.token {
 			case "x":
-				opc = OC_ex2_projvar_projscale_x
+				opc = OC_ex2_projvar_scale_x
 			case "y":
-				opc = OC_ex2_projvar_projscale_y
+				opc = OC_ex2_projvar_scale_y
 			default:
 				return bvNone(), Error(fmt.Sprint("Invalid ProjVar scale argument: %s", c.token))
 			}
@@ -3444,11 +3686,11 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 
 			switch c.token {
 			case "r":
-				opc = OC_ex2_projvar_projshadow_r
+				opc = OC_ex2_projvar_shadow_r
 			case "g":
-				opc = OC_ex2_projvar_projshadow_g
+				opc = OC_ex2_projvar_shadow_g
 			case "b":
-				opc = OC_ex2_projvar_projshadow_b
+				opc = OC_ex2_projvar_shadow_b
 			default:
 				return bvNone(), Error(fmt.Sprint("Invalid ProjVar shadow argument: %s", c.token))
 			}
@@ -3485,11 +3727,13 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 				return bvNone(), Error(fmt.Sprint("Invalid ProjVar velmul argument: %s", c.token))
 			}
 		case "xshear":
-			opc = OC_ex2_projvar_projxshear
+			opc = OC_ex2_projvar_xshear
+		case "shader":
+			opc = OC_ex2_projvar_projshader
 		default:
 			return bvNone(), Error(fmt.Sprint("Invalid ProjVar argument: %s", vname))
 		}
-		if opc != OC_ex2_projvar_projangle {
+		if opc != OC_ex2_projvar_angle {
 			c.token = c.tokenizer(in)
 
 			if err := c.checkClosingParenthesis(); err != nil {
@@ -3497,60 +3741,74 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			}
 		}
 
-		bv3 := BytecodeInt(0)
+		negate, tokenRead := false, false
 		if isFlag {
-			if err := eqne2(func(not bool) error {
-				var flg int32
+			if nextIsEqne() {
+				// Attr parses "SCA, AP". Flags parse "HLA"
+				var value int32
+				var stringExp BytecodeExp
+				var not bool
 				var err error
 				if opc == OC_ex2_projvar_attr {
-					flg, err = c.trgAttr(in) // Parses "SCA, AP"
+					value, stringExp, not, err = parseAttrComparison(true, false)
 				} else {
-					flg, err = flagSub() // Parses "HLA"
+					value, stringExp, not, err = parseHitFlagComparison()
 				}
-
 				if err != nil {
-					return err
+					return bvNone(), err
 				}
-				if not {
-					bv3 = BytecodeInt(^flg)
+				if stringExp != nil {
+					// -2 tells the opcode to convert the string value below it
+					be3 = stringExp
+					be3.appendValue(BytecodeInt(-2))
 				} else {
-					bv3 = BytecodeInt(flg)
+					be3.appendValue(BytecodeInt(value))
 				}
-				return nil
-			}); err != nil {
-				return bvNone(), err
+				// Negation is applied after the opcode, so the value can't collide with the -1 sentinel
+				negate, tokenRead = not, true
+			} else {
+				// No comparison. Push the current flag as a string
+				be3.appendValue(BytecodeInt(-1))
 			}
+		} else {
+			be3.appendValue(BytecodeInt(0))
 		}
 
-		be3.appendValue(bv3)
 		be1.appendValue(bv1)
 		be1.append(be2...)
 		be1.appendValue(bv2)
 		be1.append(be3...)
 
 		if rd {
-			out.appendI32Op(OC_nordrun, int32(len(be1)))
+			out.appendI32Op(OC_run_caller, int32(len(be1)))
 		}
 		// Just in case anybody else bangs their head against a wall with redirects:
 		// it is imperative that the be1.append(opcodetype, opcode) comes after the
-		// rd out.appendI32Op(OC_nordrun, int32(len(be1)))
+		// rd out.appendI32Op(OC_run_caller, int32(len(be1)))
 		be1.append(OC_ex2_, opc)
 		out.append(be1...)
+		if negate {
+			out.append(OC_blnot)
+		}
+		// The comparison already read the next token
+		if tokenRead {
+			return bvNone(), nil
+		}
 	case "random":
 		out.append(OC_random)
 	case "reversaldefattr":
-		hda := func() error {
-			if attr, err := c.trgAttr(in); err != nil {
-				return err
-			} else {
-				out.append(OC_ex_)
-				out.appendI32Op(OC_ex_reversaldefattr, attr)
+		if nextIsEqne() {
+			attr, stringExp, not, err := parseAttrComparison(true, false)
+			if err != nil {
+				return bvNone(), err
 			}
-			return nil
+			emitAttrOrHitFlagTest(attr, stringExp, not, OC_ex_, OC_ex_reversaldefattr)
+			return bvNone(), nil
 		}
-		if err := eqne(hda); err != nil {
-			return bvNone(), err
-		}
+		// No comparison. Push the current reversal_attr as a string
+		// The opcode strips the internal "already updated" bit before converting
+		out.append(OC_ex_)
+		out.appendI32Op(OC_ex_reversaldefattr, -1)
 	case "rightedge":
 		out.append(OC_rightedge)
 	case "runorder":
@@ -3622,6 +3880,8 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			opc = OC_ex2_soundvar_position
 		case "priority":
 			opc = OC_ex2_soundvar_priority
+		case "samplerate":
+			opc = OC_ex2_soundvar_samplerate
 		case "startposition":
 			opc = OC_ex2_soundvar_startposition
 		case "volumescale":
@@ -3638,11 +3898,11 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		be1.appendValue(bv1)
 
 		if rd {
-			out.appendI32Op(OC_nordrun, int32(len(be1)))
+			out.appendI32Op(OC_run_caller, int32(len(be1)))
 		}
 		// Just in case anybody else bangs their head against a wall with redirects:
 		// it is imperative that the be1.append(opcodetype, opcode) comes after the
-		// rd out.appendI32Op(OC_nordrun, int32(len(be1)))
+		// rd out.appendI32Op(OC_run_caller, int32(len(be1)))
 		be1.append(OC_ex2_, opc)
 		out.append(be1...)
 	case "stateno", "p2stateno":
@@ -3652,9 +3912,21 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		out.append(OC_stateno)
 	case "statetype", "p2statetype", "prevstatetype":
 		trname := c.token
-		if err := eqne2(func(not bool) error {
+		pushSelf := func() {
+			if trname == "prevstatetype" {
+				out.append(OC_ex_, OC_ex_prevstatetype, 0)
+			} else if trname == "p2statetype" {
+				var sub BytecodeExp
+				sub.append(OC_statetype, 0)
+				out.appendI32Op(OC_p2, int32(len(sub)))
+				out.append(sub...)
+			} else {
+				out.append(OC_statetype, 0)
+			}
+		}
+		if err := flagTrigger(pushSelf, func(not bool) (bool, error) {
 			if len(c.token) == 0 {
-				return Error(trname + " trigger requires a comparison")
+				return false, Error(trname + " trigger requires a comparison")
 			}
 			var st StateType
 			switch c.token[0] {
@@ -3667,23 +3939,32 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			case 'l':
 				st = ST_L
 			default:
-				return Error("Invalid StateType: " + c.token)
+				return false, nil
 			}
 			if trname == "prevstatetype" {
 				out.append(OC_ex_, OC_ex_prevstatetype, OpCode(st))
-			} else {
-				if trname == "p2statetype" {
-					out.appendI32Op(OC_p2, 2+Btoi(not))
+				if not {
+					out.append(OC_blnot)
 				}
+			} else if trname == "p2statetype" {
+				var sub BytecodeExp
+				sub.append(OC_statetype, OpCode(st))
+				if not {
+					sub.append(OC_blnot)
+				}
+				out.appendI32Op(OC_p2, int32(len(sub)))
+				out.append(sub...)
+			} else {
 				out.append(OC_statetype, OpCode(st))
+				if not {
+					out.append(OC_blnot)
+				}
 			}
-			if not {
-				out.append(OC_blnot)
-			}
-			return nil
+			return true, nil
 		}); err != nil {
 			return bvNone(), err
 		}
+		return bvNone(), nil
 	case "stagebgvar":
 		if err := c.checkOpeningParenthesis(in); err != nil {
 			return bvNone(), err
@@ -3712,6 +3993,14 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		switch vname {
 		case "actionno":
 			opc = OC_ex2_stagebgvar_actionno
+		case "animelem":
+			opc = OC_ex2_stagebgvar_animelem
+		case "animelemtime":
+			opc = OC_ex2_stagebgvar_animelemtime
+		case "animloopcount":
+			opc = OC_ex2_stagebgvar_animloopcount
+		case "animtime":
+			opc = OC_ex2_stagebgvar_animtime
 		case "delta.x":
 			opc = OC_ex2_stagebgvar_delta_x
 		case "delta.y":
@@ -3748,7 +4037,7 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		be1.append(be2...)
 		be1.appendValue(bv2)
 		if rd {
-			out.appendI32Op(OC_nordrun, int32(len(be1)))
+			out.appendI32Op(OC_run_caller, int32(len(be1)))
 		}
 		be1.append(OC_ex2_, opc)
 		out.append(be1...)
@@ -3761,14 +4050,11 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		if err := c.checkClosingParenthesis(); err != nil {
 			return bvNone(), err
 		}
-		isStr := false
 		switch svname {
 		case "info.author":
 			opc = OC_const_stagevar_info_author
-			isStr = true
 		case "info.displayname":
 			opc = OC_const_stagevar_info_displayname
-			isStr = true
 		case "info.ikemenversion.major":
 			opc = OC_const_stagevar_info_ikemenversion_major
 		case "info.ikemenversion.minor":
@@ -3781,7 +4067,6 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			opc = OC_const_stagevar_info_mugenversion_minor
 		case "info.name":
 			opc = OC_const_stagevar_info_name
-			isStr = true
 		case "camera.boundleft":
 			opc = OC_const_stagevar_camera_boundleft
 		case "camera.boundright":
@@ -3790,6 +4075,10 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			opc = OC_const_stagevar_camera_boundhigh
 		case "camera.boundlow":
 			opc = OC_const_stagevar_camera_boundlow
+		case "camera.zboundtop":
+			opc = OC_const_stagevar_camera_zboundtop
+		case "camera.zboundbot":
+			opc = OC_const_stagevar_camera_zboundbot
 		case "camera.verticalfollow":
 			opc = OC_const_stagevar_camera_verticalfollow
 		case "camera.floortension":
@@ -3800,8 +4089,12 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			opc = OC_const_stagevar_camera_tensionlow
 		case "camera.tension":
 			opc = OC_const_stagevar_camera_tension
+		case "camera.ztension":
+			opc = OC_const_stagevar_camera_ztension
 		case "camera.tensionvel":
 			opc = OC_const_stagevar_camera_tensionvel
+		case "camera.ztensionvel":
+			opc = OC_const_stagevar_camera_ztensionvel
 		case "camera.cuthigh":
 			opc = OC_const_stagevar_camera_cuthigh
 		case "camera.cutlow":
@@ -3824,6 +4117,8 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			opc = OC_const_stagevar_camera_ytension_enable
 		case "camera.autocenter":
 			opc = OC_const_stagevar_camera_autocenter
+		case "camera.zautocenter":
+			opc = OC_const_stagevar_camera_zautocenter
 		case "camera.lowestcap":
 			opc = OC_const_stagevar_camera_lowestcap
 		case "playerinfo.leftbound":
@@ -3900,6 +4195,8 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			opc = OC_const_stagevar_shadow_offset_x
 		case "shadow.offset.y":
 			opc = OC_const_stagevar_shadow_offset_y
+		case "shadow.shader":
+			opc = OC_const_stagevar_shadow_shader
 		case "reflection.intensity":
 			opc = OC_const_stagevar_reflection_intensity
 		case "reflection.yscale":
@@ -3922,21 +4219,18 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			opc = OC_const_stagevar_reflection_color_g
 		case "reflection.color.b":
 			opc = OC_const_stagevar_reflection_color_b
+		case "reflection.shader":
+			opc = OC_const_stagevar_reflection_shader
 		default:
 			return bvNone(), Error("Invalid StageVar argument: " + svname)
 		}
-		if isStr {
-			if err := nameSub(OC_const_, opc); err != nil {
-				return bvNone(), err
-			}
-		} else {
-			out.append(OC_const_)
-			out.append(opc)
-		}
+		out.append(OC_const_)
+		out.append(opc)
 	case "teammode":
-		if err := eqne(func() error {
+		pushSelf := func() { out.append(OC_teammode, 255) }
+		if err := flagTrigger(pushSelf, func(not bool) (bool, error) {
 			if len(c.token) == 0 {
-				return Error("TeamMode trigger requires a comparison")
+				return false, Error("TeamMode trigger requires a comparison")
 			}
 			var tm TeamMode
 			switch c.token {
@@ -3949,13 +4243,17 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			case "tag":
 				tm = TM_Tag
 			default:
-				return Error("Invalid TeamMode: " + c.token)
+				return false, nil
 			}
 			out.append(OC_teammode, OpCode(tm))
-			return nil
+			if not {
+				out.append(OC_blnot)
+			}
+			return true, nil
 		}); err != nil {
 			return bvNone(), err
 		}
+		return bvNone(), nil
 	case "teamside":
 		out.append(OC_teamside)
 	case "tickspersecond":
@@ -4007,14 +4305,14 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		be1.appendValue(BytecodeInt(n))
 		// TODO: This probably has the same redirection issue old projectile triggers had
 		if rd {
-			out.appendI32Op(OC_nordrun, int32(len(be1)))
+			out.appendI32Op(OC_run_caller, int32(len(be1)))
 		}
 		out.append(be1...)
 		out.append(OC_animelemtime)
 		if err = c.evaluateComparison(&be, in, false); err != nil {
 			return bvNone(), err
 		}
-		out.append(OC_jsf8, OpCode(len(be)))
+		out.append(OC_jud8, OpCode(len(be)))
 		out.append(be...)
 		return bv, nil
 	case "timemod":
@@ -4552,18 +4850,15 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		if err := c.checkClosingParenthesis(); err != nil {
 			return bvNone(), err
 		}
-		isStr := false
 		switch fsvname {
 		case "info.author":
 			opc = OC_ex2_fightscreenvar_info_author
-			isStr = true
 		case "info.localcoord.x":
 			opc = OC_ex2_fightscreenvar_info_localcoord_x
 		case "info.localcoord.y":
 			opc = OC_ex2_fightscreenvar_info_localcoord_y
 		case "info.name":
 			opc = OC_ex2_fightscreenvar_info_name
-			isStr = true
 		case "round.ctrl.time":
 			opc = OC_ex2_fightscreenvar_round_ctrl_time
 		case "round.over.hittime":
@@ -4585,22 +4880,14 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		default:
 			return bvNone(), Error("Invalid FightScreenVar argument: " + fsvname)
 		}
-		if isStr {
-			if err := nameSub(OC_ex2_, opc); err != nil {
-				return bvNone(), err
-			}
-		} else {
-			out.append(OC_ex2_)
-			out.append(opc)
-		}
+		out.append(OC_ex2_)
+		out.append(opc)
 	case "fighttime":
 		out.append(OC_ex_, OC_ex_fighttime)
 	case "firstattack":
 		out.append(OC_ex_, OC_ex_firstattack)
 	case "gamemode":
-		if err := nameSub(OC_ex_, OC_ex_gamemode); err != nil {
-			return bvNone(), err
-		}
+		out.append(OC_ex_, OC_ex_gamemode)
 	case "gamevar":
 		if err := c.checkOpeningParenthesis(in); err != nil {
 			return bvNone(), err
@@ -4643,9 +4930,7 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 	case "guardpointsmax":
 		out.append(OC_ex_, OC_ex_guardpointsmax)
 	case "helpername":
-		if err := nameSub(OC_ex_, OC_ex_helpername); err != nil {
-			return bvNone(), err
-		}
+		out.append(OC_ex_, OC_ex_helpername)
 	case "hitoverridden":
 		out.append(OC_ex_, OC_ex_hitoverridden)
 	case "ikemenversion":
@@ -4670,6 +4955,8 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		out.append(OC_ex_, OC_ex_incustomanim)
 	case "incustomstate":
 		out.append(OC_ex_, OC_ex_incustomstate)
+	case "inrunstate":
+		out.append(OC_ex3_, OC_ex3_inrunstate)
 	case "inputtime":
 		if err := c.checkOpeningParenthesisCS(in); err != nil {
 			return bvNone(), err
@@ -4911,10 +5198,69 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		if err := c.checkOpeningParenthesis(in); err != nil {
 			return bvNone(), err
 		}
-		var m string = c.token
+		// map(name) with a single name is a literal key, as before
+		// Anything else is a string expression, e.g. map("name"), map($name) or map(ifelse(...))
+		// So map(ifelse) is the same as map("ifelse") but not map(ifelse(...))
+		key := c.token
+		var keyExp BytecodeExp
+		// Read the token after the key, and go back if the key turns out to be an expression
+		savedIn := *in
 		c.token = c.tokenizer(in)
+		// A quote starts a string and "$" starts a local variable, so neither is a name
+		// Anything other than ")" or an index after the key means the expression continues
+		if key == "\"" || strings.HasPrefix(key, "$") || (c.token != ")" && c.token != ",") {
+			c.token, *in = key, savedIn
+			kv, err := c.expBoolOr(&keyExp, in)
+			if err != nil {
+				return bvNone(), err
+			}
+			// Constant numbers can't be keys. Runtime values are still unchecked
+			if !kv.IsNone() && kv.vtype != VT_String {
+				return bvNone(), Error("Expected a string expression")
+			}
+			keyExp.appendValue(kv)
+			// Constant keys are resolved now, the same as a single name
+			// A lone OC_string with its 4 byte index means the key is a plain quoted string
+			if len(keyExp) == 5 && keyExp[0] == OC_string {
+				i := 1
+				key = sys.stringPool[c.playerNo].List[keyExp.ReadIntAt(&i)]
+				keyExp = nil
+			}
+		}
+		// map(name, index) reads one element of an indexed map
+		var indexExp BytecodeExp
+		if c.token == "," {
+			c.token = c.tokenizer(in)
+			iv, err := c.expBoolOr(&indexExp, in)
+			if err != nil {
+				return bvNone(), err
+			}
+			indexExp.appendValue(iv)
+		}
 		if err := c.checkClosingParenthesis(); err != nil {
 			return bvNone(), err
+		}
+		// Literal keys are stored lowercase in the string pool, as before
+		// For expressions, -1 tells the opcode to take the key from the stack instead
+		keyIdx := int32(-1)
+		if keyExp == nil {
+			keyIdx = int32(sys.stringPool[c.playerNo].Add(strings.ToLower(key)))
+		} else {
+			// The key belongs to the caller, not the redirect target
+			// It's pushed before any := value, so the opcode pops the value first
+			if rd {
+				out.appendI32Op(OC_run_caller, int32(len(keyExp)))
+			}
+			out.append(keyExp...)
+		}
+		// The index also belongs to the caller. It's pushed after the key and before any := value
+		assignOp, exOp := OC_assign_map, OC_ex_map
+		if indexExp != nil {
+			if rd {
+				out.appendI32Op(OC_run_caller, int32(len(indexExp)))
+			}
+			out.append(indexExp...)
+			assignOp, exOp = OC_assign_mapindexed, OC_ex_mapindexed
 		}
 		c.token = c.tokenizer(in)
 		// Map assignment with := operator
@@ -4929,14 +5275,14 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			}
 			be2.appendValue(bv2)
 			if rd {
-				out.appendI32Op(OC_nordrun, int32(len(be2)))
+				out.appendI32Op(OC_run_caller, int32(len(be2)))
 			}
 			out.append(be2...)
-			out.append(OC_st_)
-			out.appendI32Op(OC_st_map, int32(sys.stringPool[c.playerNo].Add(strings.ToLower(m))))
+			out.append(OC_assign_)
+			out.appendI32Op(assignOp, keyIdx)
 		} else {
 			out.append(OC_ex_)
-			out.appendI32Op(OC_ex_maparray, int32(sys.stringPool[c.playerNo].Add(strings.ToLower(m))))
+			out.appendI32Op(exOp, keyIdx)
 		}
 		return bvNone(), nil
 	case "memberno":
@@ -5009,9 +5355,9 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		case "power":
 			out.append(OC_ex_movehitvar_power)
 		case "sparkx":
-			out.append(OC_ex_movehitvar_spark_x)
+			out.append(OC_ex_movehitvar_sparkx)
 		case "sparky":
-			out.append(OC_ex_movehitvar_spark_y)
+			out.append(OC_ex_movehitvar_sparky)
 		case "uniqhit":
 			out.append(OC_ex_movehitvar_uniqhit)
 		default:
@@ -5042,9 +5388,10 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 	case "pausetime":
 		out.append(OC_ex_, OC_ex_pausetime)
 	case "physics":
-		if err := eqne(func() error {
+		pushSelf := func() { out.append(OC_ex_, OC_ex_physics, 0) }
+		if err := flagTrigger(pushSelf, func(not bool) (bool, error) {
 			if len(c.token) == 0 {
-				return Error("Physics trigger requires a comparison")
+				return false, Error("Physics trigger requires a comparison")
 			}
 			var st StateType
 			switch c.token[0] {
@@ -5057,13 +5404,18 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			case 'n':
 				st = ST_N
 			default:
-				return Error("Invalid Physics type: " + c.token)
+				//return Error("Invalid Physics type: " + c.token)
+				return false, nil
 			}
 			out.append(OC_ex_, OC_ex_physics, OpCode(st))
-			return nil
+			if not {
+				out.append(OC_blnot)
+			}
+			return true, nil
 		}); err != nil {
 			return bvNone(), err
 		}
+		return bvNone(), nil
 	case "playerindexexist":
 		if _, err := c.oneArg(out, in, rd, true); err != nil {
 			return bvNone(), err
@@ -5094,9 +5446,7 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 		}
 		out.append(OC_ex_, OC_ex_selfstatenoexist)
 	case "shader":
-		if err := nameSub(OC_ex2_, OC_ex2_shader); err != nil {
-			return bvNone(), err
-		}
+		out.append(OC_ex2_, OC_ex2_shader)
 	case "spritevar":
 		if err := c.checkOpeningParenthesis(in); err != nil {
 			return bvNone(), err
@@ -5302,7 +5652,7 @@ func (c *CharCompiler) expValue(out *BytecodeExp, in *string,
 			}
 			// If we're inside a redirect, force the whole expression to execute in the redirected context
 			if rd {
-				out.appendI32Op(OC_run, int32(len(oldblock)))
+				out.appendI32Op(OC_run_redir, int32(len(oldblock)))
 			}
 			out.append(oldblock...)
 			return bvNone(), nil
@@ -5678,15 +6028,15 @@ func (c *CharCompiler) expOneOp(out *BytecodeExp, in *string, ef expFunc,
 }
 
 func (c *CharCompiler) expAnd(out *BytecodeExp, in *string) (BytecodeValue, error) {
-	return c.expOneOp(out, in, c.expEqne, "&", out.and, OC_and)
+	return c.expOneOp(out, in, c.expEqne, "&", out.bwand, OC_bwand)
 }
 
 func (c *CharCompiler) expXor(out *BytecodeExp, in *string) (BytecodeValue, error) {
-	return c.expOneOp(out, in, c.expAnd, "^", out.xor, OC_xor)
+	return c.expOneOp(out, in, c.expAnd, "^", out.bwxor, OC_bwxor)
 }
 
 func (c *CharCompiler) expOr(out *BytecodeExp, in *string) (BytecodeValue, error) {
-	return c.expOneOp(out, in, c.expXor, "|", out.or, OC_or)
+	return c.expOneOp(out, in, c.expXor, "|", out.bwor, OC_bwor)
 }
 
 func (c *CharCompiler) expBoolAnd(out *BytecodeExp, in *string) (BytecodeValue, error) {
@@ -5783,6 +6133,10 @@ func (c *CharCompiler) typedExp(ef expFunc, in *string,
 		return nil, err
 	}
 	if !bv.IsNone() {
+		// Constant numbers can't stand in for strings. Runtime values are still unchecked
+		if vt == VT_String && bv.vtype != VT_String {
+			return nil, Error("Expected a string expression")
+		}
 		switch vt {
 		case VT_Float:
 			bv.SetF(bv.ToF())
@@ -6120,6 +6474,56 @@ func (c *CharCompiler) getDataPrefix(data *string, ffxDefault bool) (prefix stri
 	return
 }
 
+// Builds an expression that pushes a pooled string constant
+func (c *CharCompiler) stringToExp(s string) []BytecodeExp {
+	be := BytecodeExp{}
+	be.appendI32Op(OC_string, int32(sys.stringPool[c.playerNo].Add(s)))
+	return []BytecodeExp{be}
+}
+
+// Handles parameters with FX prefixes
+func (c *CharCompiler) paramPrefixValue(is IniSection, sc *StateControllerBase,
+	name string, id byte, numArg int, mandatory, ffxDefault bool) error {
+	return c.stateParam(is, name, mandatory, func(data string) error {
+		// Legacy syntax: a lexically stripped prefix means the rest is purely numeric
+		// anim = F 40
+		length := len(data)
+		prefix := c.getDataPrefix(&data, ffxDefault)
+		if len(data) < length {
+			return c.scAdd(sc, id, data, VT_Int, numArg, c.stringToExp(prefix)...)
+		}
+		// Try the whole value as numeric arguments without a prefix
+		// anim = 40
+		bes, err := c.exprs(data, VT_Int, numArg)
+		if err == nil {
+			def := ""
+			if ffxDefault {
+				def = "f"
+			}
+			sc.add(id, append(c.stringToExp(def), bes...))
+			return nil
+		}
+		// Dynamic prefix: a string expression followed by a comma and the numeric arguments
+		// anim = "F", 40 or anim = [string expression], 40
+		rest := data
+		c.token = c.tokenizer(&rest)
+		var sbe BytecodeExp
+		bv, err2 := c.expBoolOr(&sbe, &rest)
+		if err2 != nil || c.token != "," || (!bv.IsNone() && bv.vtype != VT_String) {
+			return err // Keep the legacy error message for values that aren't string-prefixed
+		}
+		if !bv.IsNone() {
+			sbe.appendValue(bv)
+		}
+		bes, err = c.exprs(rest, VT_Int, numArg)
+		if err != nil {
+			return err
+		}
+		sc.add(id, append([]BytecodeExp{sbe}, bes...))
+		return nil
+	})
+}
+
 func (c *CharCompiler) exprs(data string, vt ValueType,
 	numArg int) ([]BytecodeExp, error) {
 	bes := []BytecodeExp{}
@@ -6170,6 +6574,47 @@ func (c *CharCompiler) paramValue(is IniSection, sc *StateControllerBase,
 	if mandatory && !found {
 		return Error(paramname + " not specified")
 	}
+	return nil
+}
+
+// This path tolerates gibberish in CNS. Only for parameters confirmed to do the same in Mugen
+// https://github.com/ikemen-engine/Ikemen-GO/issues/4099
+func (c *CharCompiler) paramValueLoose(is IniSection, sc *StateControllerBase,
+	paramname string, id byte, vt ValueType, numArg int, mandatory bool) error {
+	// Try parsing normally
+	err := c.paramValue(is, sc, paramname, id, vt, numArg, mandatory)
+
+	// ZSS pushes the error immediately like usual
+	if err == nil || c.zssMode || !sys.ignoreMostErrors {
+		return err
+	}
+
+	// CNS falls back to the raw text
+	// This second pass relies on stateParam keeping the key when parsing fails
+	data, ok := is[paramname]
+	if !ok {
+		return err
+	}
+	delete(is, paramname)
+	str := strings.TrimSpace(data)
+
+	// String params keep the text as is
+	// Valid quoted strings were already parsed in the normal path, so this only strips the outer pair from partly quoted text
+	if vt == VT_String {
+		if len(str) >= 2 && str[0] == '"' && str[len(str)-1] == '"' {
+			str = str[1 : len(str)-1]
+		}
+		sc.add(id, c.stringToExp(str))
+		return nil
+	}
+
+	// Other types ignore the value with a warning and keep their default
+	// Storing the string would read as 0/false and override that default
+	sys.appendToConsole(c.charWarn() + paramname + " = " + str + ", ignored")
+	if mandatory {
+		return err
+	}
+
 	return nil
 }
 
@@ -6323,13 +6768,21 @@ func (c *CharCompiler) paramPostype(is IniSection, sc *StateControllerBase, id b
 	})
 }
 
-func (c *CharCompiler) paramSpace(is IniSection, sc *StateControllerBase, id byte) error {
+func (c *CharCompiler) paramSpace(is IniSection, sc *StateControllerBase, id byte, allowNone bool) error {
 	return c.stateParam(is, "space", false, func(data string) error {
 		if len(data) == 0 {
 			return Error("space not specified")
 		}
 		var spc Space
 		switch strings.ToLower(data) {
+		case "none":
+			if allowNone {
+				spc = Space_none
+			} else if c.zssMode && !sys.ignoreMostErrors {
+				return Error("Invalid space type: " + data)
+			} else {
+				sys.appendToConsole(c.charWarn() + "Invalid space type: " + data)
+			}
 		case "stage":
 			spc = Space_stage
 		case "screen":
@@ -6498,7 +6951,7 @@ func (c *CharCompiler) paramTrans(is IniSection, sc *StateControllerBase, prefix
 		// You couldn't define alpha for "sub" type in Mugen, so we'll lock it to defaults for Mugen characters
 		// https://github.com/ikemen-engine/Ikemen-GO/issues/3868
 		// TODO: They can still do it in the AIR format, so this might be moot
-		if tt == TT_sub && sys.cgi[c.playerNo].ikemenver[0] == 0 && sys.cgi[c.playerNo].ikemenver[1] == 0 {
+		if tt == TT_sub && c.targetGi.ikemenver[0] == 0 && c.targetGi.ikemenver[1] == 0 {
 			exp[0] = sc.iToExp(defsrc)[0]
 			exp[1] = sc.iToExp(defdst)[0]
 		}
@@ -6518,6 +6971,8 @@ func (c *CharCompiler) paramClsnType(is IniSection, sc *StateControllerBase, par
 		}
 		var box int32
 		switch strings.ToLower(data) {
+		case "all":
+			box = -1
 		case "none":
 			box = 0
 		case "clsn1":
@@ -6526,6 +6981,8 @@ func (c *CharCompiler) paramClsnType(is IniSection, sc *StateControllerBase, par
 			box = 2
 		case "size":
 			box = 3
+		case "dummy":
+			box = 4
 		default:
 			return Error("Invalid Clsn type for " + paramName + ": " + data)
 		}
@@ -6550,8 +7007,7 @@ func (c *CharCompiler) paramStringList(is IniSection, sc *StateControllerBase, p
 			if err != nil {
 				return Error("Invalid quoted string: " + part)
 			}
-			be := BytecodeExp(unquoted)
-			allBe = append(allBe, be)
+			allBe = append(allBe, c.stringToExp(unquoted)...)
 		}
 		if len(allBe) > 0 {
 			sc.add(opcode, allBe)
@@ -6562,68 +7018,42 @@ func (c *CharCompiler) paramStringList(is IniSection, sc *StateControllerBase, p
 
 // Interprets an IniSection of statedef properties and sets them to a StateBytecode
 func (c *CharCompiler) stateDef(is IniSection, sbc *StateBytecode) error {
+	// Negative states are never entered, so their header is unused
+	// CNS ignores it like Mugen does. ZSS rejects it
+	if c.stateNo < 0 {
+		if c.zssMode && len(is) > 0 {
+			return Error("Negative states cannot have StateDef parameters")
+		}
+		return nil
+	}
 	return c.stateSec(is, func() error {
 		sc := newStateControllerBase()
 		if err := c.stateParam(is, "type", false, func(data string) error {
-			if len(data) == 0 {
-				return Error("statetype not specified")
+			v, be, err := c.typeExpression(data, "statetype", "SCALUscalu", stateTypeValue)
+			if err != nil {
+				return err
 			}
-			switch strings.ToLower(data)[0] {
-			case 's':
-				sbc.stateType = ST_S
-			case 'c':
-				sbc.stateType = ST_C
-			case 'a':
-				sbc.stateType = ST_A
-			case 'l':
-				sbc.stateType = ST_L
-			case 'u':
-				sbc.stateType = ST_U
-			default:
-				return Error("Invalid statetype: " + data)
-			}
+			sbc.stateType, sbc.stateTypeExp = StateType(v), be
 			return nil
 		}); err != nil {
 			return err
 		}
 		if err := c.stateParam(is, "movetype", false, func(data string) error {
-			if len(data) == 0 {
-				return Error("movetype not specified")
+			v, be, err := c.typeExpression(data, "movetype", "IAHUiahu", moveTypeValue)
+			if err != nil {
+				return err
 			}
-			switch strings.ToLower(data)[0] {
-			case 'i':
-				sbc.moveType = MT_I
-			case 'a':
-				sbc.moveType = MT_A
-			case 'h':
-				sbc.moveType = MT_H
-			case 'u':
-				sbc.moveType = MT_U
-			default:
-				return Error("Invalid movetype: " + data)
-			}
+			sbc.moveType, sbc.moveTypeExp = MoveType(v), be
 			return nil
 		}); err != nil {
 			return err
 		}
 		if err := c.stateParam(is, "physics", false, func(data string) error {
-			if len(data) == 0 {
-				return Error("physics not specified")
+			v, be, err := c.typeExpression(data, "physics type", "SCANUscanu", physicsTypeValue)
+			if err != nil {
+				return err
 			}
-			switch strings.ToLower(data)[0] {
-			case 's':
-				sbc.physics = ST_S
-			case 'c':
-				sbc.physics = ST_C
-			case 'a':
-				sbc.physics = ST_A
-			case 'n':
-				sbc.physics = ST_N
-			case 'u':
-				sbc.physics = ST_U
-			default:
-				return Error("Invalid physics type: " + data)
-			}
+			sbc.physics, sbc.physicsExp = StateType(v), be
 			return nil
 		}); err != nil {
 			return err
@@ -6675,11 +7105,7 @@ func (c *CharCompiler) stateDef(is IniSection, sbc *StateBytecode) error {
 			stateDef_velset, VT_Float, 3, false); err != nil {
 			return err
 		}
-		if err := c.stateParam(is, "anim", false, func(data string) error {
-			prefix := c.getDataPrefix(&data, false)
-			return c.scAdd(sc, stateDef_anim, data, VT_Int, 1,
-				sc.beToExp(BytecodeExp(prefix))...)
-		}); err != nil {
+		if err := c.paramPrefixValue(is, sc, "anim", stateDef_anim, 1, false, false); err != nil {
 			return err
 		}
 		if err := c.paramValue(is, sc, "ctrl",
@@ -6737,8 +7163,8 @@ func cnsStringArray(arg string) ([]string, error) {
 }
 
 // Forwards state compiling to CNS or ZSS branches as appropriate
-func (c *CharCompiler) stateCompile(states map[int32]StateBytecode,
-	filename string, dirs []string, negoverride bool, constants map[string]float32) error {
+func (c *CharCompiler) stateCompile(states map[int32]*StateBytecode,
+	filename string, dirs []string, negoverride bool, constants map[string]TypedValue) error {
 
 	// Determine type from extension
 	isZss := HasExtension(filename, ".zss")
@@ -6783,7 +7209,7 @@ func (c *CharCompiler) stateCompile(states map[int32]StateBytecode,
 	return c.stateCompileCNS(states, filename, filetext, negoverride, constants)
 }
 
-func (c *CharCompiler) stateCompileCNS(states map[int32]StateBytecode, filename, filetext string, negoverride bool, constants map[string]float32) error {
+func (c *CharCompiler) stateCompileCNS(states map[int32]*StateBytecode, filename, filetext string, negoverride bool, constants map[string]TypedValue) error {
 	// Reset ZSS mode
 	c.zssMode = false
 
@@ -6840,8 +7266,8 @@ func (c *CharCompiler) stateCompileCNS(states map[int32]StateBytecode, filename,
 			return errmes(err)
 		}
 		sbc := newStateBytecode(c.playerNo)
-		if _, ok := states[c.stateNo]; ok && c.stateNo < 0 {
-			*sbc = states[c.stateNo]
+		if old, ok := states[c.stateNo]; ok && c.stateNo < 0 {
+			*sbc = *old
 		}
 		// Interpret the statedef properties
 		if err := c.stateDef(is, sbc); err != nil {
@@ -6905,7 +7331,7 @@ func (c *CharCompiler) stateCompileCNS(states map[int32]StateBytecode, filename,
 					}
 				case "ignorehitpause":
 					ih := Atoi(data) != 0
-					c.block.ignorehitpause = Btoi(ih) - 2
+					c.block.ignorehitpause = ih
 					c.block.ctrlsIgnorehitpause = ih
 				default:
 					// Handle triggers
@@ -7089,9 +7515,10 @@ func (c *CharCompiler) stateCompileCNS(states map[int32]StateBytecode, filename,
 				}
 			}
 			if appending {
-				// If the trigger is always true
-				if len(c.block.trigger) == 0 && c.block.persistentIndex < 0 &&
-					c.block.ignorehitpause < -1 {
+				// If the trigger is always true and persistent, just skip the wrapper block entirely
+				// This will allow it to be executed faster later
+				//if len(c.block.trigger) == 0 && c.block.persistentIndex < 0 &&
+				if len(c.block.trigger) == 0 && c.block.persistent == 1 && !c.block.ignorehitpause {
 					if _, ok := sctrl.(NullStateController); !ok {
 						sbc.block.ctrls = append(sbc.block.ctrls, sctrl)
 					}
@@ -7099,9 +7526,9 @@ func (c *CharCompiler) stateCompileCNS(states map[int32]StateBytecode, filename,
 					if _, ok := sctrl.(NullStateController); !ok {
 						c.block.ctrls = append(c.block.ctrls, sctrl)
 					}
-					sbc.block.ctrls = append(sbc.block.ctrls, *c.block)
-					if c.block.ignorehitpause >= -1 {
-						sbc.block.ignorehitpause = -1
+					sbc.block.ctrls = append(sbc.block.ctrls, c.block)
+					if c.block.ignorehitpause {
+						sbc.block.ignorehitpause = true
 					}
 				}
 			}
@@ -7109,7 +7536,7 @@ func (c *CharCompiler) stateCompileCNS(states map[int32]StateBytecode, filename,
 
 		// Skip appending if already declared. Exception for negative states present in CommonStates and files belonging to char flagged with ikemenversion
 		if _, ok := states[c.stateNo]; !ok || (!negoverride && c.stateNo < 0) {
-			states[c.stateNo] = *sbc
+			states[c.stateNo] = sbc
 		}
 	}
 	return nil
@@ -7329,7 +7756,7 @@ func (c *CharCompiler) scanI32(line *string) (int32, error) {
 	return int32(v), err
 }
 
-func (c *CharCompiler) scanStateDef(line *string, constants map[string]float32) (int32, error) {
+func (c *CharCompiler) scanStateDef(line *string, constants map[string]TypedValue) (int32, error) {
 	t := c.scan(line)
 	if t == "" {
 		return 0, c.wrongClosureToken()
@@ -7343,8 +7770,10 @@ func (c *CharCompiler) scanStateDef(line *string, constants map[string]float32) 
 		v, ok := constants[k]
 		if !ok {
 			err = Error(fmt.Sprintf("StateDef constant not found: %v", k))
+		} else if v.Type != VT_Int {
+			err = Error(fmt.Sprintf("StateDef constant is not an integer: %v", k))
 		}
-		return int32(v), err
+		return int32(v.ToF()), err
 	}
 	// Special +1 case
 	if t == "+" {
@@ -7367,7 +7796,7 @@ func (c *CharCompiler) blockAttribSet(line *string, bl *StateBlock, sbc *StateBy
 	inheritIhp, nestedInLoop bool) error {
 	// Inherit ignorehitpause/loop attr from parent block
 	if inheritIhp {
-		bl.ignorehitpause, bl.ctrlsIgnorehitpause = -1, true
+		bl.ignorehitpause, bl.ctrlsIgnorehitpause = true, true
 		// Avoid re-reading ignorehitpause
 		if c.token == "ignorehitpause" {
 			c.scan(line)
@@ -7377,10 +7806,10 @@ func (c *CharCompiler) blockAttribSet(line *string, bl *StateBlock, sbc *StateBy
 	for {
 		switch c.token {
 		case "ignorehitpause":
-			if bl.ignorehitpause >= -1 {
+			if bl.ignorehitpause {
 				return c.wrongClosureToken()
 			}
-			bl.ignorehitpause, bl.ctrlsIgnorehitpause = -1, true
+			bl.ignorehitpause, bl.ctrlsIgnorehitpause = true, true
 			c.scan(line)
 			continue
 		case "persistent":
@@ -7490,8 +7919,8 @@ func (c *CharCompiler) subBlock(line *string, root bool,
 			sbc, numVars, inheritIhp || bl.ctrlsIgnorehitpause, nestedInLoop); err != nil {
 			return nil, err
 		}
-		if bl.elseBlock.ignorehitpause >= -1 {
-			bl.ignorehitpause = -1
+		if bl.elseBlock.ignorehitpause {
+			bl.ignorehitpause = true
 		}
 	}
 	return bl, nil
@@ -7590,10 +8019,10 @@ func (c *CharCompiler) switchBlock(line *string, bl *StateBlock,
 	if sbl, err := readNextCase(nil); err != nil {
 		return err
 	} else {
-		if bl != nil && sbl.ignorehitpause >= -1 {
-			bl.ignorehitpause = -1
+		if bl != nil && sbl.ignorehitpause {
+			bl.ignorehitpause = true
 		}
-		bl.ctrls = append(bl.ctrls, *sbl)
+		bl.ctrls = append(bl.ctrls, sbl)
 	}
 	return nil
 }
@@ -7767,13 +8196,13 @@ func (c *CharCompiler) letAssign(line *string, root bool,
 			return err
 		}
 	default:
-		otk := c.token
+		// Push the token back rather than rejoining with " ", which breaks strings
+		*line = c.token + *line
 		expr, _, err := c.readSentence(line)
 		if err != nil {
 			return err
 		}
-		expr = otk + " " + expr
-		otk = c.token
+		otk := c.token
 		for i, n := range names {
 			var be BytecodeExp
 			if i < len(names)-1 {
@@ -7837,10 +8266,10 @@ func (c *CharCompiler) stateBlock(line *string, bl *StateBlock, root bool,
 				bl != nil && bl.ctrlsIgnorehitpause, bl != nil && bl.nestedInLoop); err != nil {
 				return err
 			} else {
-				if bl != nil && sbl.ignorehitpause >= -1 {
-					bl.ignorehitpause = -1
+				if bl != nil && sbl.ignorehitpause {
+					bl.ignorehitpause = true
 				}
-				*ctrls = append(*ctrls, *sbl)
+				*ctrls = append(*ctrls, sbl)
 			}
 			continue
 		case "call":
@@ -7930,13 +8359,13 @@ func (c *CharCompiler) stateBlock(line *string, bl *StateBlock, root bool,
 				c.scan(line)
 				continue
 			} else {
-				otk := c.token
+				// Same push-back as letAssign
+				*line = c.token + *line
 				expr, assign, err := c.readSentence(line)
 				if err != nil {
 					return err
 				}
-				expr = otk + " " + expr
-				otk = c.token
+				otk := c.token
 				if stex, err := c.fullExpression(&expr, VT_Undefined); err != nil {
 					return err
 				} else {
@@ -7963,7 +8392,7 @@ func (c *CharCompiler) stateBlock(line *string, bl *StateBlock, root bool,
 	return c.wrongClosureToken()
 }
 
-func (c *CharCompiler) stateCompileZSS(states map[int32]StateBytecode, filename, filetext string, constants map[string]float32) error {
+func (c *CharCompiler) stateCompileZSS(states map[int32]*StateBytecode, filename, filetext string, constants map[string]TypedValue) error {
 	// Enable ZSS mode
 	// TODO: There's some overlap between this flag and sys.ignoreMostErrors
 	c.zssMode = true
@@ -8031,8 +8460,8 @@ func (c *CharCompiler) stateCompileZSS(states map[int32]StateBytecode, filename,
 				}
 			}
 			sbc := newStateBytecode(c.playerNo)
-			if _, ok := states[c.stateNo]; ok && c.stateNo < 0 {
-				*sbc = states[c.stateNo]
+			if old, ok := states[c.stateNo]; ok && c.stateNo < 0 {
+				*sbc = *old
 			}
 			c.vars = make(map[string]uint8)
 			if err := c.stateDef(is, sbc); err != nil {
@@ -8046,7 +8475,7 @@ func (c *CharCompiler) stateCompileZSS(states map[int32]StateBytecode, filename,
 				return errmes(err)
 			}
 			if _, ok := states[c.stateNo]; !ok || c.stateNo < 0 {
-				states[c.stateNo] = *sbc
+				states[c.stateNo] = sbc
 			}
 		case "function":
 			name := c.scan(&line)
@@ -8126,9 +8555,12 @@ func (c *CharCompiler) stateCompileZSS(states map[int32]StateBytecode, filename,
 }
 
 // Compile a character definition file
-func (c *CharCompiler) Compile(pn int, def string, constants map[string]float32) (map[int32]StateBytecode, error) {
+func (c *CharCompiler) Compile(p *Char, def string, gi *CharGlobalInfo) (map[int32]*StateBytecode, error) {
+	pn := p.playerNo
+	constants := gi.constants
 	c.playerNo = pn
-	states := make(map[int32]StateBytecode)
+	c.targetGi = gi
+	states := make(map[int32]*StateBytecode)
 
 	// Load initial data from definition file
 	str, err := LoadText(def)
@@ -8148,11 +8580,11 @@ func (c *CharCompiler) Compile(pn int, def string, constants map[string]float32)
 			if info {
 				info = false
 				// Read MugenVersion and IkemenVersion
-				sys.cgi[pn].mugenver = ParseMugenVersion(is["mugenversion"])
-				sys.cgi[pn].ikemenver = ParseIkemenVersion(is["ikemenversion"])
+				gi.mugenver = ParseMugenVersion(is["mugenversion"])
+				gi.ikemenver = ParseIkemenVersion(is["ikemenversion"])
 				// Ikemen characters adopt Mugen 1.1 version as a safeguard
-				if sys.cgi[pn].ikemenver[0] != 0 || sys.cgi[pn].ikemenver[1] != 0 {
-					sys.cgi[pn].mugenver = [2]uint16{1, 1}
+				if gi.ikemenver[0] != 0 || gi.ikemenver[1] != 0 {
+					gi.mugenver = [2]uint16{1, 1}
 				}
 			}
 		case "files":
@@ -8161,11 +8593,16 @@ func (c *CharCompiler) Compile(pn int, def string, constants map[string]float32)
 				files = false
 				cmd, stcommon = decodeShiftJIS(is["cmd"]), decodeShiftJIS(is["stcommon"])
 				re := regexp.MustCompile(`^st[0-9]*$`)
-				// Sorted starting with "st" and followed by "st<num>" in natural order
-				for _, v := range SortedKeys(is) {
-					if re.MatchString(v) {
-						st = append(st, decodeShiftJIS(is[v]))
+				// "st" then "st<num>" in natural order. Only st keys are sorted, since others
+				// like movelist.2 don't fit that form.
+				stFiles := make(map[string]string)
+				for k, v := range is {
+					if re.MatchString(k) {
+						stFiles[k] = v
 					}
+				}
+				for _, v := range SortedKeys(stFiles) {
+					st = append(st, decodeShiftJIS(stFiles[v]))
 				}
 
 			}
@@ -8204,16 +8641,15 @@ func (c *CharCompiler) Compile(pn int, def string, constants map[string]float32)
 	lines, lnidx = SplitAndTrim(str, "\n"), 0
 
 	// Initialize command list data
-	char := sys.chars[pn][0]
-	if char.cmd == nil {
-		char.cmd = make([]CommandList, MaxPlayerNo)
+	if p.cmd == nil {
+		p.cmd = make([]CommandList, MaxPlayerNo)
 		// Create one single input buffer and link it to all command lists
 		buffer := NewInputBuffer()
-		for i := range char.cmd {
-			char.cmd[i] = *NewCommandList(buffer)
+		for i := range p.cmd {
+			p.cmd[i] = *NewCommandList(buffer)
 		}
 	}
-	c.cmdl = &char.cmd[pn]
+	c.cmdl = &p.cmd[pn]
 	remap, defaults, ckr := true, true, NewCommandKeyRemap()
 
 	var cmds []IniSection
@@ -8321,7 +8757,7 @@ func (c *CharCompiler) Compile(pn int, def string, constants map[string]float32)
 		// Parse the command string and populate steps
 		err = cm.ReadCommandSymbols(is["command"], ckr)
 		if err != nil {
-			if sys.ignoreMostErrors && sys.cgi[pn].ikemenver[0] == 0 && sys.cgi[pn].ikemenver[1] == 0 {
+			if sys.ignoreMostErrors && gi.ikemenver[0] == 0 && gi.ikemenver[1] == 0 {
 				// Mugen characters ignore command definition errors
 			} else {
 				return nil, Error(cmd + ":\nname = " + is["name"] +
@@ -8330,22 +8766,22 @@ func (c *CharCompiler) Compile(pn int, def string, constants map[string]float32)
 		}
 
 		// Apply backward compatibiliy quirks
-		if sys.cgi[pn].ikemenver[0] == 0 && sys.cgi[pn].ikemenver[1] == 0 {
-			cm.ApplyBackwardCompatibility(pn)
+		if gi.ikemenver[0] == 0 && gi.ikemenver[1] == 0 {
+			cm.ApplyBackwardCompatibility(gi.name)
 		}
 
 		c.cmdl.Add(*cm)
 	}
 
-	// Compile states
+	// Reset string pool
+	// String values will stay valid for as long as this character stays loaded
 	sys.stringPool[pn].Clear()
-	sys.cgi[pn].hitPauseToggleFlagCount = 0
 
 	// Compile state files
 	for _, s := range st {
 		if len(s) > 0 {
 			if err := c.stateCompile(states, s, []string{def, "", sys.motif.Def, "data/"},
-				sys.cgi[pn].ikemenver[0] == 0 && sys.cgi[pn].ikemenver[1] == 0, constants); err != nil {
+				gi.ikemenver[0] == 0 && gi.ikemenver[1] == 0, constants); err != nil {
 				return nil, err
 			}
 		}
@@ -8353,14 +8789,14 @@ func (c *CharCompiler) Compile(pn int, def string, constants map[string]float32)
 	// Compile states in command file
 	if len(cmd) > 0 {
 		if err := c.stateCompile(states, cmd, []string{def, "", sys.motif.Def, "data/"},
-			sys.cgi[pn].ikemenver[0] == 0 && sys.cgi[pn].ikemenver[1] == 0, constants); err != nil {
+			gi.ikemenver[0] == 0 && gi.ikemenver[1] == 0, constants); err != nil {
 			return nil, err
 		}
 	}
 	// Compile states in stcommon state file
 	if len(stcommon) > 0 {
 		if err := c.stateCompile(states, stcommon, []string{def, "", sys.motif.Def, "data/"},
-			sys.cgi[pn].ikemenver[0] == 0 && sys.cgi[pn].ikemenver[1] == 0, constants); err != nil {
+			gi.ikemenver[0] == 0 && gi.ikemenver[1] == 0, constants); err != nil {
 			return nil, err
 		}
 	}
@@ -8374,7 +8810,7 @@ func (c *CharCompiler) Compile(pn int, def string, constants map[string]float32)
 		}
 	}
 	// Store functions in Global Info (static data), accessible to all instances
-	sys.cgi[pn].callFuncs = c.funcs
+	gi.callFuncs = c.funcs
 	return states, nil
 }
 
@@ -8386,5 +8822,5 @@ func (c *CharCompiler) charWarn() string {
 	if c.zssMode {
 		offset = 0
 	}
-	return fmt.Sprintf("WARNING: %v's state %v in %v, line %v: ", sys.cgi[c.playerNo].name, c.stateNo, file, c.i+offset)
+	return fmt.Sprintf("WARNING: %v's state %v in %v, line %v: ", c.targetGi.name, c.stateNo, file, c.i+offset)
 }

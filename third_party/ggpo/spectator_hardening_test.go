@@ -294,11 +294,11 @@ func TestWatcherThatStopsAcknowledgingIsDroppedNotFatal(t *testing.T) {
 	// The watcher goes silent: nothing reaches it, nothing comes back.
 	tr.board.cut[boardKey(tIP, tSpecPort)] = true
 	hostBefore := tr.hostFrames
-	if err := tr.run(400); err != nil {
+	if err := tr.run(600); err != nil {
 		t.Fatalf("the host did not survive a silent watcher: %v", err)
 	}
-	if tr.hostFrames-hostBefore < 390 || tr.guestFrames < tr.hostFrames-10 {
-		t.Fatalf("the players stalled behind a silent watcher: host advanced %d of 400 frames, guest at %d",
+	if tr.hostFrames-hostBefore < 590 || tr.guestFrames < tr.hostFrames-10 {
+		t.Fatalf("the players stalled behind a silent watcher: host advanced %d of 600 frames, guest at %d",
 			tr.hostFrames-hostBefore, tr.guestFrames)
 	}
 	if !tr.hostS.has(ggpo.EventCodeDisconnectedFromPeer, 1000) {
@@ -333,11 +333,11 @@ func TestMatchStartDoesNotWaitForAWatcher(t *testing.T) {
 	if !tr.hostS.has(ggpo.EventCodeRunning, 0) {
 		t.Fatalf("the host's match waits on a watcher that never connected")
 	}
-	if err := tr.run(300); err != nil {
+	if err := tr.run(600); err != nil {
 		t.Fatalf("%v", err)
 	}
-	if tr.hostFrames < 290 {
-		t.Fatalf("the host advanced only %d of 300 frames with an absent watcher", tr.hostFrames)
+	if tr.hostFrames < 590 {
+		t.Fatalf("the host advanced only %d of 600 frames with an absent watcher", tr.hostFrames)
 	}
 	if !tr.hostS.has(ggpo.EventCodeDisconnectedFromPeer, 1000) {
 		t.Fatalf("a watcher that never connected is still registered after %d frames", tr.hostFrames)
@@ -520,9 +520,10 @@ func TestWatcherUploadIsBounded(t *testing.T) {
 		{"+350 ms round trip", 11, 0, 0, true},
 		{"+500 ms round trip, 5% loss", 15, 0, 0.05, true},
 		{"acks held back 2 s", 0, 120, 0, true},
-		// Past the 240 frames (4 s) a host keeps for a watcher: dropped, with
+		{"acks held back 3.5 s", 0, 210, 0, true},
+		// Past the 480 frames (8 s) a host keeps for a watcher: dropped, with
 		// the reason, and its cost stays under the ceiling until then.
-		{"acks held back 3.5 s", 0, 210, 0, false},
+		{"acks held back 9 s", 0, 540, 0, false},
 		{"never acknowledges", 0, 100000, 0, false},
 	}
 	for _, c := range cases {

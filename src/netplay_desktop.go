@@ -14,10 +14,20 @@ import (
 // Desktop netplay transport: plain TCP with the IKEMENGO handshake,
 // exactly as upstream. The js/wasm build replaces these in netplay_js.go.
 
+// Desktop keeps upstream's netplay deadlines (Netplay.SyncTimeout and
+// Netplay.LoadingTimeout, see netDeadline in netplay.go).
+const platformNetDeadlines = true
+
 // platformGGPOTransport returns extra transports for
 // ggpo.Peer.InitializeConnection; none on desktop (default UDP).
 func platformGGPOTransport() []transport.Connection {
 	return nil
+}
+
+// platformRollbackPeer: desktop reads the rollback peer from the TCP stream
+// and the negotiated ports (rollback.go preMatchSetup), so it has no override.
+func platformRollbackPeer(host bool) (remoteIp string, localPort, remotePort int, ok bool) {
+	return "", 0, 0, false
 }
 
 func (nc *NetConnection) Accept(port int) error {
@@ -35,9 +45,11 @@ func (nc *NetConnection) Accept(port int) error {
 	nc.ln = tcpLn
 	nc.host = true
 	nc.conn = nil // Make sure this is a new connection
-	nc.locIn, nc.remIn = nc.GetHostGuestRemap()
+	// Channel 0 is the host and channel 1 the guest, as in rollback/replays.
+	// Character ownership is selected separately through inputRemap.
+	nc.locIn, nc.remIn = 0, 1
 
-	lnLocal := nc.ln
+	lnLocal := tcpLn
 	SafeGo(func() {
 		defer lnLocal.Close()
 
@@ -53,10 +65,6 @@ func (nc *NetConnection) Accept(port int) error {
 
 		// Don't allow the handshake to block forever (important when shutting down).
 		_ = tempConn.SetDeadline(time.Now().Add(2 * time.Second))
-
-		if sys.cfg.Netplay.RollbackNetcode {
-			sys.rollback.session.remoteIp = tempConn.RemoteAddr().(*net.TCPAddr).IP.String()
-		}
 
 		//Send handshake
 		if _, err := tempConn.Write([]byte("IKEMENGO")); err != nil {
@@ -75,12 +83,8 @@ func (nc *NetConnection) Accept(port int) error {
 		// Handshake complete; clear deadlines for normal play.
 		_ = tempConn.SetDeadline(time.Time{})
 
-		// Handshake complete. Make temp connection permanent
-		if nc.isClosing() {
-			tempConn.Close()
-			return
-		}
-		nc.conn = tempConn
+		// Rollback reads the peer address from the adopted socket at match startup.
+		nc.publishConnection(tempConn)
 	})
 
 	return nil
@@ -89,7 +93,7 @@ func (nc *NetConnection) Accept(port int) error {
 func (nc *NetConnection) Connect(server string, port int) {
 	nc.host = false
 	nc.conn = nil // Make sure this is a new connection
-	nc.remIn, nc.locIn = nc.GetHostGuestRemap()
+	nc.remIn, nc.locIn = 0, 1
 
 	SafeGo(func() {
 		d := net.Dialer{Timeout: 1 * time.Second}
@@ -131,12 +135,7 @@ func (nc *NetConnection) Connect(server string, port int) {
 			// Handshake complete; clear deadlines for normal play.
 			_ = tcpConn.SetDeadline(time.Time{})
 
-			// Handshake complete. Make temp connection permanent
-			if nc.isClosing() {
-				tcpConn.Close()
-				return
-			}
-			nc.conn = tcpConn
+			nc.publishConnection(tcpConn)
 			return
 		}
 	})
@@ -158,3 +157,11 @@ func platformLobby(cmd, arg string) string { return "" }
 // platformReportResult is likewise browser-only: there is no leaderboard
 // endpoint to report to from a desktop build.
 func platformReportResult(winSide int, p1Char, p2Char string) {}
+
+// platformMatchGone: only the browser page can know that the other player
+// left a lobby (netplay_js.go); desktop waits for GGPO's disconnect.
+func platformMatchGone() bool { return false }
+
+// platformNetFail: desktop shows a failed connection in the session warning
+// only (netplay_js.go also hands it to the page).
+func platformNetFail(msg string) {}

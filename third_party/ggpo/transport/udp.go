@@ -3,6 +3,7 @@ package transport
 import (
 	"net"
 	"strconv"
+	"sync"
 
 	"github.com/ikemen-engine/ggpo/internal/messages"
 	"github.com/ikemen-engine/ggpo/internal/util"
@@ -22,6 +23,9 @@ type Udp struct {
 	localPort      int
 	ipAddress      string
 	sendChan       chan sendRequest
+	done           chan struct{}
+	sendDone       chan struct{}
+	closeOnce      *sync.Once // Shared by the value copies stored in endpoints.
 }
 
 type UdpStats struct {
@@ -42,8 +46,12 @@ func getPeerAddress(address net.Addr) peerAddress {
 }
 
 func (u Udp) Close() {
-	if u.listener != nil {
-		u.listener.Close()
+	if u.closeOnce != nil {
+		u.closeOnce.Do(func() {
+			close(u.done)
+			u.listener.Close()
+			<-u.sendDone
+		})
 	}
 }
 
@@ -53,47 +61,69 @@ type sendRequest struct {
 	remotePort int
 }
 
-func NewUdp(messageHandler MessageHandler, localPort int) Udp {
+func NewUdp(messageHandler MessageHandler, localPort int) (Udp, error) {
 	u := Udp{}
+	u.messageHandler = messageHandler
+	u.localPort = localPort
+	util.Log.Printf("binding udp socket to port %d.\n", localPort)
+	var err error
+	u.listener, err = net.ListenPacket("udp", "0.0.0.0:"+strconv.Itoa(localPort))
+	if err != nil {
+		return u, err
+	}
 
 	u.sendChan = make(chan sendRequest, 256) // Create a buffered channel
+	u.done = make(chan struct{})
+	u.sendDone = make(chan struct{})
+	u.closeOnce = &sync.Once{}
 
 	go func() { // Start a goroutine to handle sending of messages
-		for req := range u.sendChan {
-			RemoteEP := net.UDPAddr{IP: net.ParseIP(req.remoteIp), Port: req.remotePort}
-			buf := req.msg.ToBytes()
-			_, err := u.listener.WriteTo(buf, &RemoteEP)
-			if err != nil {
-				util.Log.Printf("WriteTo error: %s", err)
+		defer close(u.sendDone)
+		for {
+			select {
+			case <-u.done:
+				return
+			case req := <-u.sendChan:
+				RemoteEP := net.UDPAddr{IP: net.ParseIP(req.remoteIp), Port: req.remotePort}
+				buf := req.msg.ToBytes()
+				_, err := u.listener.WriteTo(buf, &RemoteEP)
+				if err != nil {
+					util.Log.Printf("WriteTo error: %s", err)
+				}
 			}
 		}
 	}()
 
-	u.messageHandler = messageHandler
-	portStr := strconv.Itoa(localPort)
-
-	u.localPort = localPort
-	util.Log.Printf("binding udp socket to port %d.\n", localPort)
-	u.listener, _ = net.ListenPacket("udp", "0.0.0.0:"+portStr)
-	return u
+	return u, nil
 }
 
 // dst should be sockaddr
 // maybe create Gob encoder and decoder members
 // instead of creating them on each message send
 func (u Udp) SendTo(msg messages.UDPMessage, remoteIp string, remotePort int) {
-	if msg == nil || remoteIp == "" {
+	if msg == nil || remoteIp == "" || u.sendChan == nil {
 		return
 	}
 
 	// RemoteEP := net.UDPAddr{IP: net.ParseIP(remoteIp), Port: remotePort}
 	// buf := msg.ToBytes()
 	// u.listener.WriteTo(buf, &RemoteEP)
-	u.sendChan <- sendRequest{msg: msg, remoteIp: remoteIp, remotePort: remotePort} // Add the request to the channel
+	select {
+	case <-u.done:
+		return
+	default:
+	}
+	select {
+	case <-u.done:
+	case u.sendChan <- sendRequest{msg: msg, remoteIp: remoteIp, remotePort: remotePort}:
+	}
 }
 
 func (u Udp) Read(messageChan chan MessageChannelItem) {
-	defer u.listener.Close()
+	if u.listener == nil {
+		return
+	}
+	defer u.Close()
 	recvBuf := make([]byte, MaxUDPPacketSize*2)
 	for {
 		len, addr, err := u.listener.ReadFrom(recvBuf)
@@ -111,7 +141,12 @@ func (u Udp) Read(messageChan chan MessageChannelItem) {
 				util.Log.Printf("Error decoding message: %s", err)
 				continue
 			}
-			messageChan <- MessageChannelItem{Peer: peer, Message: msg, Length: len}
+			// The game may have stopped pumping GGPO before closing this session.
+			select {
+			case <-u.done:
+				return
+			case messageChan <- MessageChannelItem{Peer: peer, Message: msg, Length: len}:
+			}
 		}
 
 	}

@@ -131,6 +131,15 @@ func (fa *Fade) drawRect(rect [4]int32, color uint32, alpha int32) {
 }
 
 func (fa *Fade) draw() {
+	fa.drawWithOverlay(false)
+}
+
+// Like draw, but the fade color covers the whole screen instead of only the fight.
+func (fa *Fade) drawFullScreen() {
+	fa.drawWithOverlay(true)
+}
+
+func (fa *Fade) drawWithOverlay(fullScreen bool) {
 	if !fa.active || fa.timeRemaining < 0 || fa.totalTime <= 0 {
 		return
 	}
@@ -144,12 +153,15 @@ func (fa *Fade) draw() {
 	if elapsed < 0 || elapsed > fa.time {
 		return
 	}
+	alpha := int32(math.Floor(255 * float64(elapsed) / float64(fa.time)))
 	if fa.isFadeIn {
-		alpha := int32(math.Floor(float64(255) - 255*float64(elapsed-1)/float64(fa.time)))
-		fa.drawRect(sys.scrrect, fa.colEncoded, alpha)
+		alpha = int32(math.Floor(float64(255) - 255*float64(elapsed-1)/float64(fa.time)))
+	}
+	draw := func() { fa.drawRect(sys.scrrect, fa.colEncoded, alpha) }
+	if fullScreen {
+		sys.withFullViewport(sys.motif.Bezel.Fade, draw)
 	} else {
-		alpha := int32(math.Floor(255 * float64(elapsed) / float64(fa.time)))
-		fa.drawRect(sys.scrrect, fa.colEncoded, alpha)
+		draw()
 	}
 }
 
@@ -179,6 +191,10 @@ const (
 // - overrideBlack: treat caller as a user interruption and force immediate cut for FadeStop.
 // - policy: controls how an in-progress fade-in is handled.
 func startFadeOut(tmpl *Fade, dest *Fade, overrideBlack bool, policy FadeStartPolicy) {
+	startFadeOutFrom(tmpl, dest, sys.motif.fadeIn, overrideBlack, policy)
+}
+
+func startFadeOutFrom(tmpl, dest, fi *Fade, overrideBlack bool, policy FadeStartPolicy) {
 	if tmpl == nil || dest == nil {
 		return
 	}
@@ -193,7 +209,6 @@ func startFadeOut(tmpl *Fade, dest *Fade, overrideBlack bool, policy FadeStartPo
 		tmp.animData = nil
 		use = &tmp
 	}
-	fi := sys.motif.fadeIn
 
 	// FadeStop semantics:
 	// If this is an explicit user interruption OR a fade-in is active, cut immediately.
@@ -248,11 +263,12 @@ func startFadeOut(tmpl *Fade, dest *Fade, overrideBlack bool, policy FadeStartPo
 type Rect struct {
 	window     [4]int32
 	col        uint32
+	trans      TransType
 	alpha      [2]int32
 	time       int32
 	layerno    int16
 	localScale float32
-	offsetX    int32
+	offsetX    float32
 	// pulse src = clamp(mid + amp * sin(phase))
 	pulseMid       float32
 	pulseAmp       float32
@@ -260,12 +276,13 @@ type Rect struct {
 	pulsePhaseStep float32 // radians per frame = 2π / periodFrames
 	autoAlpha      bool
 	//palfx          *PalFX
+	windowDefault bool // The clip follows sys.scrrect if no window was authored.
 	// initial, unscaled values
 	windowInit [4]float32
 }
 
 func NewRect() *Rect {
-	return &Rect{window: sys.scrrect, alpha: [2]int32{255, 0}, localScale: 1}
+	return &Rect{window: sys.scrrect, windowDefault: true, trans: TT_default, alpha: [2]int32{255, 0}, localScale: 1}
 }
 
 func packAlpha(src, dst int32) [2]int32 {
@@ -284,7 +301,18 @@ func (r *Rect) updateAlpha() {
 
 func (r *Rect) Draw(ln int16) {
 	if r != nil && r.layerno == ln {
-		FillRect(r.drawWindow(), r.col, r.alpha, nil)
+		alpha := r.alpha
+		// None is opaque, as in transBlend. Pulse would otherwise override it.
+		if r.trans == TT_none {
+			alpha = [2]int32{255, 0}
+		}
+		draw := func() { FillRectTrans(r.drawWindow(), r.col, r.trans, alpha, nil) }
+		if r.windowDefault && sys.drawMotif {
+			// Menu overlays without a window (e.g. pause-menu darkening) cover the whole screen.
+			sys.withFullViewport(true, draw)
+		} else {
+			draw()
+		}
 	}
 }
 
@@ -299,6 +327,12 @@ func (r *Rect) SetColor(col [3]int32) {
 func (r *Rect) SetAlpha(alpha [2]int32) {
 	r.alpha = packAlpha(alpha[0], alpha[1])
 	r.autoAlpha = false
+}
+
+// SetTrans sets the blending type. Alpha keeps supplying the factors, because
+// rectangles have no factors of their own.
+func (r *Rect) SetTrans(tt TransType) {
+	r.trans = tt
 }
 
 func (r *Rect) SetAlphaPulse(sMid, sAmp, sPeriod int32) {
@@ -324,7 +358,7 @@ func (r *Rect) SetLocalcoord(lx, ly float32) {
 		v = ly * 4 / 3
 	}
 	r.localScale = float32(v / 320)
-	r.offsetX = -int32(math.Floor(float64(lx)/(float64(v)/320)-320) / 2)
+	r.offsetX = localcoordOffsetX(float64(lx), float64(v))
 }
 
 func (r *Rect) SetWindow(window [4]float32) {
@@ -332,25 +366,24 @@ func (r *Rect) SetWindow(window [4]float32) {
 		return
 	}
 	r.windowInit = window
+	r.windowDefault = false
 	r.window = r.drawWindow()
 }
 
 func (r *Rect) drawWindow() [4]int32 {
+	if r.windowDefault {
+		return sys.scrrect
+	}
 	if r.windowInit == [4]float32{0, 0, 0, 0} {
 		return r.window
 	}
 	// Pixel bounds depend on the aspect state selected for this draw pass.
 	window := r.windowInit
-	x := window[0]/r.localScale + float32(r.offsetX)
+	x := window[0]/r.localScale + r.offsetX
 	y := window[1] / r.localScale
 	w := (window[2] - window[0]) / r.localScale
 	h := (window[3] - window[1]) / r.localScale
-	return [4]int32{
-		int32((x + float32(sys.gameWidth-320)/2) * sys.widthScale),
-		int32((y + float32(sys.gameHeight-240)) * sys.heightScale),
-		int32(w*sys.widthScale + 0.5),
-		int32(h*sys.heightScale + 0.5),
-	}
+	return screenRect(x+(sys.gameWidth-320)/2, y+sys.gameHeight-240, w, h)
 }
 
 func (r *Rect) Update() {

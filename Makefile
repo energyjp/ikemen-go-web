@@ -36,6 +36,8 @@ srcFiles=src/resources/defaultConfig.ini \
 	src/render_vk.go \
 	src/rollback.go \
 	src/script.go \
+	src/sdl_ios.go \
+	src/sdl_other.go \
 	src/select_params.go \
 	src/sound.go \
 	src/sound_xm.go \
@@ -50,6 +52,7 @@ srcFiles=src/resources/defaultConfig.ini \
 	src/util_android.go \
 	src/util_darwin.go \
 	src/util_desktop.go \
+	src/util_ios.go \
 	src/util_linux.go \
 	src/util_raw.go \
 	src/util_windows.go \
@@ -59,10 +62,6 @@ srcFiles=src/resources/defaultConfig.ini \
 # Windows 64-bit target
 Ikemen_GO.exe: ${srcFiles}
 	bash ./build/build.sh Win64
-
-# Windows 32-bit target
-Ikemen_GO_x86.exe: ${srcFiles}
-	bash ./build/build.sh Win32
 
 # Linux target
 Ikemen_GO_Linux: ${srcFiles}
@@ -107,6 +106,11 @@ appbundle:
 .PHONY: android-apk
 android-apk:
 	bash ./build/build_android.sh
+
+# iOS target (macOS + Xcode only): builds bin/ikemen-go.ipa
+.PHONY: ios-ipa
+ios-ipa:
+	bash ./build/build.sh iOS
 
 clean_appbundle:
 	rm -rf I.K.E.M.E.N-Go.app

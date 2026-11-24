@@ -263,10 +263,15 @@ type Animation struct {
 	remap                      RemapPreset
 	start_scale                [2]float32
 	isParallax                 bool
+	parallaxRot                bool
 	isVideo                    bool // Because videos are rendered through Animation.Draw()
 	phantomPixel               bool
 	copyAction                 int32
 	warnMissing                bool
+	loopcount                  int32
+	filename                   string
+	actionNumber               int32
+	param                      string // motif parameter name, shown in warnings
 }
 
 func newAnimation(sff *Sff, pal *PaletteList) *Animation {
@@ -289,8 +294,72 @@ func newAnimation(sff *Sff, pal *PaletteList) *Animation {
 	}
 }
 
-func ReadAnimation(sff *Sff, pal *PaletteList, lines []string, i *int) (*Animation, error) {
-	a := newAnimation(sff, pal)
+type AnimCompiler struct {
+	sff       *Sff
+	pal       *PaletteList
+	at        AnimationTable
+	seen      map[int32]bool // Actions found in the file being compiled, for duplicate checks
+	lines     []string
+	i         int // Line index
+	filename  string
+	mainFile  string // First file compiled, in case common animations are used
+	animNo    int32
+	log       bool
+	finalized bool
+}
+
+func newAnimCompiler(sff *Sff, pal *PaletteList, log bool) *AnimCompiler {
+	return &AnimCompiler{
+		sff:  sff,
+		pal:  pal,
+		at:   NewAnimationTable(),
+		seen: make(map[int32]bool),
+		log:  log,
+	}
+}
+
+func (ac *AnimCompiler) warnf(format string, args ...interface{}) {
+	if !ac.log {
+		return
+	}
+	LogMessage("WARNING: %v, action %v: %v", ac.filename, ac.animNo, fmt.Sprintf(format, args...))
+}
+
+func (ac *AnimCompiler) errorf(line int, format string, args ...interface{}) error {
+	return Error(fmt.Sprintf("%v, action %v, line %v: %v",
+		ac.filename, ac.animNo, line, fmt.Sprintf(format, args...)))
+}
+
+// Parses every action in one source
+func (ac *AnimCompiler) compileText(filename, text string) {
+	// The resolved table shares its map with the caller, so compiling again would mutate it
+	if ac.finalized {
+		LogMessage("WARNING: %v compiled after the table was resolved (ignored)", filename)
+		return
+	}
+	ac.filename = filename
+	if ac.mainFile == "" {
+		ac.mainFile = filename
+	}
+	ac.seen = make(map[int32]bool)
+	ac.lines, ac.i = SplitAndTrim(text, "\n"), 0
+	for ac.compileAction() != nil {
+	}
+}
+
+// Finalizes the table, resolving Copy Action across every compiled file
+// The compiler is spent afterwards and must not compile anything else
+func (ac *AnimCompiler) finalize() AnimationTable {
+	ac.at.resolveCopyAction()
+	ac.at.filename = ac.mainFile
+	ac.finalized = true
+	return ac.at
+}
+
+func (ac *AnimCompiler) readAnimation() (*Animation, error) {
+	a := newAnimation(ac.sff, ac.pal)
+	a.filename = ac.filename
+	a.actionNumber = ac.animNo
 
 	a.mask = 0
 	ols := int32(0)
@@ -298,12 +367,12 @@ func ReadAnimation(sff *Sff, pal *PaletteList, lines []string, i *int) (*Animati
 	var clsn1, clsn1d, clsn2, clsn2d [][4]float32
 	def1, def2 := true, true
 
-	for ; *i < len(lines); (*i)++ {
-		if len(lines[*i]) > 0 && lines[*i][0] == '[' {
+	for ; ac.i < len(ac.lines); ac.i++ {
+		if len(ac.lines[ac.i]) > 0 && ac.lines[ac.i][0] == '[' {
 			break
 		}
 		line := strings.ToLower(strings.TrimSpace(
-			strings.SplitN(lines[*i], ";", 2)[0]))
+			strings.SplitN(ac.lines[ac.i], ";", 2)[0]))
 
 		// Copy Action
 		if len(line) >= 12 && line[:12] == "copy action " { // Trailing space here
@@ -321,9 +390,10 @@ func ReadAnimation(sff *Sff, pal *PaletteList, lines []string, i *int) (*Animati
 		var af *AnimFrame
 		af, lerr := ReadAnimFrame(line)
 
-		// Use a local error to prevent overwriting the outer one with nil
+		// Use a local error to prevent overwriting the outer one with nil.
+		// Tag with file/action/line so callers don't have to.
 		if lerr != nil {
-			err = lerr
+			err = ac.errorf(ac.i+1, "%v", lerr.Error())
 		}
 
 		switch {
@@ -360,68 +430,28 @@ func ReadAnimation(sff *Sff, pal *PaletteList, lines []string, i *int) (*Animati
 			if size < 0 {
 				break
 			}
-			var clsn [][4]float32
-			if line[4] == '1' {
-				// Clsn1
-				clsn1 = make([][4]float32, size)
-				clsn = clsn1
-				if len(line) >= 12 && line[5:12] == "default" {
+			clsnType := line[4]
+			isDefault := len(line) >= 12 && line[5:12] == "default"
+			switch clsnType {
+			case '1':
+				clsn1, lerr = ac.readClsn(clsnType, size)
+				if lerr != nil {
+					err = lerr
+				}
+				if isDefault {
 					clsn1d = clsn1
 				}
 				def1 = false
-			} else if line[4] == '2' {
-				// Clsn2
-				clsn2 = make([][4]float32, size)
-				clsn = clsn2
-				if len(line) >= 12 && line[5:12] == "default" {
+			case '2':
+				clsn2, lerr = ac.readClsn(clsnType, size)
+				if lerr != nil {
+					err = lerr
+				}
+				if isDefault {
 					clsn2d = clsn2
 				}
 				def2 = false
-			} else {
-				break
 			}
-			if size == 0 {
-				break
-			}
-			// Move past the "Clsn:" line to the first rectangle line
-			(*i)++
-			// Read exactly 'size' number rectangle lines
-			// TODO: Mugen seems less strict about this
-			for n := int32(0); n < size && *i < len(lines); {
-				line := strings.ToLower(strings.TrimSpace(
-					strings.SplitN(lines[*i], ";", 2)[0]))
-				if len(line) == 0 {
-					(*i)++
-					continue // Skip blank lines
-				}
-				// Stop if we encounter a line that doesn't start with "clsn"
-				if len(line) < 4 || line[:4] != "clsn" {
-					break
-				}
-				// Extract the coordinates after "="
-				ii := strings.Index(line, "=")
-				if ii < 0 {
-					break
-				}
-				ary := strings.Split(line[ii+1:], ",")
-				if len(ary) < 4 {
-					break
-				}
-				l, t, r, b := Atoi(ary[0]), Atoi(ary[1]), Atoi(ary[2]), Atoi(ary[3])
-				// Normalize rectangle
-				if l > r {
-					l, r = r, l
-				}
-				if t > b {
-					t, b = b, t
-				}
-				clsn[n][0], clsn[n][1], clsn[n][2], clsn[n][3] =
-					float32(l), float32(t), float32(r), float32(b)
-				n++
-				(*i)++
-			}
-			// Back up one step to avoid skipping the line after the last rectangle
-			(*i)--
 		}
 	}
 
@@ -454,10 +484,109 @@ func ReadAnimation(sff *Sff, pal *PaletteList, lines []string, i *int) (*Animati
 	return a, err
 }
 
-func ReadAction(sff *Sff, pal *PaletteList, lines []string, i *int) (no int32, a *Animation, err error) {
+func (ac *AnimCompiler) readClsn(clsnType byte, size int32) ([][4]float32, error) {
+	clsn := make([][4]float32, size)
+	if size == 0 {
+		return clsn, nil
+	}
+	filled := make([]bool, size)
+
+	// 1-based line number of the "Clsn1:" / "Clsn2:" header
+	lineNo := ac.i + 1
+
+	// Move past the "Clsn:" line to the first rectangle line
+	ac.i++
+
+	// Read exactly 'size' number rectangle lines
+	count := int32(0)
+	for count < size && ac.i < len(ac.lines) {
+		rline := strings.ToLower(strings.TrimSpace(
+			strings.SplitN(ac.lines[ac.i], ";", 2)[0]))
+		if len(rline) == 0 {
+			ac.i++
+			continue // Skip blank lines
+		}
+		// Stop if we encounter a line that doesn't start with "clsn"
+		if len(rline) < 4 || rline[:4] != "clsn" {
+			break
+		}
+		// Find the coordinate assignment
+		eqIdx := strings.Index(rline, "=")
+		if eqIdx < 0 {
+			break
+		}
+		// Optional [n] between the type and "="
+		boxIdx := int32(-1)
+		if brStart := strings.Index(rline, "["); brStart >= 0 && brStart < eqIdx {
+			if brEnd := strings.Index(rline[brStart:], "]"); brEnd > 0 {
+				idxStr := strings.TrimSpace(rline[brStart+1 : brStart+brEnd])
+				valid := idxStr != ""
+				for k := 0; valid && k < len(idxStr); k++ {
+					if idxStr[k] < '0' || idxStr[k] > '9' {
+						valid = false
+					}
+				}
+				if valid {
+					boxIdx = int32(Atoi(idxStr))
+				}
+			}
+		}
+		// If the index couldn't be honored (absent, out-of-range, or repeated),
+		// fall back to the first free slot so the box isn't silently lost.
+		if boxIdx < 0 || boxIdx >= size || filled[boxIdx] {
+			requested := boxIdx
+			boxIdx = -1
+			for k := int32(0); k < size; k++ {
+				if !filled[k] {
+					boxIdx = k
+					break
+				}
+			}
+			if boxIdx < 0 {
+				// Impossible to reach, but kept as a safety net
+				ac.warnf("line %v: Clsn%v no free slot (size %v); box dropped",
+					lineNo, string(clsnType), size)
+				ac.i++
+				continue
+			}
+			if requested >= 0 {
+				ac.warnf("line %v: Clsn%v[%v] index is duplicate or out of range; placed in slot [%v]",
+					lineNo, string(clsnType), requested, boxIdx)
+			}
+		}
+		// Extract the coordinates after "="
+		ary := strings.Split(rline[eqIdx+1:], ",")
+		if len(ary) < 4 {
+			break
+		}
+		clsn[boxIdx] = NormalizeRect([4]float32{
+			float32(Atoi(ary[0])),
+			float32(Atoi(ary[1])),
+			float32(Atoi(ary[2])),
+			float32(Atoi(ary[3])),
+		})
+		filled[boxIdx] = true
+		count++
+		ac.i++
+	}
+
+	// Back up one step to avoid skipping the line after the last rectangle
+	ac.i--
+
+	// Warn if size doesn't match found boxes
+	// Mugen crashes here
+	if count != size {
+		return clsn, ac.errorf(lineNo, "Clsn%v: declared %v boxes but only %v found",
+			string(clsnType), size, count)
+	}
+
+	return clsn, nil
+}
+
+func (ac *AnimCompiler) readAction() (no int32, a *Animation, err error) {
 	var name, subname string
-	for ; *i < len(lines); (*i)++ {
-		name, subname = SectionName(lines[*i])
+	for ; ac.i < len(ac.lines); ac.i++ {
+		name, subname = SectionName(ac.lines[ac.i])
 		if len(name) > 0 {
 			break
 		}
@@ -472,10 +601,11 @@ func ReadAction(sff *Sff, pal *PaletteList, lines []string, i *int) (no int32, a
 	if strings.ToLower(subname[:spi+1]) != "action " {
 		return
 	}
-	(*i)++
+	ac.i++
 
 	no = Atoi(subname[spi+1:])
-	a, err = ReadAnimation(sff, pal, lines, i)
+	ac.animNo = no
+	a, err = ac.readAnimation()
 
 	return
 }
@@ -483,7 +613,9 @@ func ReadAction(sff *Sff, pal *PaletteList, lines []string, i *int) (no int32, a
 func (a *Animation) Reset() {
 	a.curelem, a.drawidx = 0, 0
 	a.curelemtime, a.curtime = 0, 0
-	a.newframe, a.loopend = true, false
+	a.newframe = true
+	a.loopend = false
+	a.loopcount = 0
 	a.spr = nil
 }
 
@@ -629,6 +761,7 @@ func (a *Animation) SetAnimElem(elem, elemtime int32) {
 
 	a.newframe = true
 	a.loopend = false
+	a.loopcount = 0
 	a.UpdateSprite()
 
 	a.curtime = 0 // Used within AnimElemTime, so must be set to 0 first
@@ -709,7 +842,13 @@ func (a *Animation) UpdateSprite() {
 						a.sff.debugMissing = make(map[[2]uint16]bool)
 					}
 					if !a.sff.debugMissing[key] {
-						LogMessage("WARNING: Animation missing sprite %v,%v from %v", group, number, a.sff.filename)
+						if a.param != "" && a.sff.filename != "" {
+							LogMessage("WARNING: %v: missing sprite %v,%v in %v", a.param, group, number, a.sff.filename)
+						} else if a.param != "" {
+							LogMessage("WARNING: %v: missing sprite %v,%v", a.param, group, number)
+						} else {
+							LogMessage("WARNING: %v, action %v: missing sprite %v,%v", a.filename, a.actionNumber, group, number)
+						}
 						a.sff.debugMissing[key] = true
 					}
 				}
@@ -838,6 +977,7 @@ func (a *Animation) Action() {
 	}
 	if a.totaltime != -1 && a.curtime >= a.totaltime {
 		a.curtime = a.totaltime - a.looptime
+		a.loopcount++
 	}
 	a.curtime++
 	if a.totaltime != -1 && a.curtime >= a.totaltime {
@@ -937,13 +1077,22 @@ func (a *Animation) drawSub1(angle, facing float32) (h, v, agl float32) {
 }
 
 func (a *Animation) Draw(window *[4]int32, x, y, xcs, ycs, xs, xbs, ys,
-	rxadd float32, rot Rotation, rcx float32, pfx *PalFX, facing float32,
-	airOffsetFix [2]float32, projectionMode int32, fLength float32, color uint32,
+	rxadd float32, rot Rotation, rcx float32, rotPivot [2]float32, pfx *PalFX, facing float32,
+	airOffsetFix [2]float32, projectionMode int32, fLength float32,
 	isReflection bool, shader CustomShaderRenderData) {
+	a.draw(a.drawParams(window, x, y, xcs, ycs, xs, xbs, ys, rxadd, rot, rcx,
+		rotPivot, pfx, facing, airOffsetFix, projectionMode, fLength, isReflection, shader))
+}
+
+// Where the sprite is drawn, shared with mouse hits.
+func (a *Animation) drawParams(window *[4]int32, x, y, xcs, ycs, xs, xbs, ys,
+	rxadd float32, rot Rotation, rcx float32, rotPivot [2]float32, pfx *PalFX, facing float32,
+	airOffsetFix [2]float32, projectionMode int32, fLength float32,
+	isReflection bool, shader CustomShaderRenderData) RenderParams {
 
 	// Skip blank animations
-	if a == nil || a.isBlank() {
-		return
+	if a == nil || a.isBlank() || a.spr == nil {
+		return RenderParams{}
 	}
 
 	// Determine animation angle. Invert for reflection
@@ -1021,33 +1170,27 @@ func (a *Animation) Draw(window *[4]int32, x, y, xcs, ycs, xs, xbs, ys,
 				y -= float32(int(y/space)) * space
 			}
 		}
-		rcx, rcy = rcx*sys.widthScale, 0
+		rcx = rcx * sys.widthScale
+		rcy = 0
 		x = -x + Abs(xs)*float32(a.spr.Offset[0])
 		y = -y + Abs(ys)*float32(a.spr.Offset[1])
 	} else {
-		rcx, rcy = (x+rcx)*sys.widthScale, y*sys.heightScale
-		x, y = Abs(xs)*float32(a.spr.Offset[0]), Abs(ys)*float32(a.spr.Offset[1])
+		rcx = (x + rcx) * sys.widthScale
+		rcy = y * sys.heightScale
+		x = Abs(xs) * float32(a.spr.Offset[0])
+		y = Abs(ys) * float32(a.spr.Offset[1])
 		fLength *= ycs
 	}
 
-	blendMode, blendAlpha := a.alphaToBlend()
-
-	var paltex Texture
-	if !a.isVideo {
-		var pal []uint32
-		pal, paltex = a.pal(pfx)
-		if a.spr.coldepth <= 8 && paltex == nil {
-			paltex = a.spr.CachePalTex(pal)
-		}
-	}
+	rcOffset := [2]float32{rotPivot[0] * sys.widthScale, rotPivot[1] * sys.heightScale}
 
 	rp := RenderParams{
 		tex:            a.spr.Tex,
-		paltex:         paltex,
 		size:           a.spr.Size,
 		x:              x * sys.widthScale,
 		y:              y * sys.heightScale,
 		tile:           a.tile,
+		parallaxRot:    a.parallaxRot,
 		xts:            xs * sys.widthScale,
 		xbs:            xcs * xbs * h * sys.widthScale,
 		ys:             ys * sys.heightScale,
@@ -1056,14 +1199,13 @@ func (a *Animation) Draw(window *[4]int32, x, y, xcs, ycs, xs, xbs, ys,
 		xas:            h,
 		yas:            v,
 		rot:            rot,
-		tint:           color,
-		blendMode:      blendMode,
-		blendAlpha:     blendAlpha,
+		tint:           0,
 		mask:           int32(a.mask),
 		pfx:            pfx,
 		window:         window,
 		rcx:            rcx,
 		rcy:            rcy,
+		rcOffset:       rcOffset,
 		projectionMode: projectionMode,
 		fLength:        fLength * sys.heightScale,
 		xOffset:        xoff * sys.widthScale,
@@ -1071,10 +1213,25 @@ func (a *Animation) Draw(window *[4]int32, x, y, xcs, ycs, xs, xbs, ys,
 		customShader:   shader,
 	}
 
+	return rp
+}
+
+func (a *Animation) draw(rp RenderParams) {
+	if rp.tex == nil {
+		return
+	}
+	rp.blendMode, rp.blendAlpha = a.alphaToBlend()
+	if !a.isVideo {
+		pal, paltex := a.pal(rp.pfx)
+		if a.spr.coldepth <= 8 && paltex == nil {
+			paltex = a.spr.CachePalTex(pal)
+		}
+		rp.paltex = paltex
+	}
 	RenderSprite(rp)
 }
 
-func (a *Animation) ShadowDraw(window *[4]int32, x, y, xscl, yscl, vscl, rxadd float32, rot Rotation,
+func (a *Animation) ShadowDraw(window *[4]int32, x, y, xscl, yscl, vscl, rxadd float32, rot Rotation, rotPivot [2]float32,
 	pfx *PalFX, color uint32, intensity int32, facing float32, airOffsetFix [2]float32, projectionMode int32, fLength float32, shader CustomShaderRenderData) {
 
 	// Skip blank shadows
@@ -1092,6 +1249,8 @@ func (a *Animation) ShadowDraw(window *[4]int32, x, y, xscl, yscl, vscl, rxadd f
 
 	x += xoff
 	y += yoff
+
+	rcOffset := [2]float32{rotPivot[0] * sys.widthScale, rotPivot[1] * sys.heightScale}
 
 	rp := RenderParams{
 		tex:            a.spr.Tex,
@@ -1116,6 +1275,7 @@ func (a *Animation) ShadowDraw(window *[4]int32, x, y, xscl, yscl, vscl, rxadd f
 		window:         window,
 		rcx:            (x + float32(sys.gameWidth)/2) * sys.widthScale,
 		rcy:            y * sys.heightScale,
+		rcOffset:       rcOffset,
 		projectionMode: projectionMode,
 		fLength:        fLength * sys.heightScale,
 		xOffset:        xoff,
@@ -1191,60 +1351,59 @@ func NewAnimationTable() AnimationTable {
 	}
 }
 
-func (at AnimationTable) readAction(sff *Sff, pal *PaletteList, lines []string, i *int, log bool) *Animation {
-	for *i < len(lines) {
-		no, a, err := ReadAction(sff, pal, lines, i)
+// Reads the next action and stores it, keeping the first of any duplicates
+func (ac *AnimCompiler) compileAction() *Animation {
+	for ac.i < len(ac.lines) {
+		outerNo := ac.animNo
+		no, a, err := ac.readAction()
+		ac.animNo = outerNo
 		// Animation errors do not crash Mugen. But we can log them
-		if log && err != nil {
-			LogMessage("WARNING: Action %v in %v: %v", no, at.filename, err.Error())
+		if ac.log && err != nil {
+			LogMessage("WARNING: %v", err.Error())
 		}
 		if a != nil {
 			// In case of duplicate action numbers, just use the first one
 			// Even if first one is "Copy Action"
-			if existing := at.anims[no]; existing != nil {
-				if log {
-					LogMessage("WARNING: Duplicate action key in %v: %v (ignored)", at.filename, no)
+			if existing := ac.at.anims[no]; existing != nil {
+				if ac.log && ac.seen[no] {
+					LogMessage("WARNING: Duplicate action key in %v: %v (ignored)", ac.filename, no)
 				}
+				ac.seen[no] = true
 				return existing
 			}
 			// Recursive logic until we find a non-empty animation
 			// If the current action is empty, we attempt to copy the very next action found in the file
 			logged := false
-			for len(a.frames) == 0 && *i < len(lines) && a.copyAction < 0 {
-				if !logged && log {
-					LogMessage("WARNING: Action %v in %v has no valid frames", no, at.filename)
+			for len(a.frames) == 0 && ac.i < len(ac.lines) && a.copyAction < 0 {
+				if !logged && ac.log {
+					LogMessage("WARNING: %v, action %v: no valid frames", ac.filename, no)
 					logged = true
 				}
-				if a2 := at.readAction(sff, pal, lines, i, log); a2 != nil {
+				if a2 := ac.compileAction(); a2 != nil {
 					*a = *a2
 					break
 				}
-				(*i)++
+				ac.i++
 			}
 			// Store only now that the animation is fully resolved or confirmed empty
-			at.anims[no] = a
+			ac.at.anims[no] = a
+			ac.seen[no] = true
 			return a
 		} else {
 			// No action found on this line, advance to the next one
-			(*i)++
+			ac.i++
 		}
 	}
 	return nil
 }
 
+// Single file shortcut. Use AnimCompiler directly to merge several sources
 func ReadAnimationTable(filename string, sff *Sff,
-	pal *PaletteList, lines []string, i *int, log bool) AnimationTable {
+	pal *PaletteList, text string, log bool) AnimationTable {
 
-	at := NewAnimationTable()
-	at.filename = filename
-
-	// Continue reading actions until none are left
-	for at.readAction(sff, pal, lines, i, log) != nil {
-	}
-
-	at.resolveCopyAction()
-
-	return at
+	ac := newAnimCompiler(sff, pal, log)
+	ac.compileText(filename, text)
+	return ac.finalize()
 }
 
 func (at AnimationTable) get(no int32) *Animation {
@@ -1308,6 +1467,7 @@ type SpriteData struct {
 	layerno      int32
 	priority     int32
 	rot          Rotation
+	rotPivot     [2]float32
 	screen       bool
 	undarken     bool // Ignore SuperPause "darken"
 	facing       float32
@@ -1414,7 +1574,6 @@ func (dl DrawList) draw(layerno int32, under bool, cameraX, cameraY, cameraScl f
 
 	// Common variables
 	shake := sys.envShake.getOffset()
-	fightClip, clipFight := sys.fightDrawClip()
 
 	// Draw only the filtered items
 	for _, idx := range sortList {
@@ -1483,14 +1642,10 @@ func (dl DrawList) draw(layerno int32, under bool, cameraX, cameraY, cameraScl f
 
 			drawwindow = &window
 		}
-		if clipFight {
-			window := intersectRect(*drawwindow, fightClip)
-			drawwindow = &window
-		}
 
 		s.anim.Draw(drawwindow, pos[0]-xsoffset, pos[1], cs, cs, s.scl[0], s.scl[0],
-			s.scl[1], xshear, s.rot, float32(sys.gameWidth)/2, s.pfx, s.facing,
-			s.airOffsetFix, s.projection, s.fLength, 0, false, s.customShader)
+			s.scl[1], xshear, s.rot, float32(sys.gameWidth)/2, s.rotPivot, s.pfx, s.facing,
+			s.airOffsetFix, s.projection, s.fLength, false, s.customShader)
 
 		// Restore original animation transparency just in case
 		s.anim.transType = oldTransType
@@ -1517,6 +1672,8 @@ type ShadowSprite struct {
 	shadowRot           Rotation
 	shadowProjection    int32
 	shadowfLength       float32
+	shadowShader        CustomShaderRenderData
+	inheritShader       bool
 }
 
 func newShadowSprite() *ShadowSprite {
@@ -1526,6 +1683,7 @@ func newShadowSprite() *ShadowSprite {
 		shadowIntensity:     -1,
 		shadowKeeptransform: true,
 		shadowProjection:    -1,
+		inheritShader:       true,
 	}
 }
 
@@ -1700,6 +1858,11 @@ func (sl ShadowList) draw(x, y, scl float32) {
 			offsetX += (-s.pos[1] + s.groundLevel) * xshear * Sign(yscale)
 		}
 
+		// Scale rotation pivot by the reflection's base scale
+		// Y is multiplied by -1 because a y-scale of 1 means inverted
+		// TODO: It's slightly off. Might need a correction similar to "xrotoff"
+		sdwRotPivot := [2]float32{s.rotPivot[0] * xscale, s.rotPivot[1] * yscale * -1}
+
 		var projection int32
 		if s.shadowProjection != -1 {
 			projection = int32(s.shadowProjection)
@@ -1716,6 +1879,15 @@ func (sl ShadowList) draw(x, y, scl float32) {
 			fLength = sys.stage.sdw.fLength
 		} else {
 			fLength = s.fLength
+		}
+
+		var shader CustomShaderRenderData
+		if s.shadowShader.name != "" {
+			shader = s.shadowShader
+		} else if s.inheritShader && s.customShader.name != "" {
+			shader = s.customShader
+		} else if sys.stage.sdw.shader.name != "" {
+			shader = sys.stage.sdw.shader.renderData(!sys.stage.paused())
 		}
 
 		drawwindow := &sys.scrrect
@@ -1755,8 +1927,8 @@ func (sl ShadowList) draw(x, y, scl float32) {
 			(sys.cam.Offset[0]-shake[0])-((x-s.pos[0]-offsetX)*scl),
 			sys.cam.GroundLevel()+(sys.cam.Offset[1]-shake[1])-y-(sdwPosY*yscale-offsetY)*scl,
 			scl*s.scl[0]*xscale, scl*-s.scl[1],
-			yscale, xshear, rot,
-			s.pfx, uint32(color), intensity, s.facing, s.airOffsetFix, projection, fLength, s.customShader)
+			yscale, xshear, rot, sdwRotPivot,
+			s.pfx, uint32(color), intensity, s.facing, s.airOffsetFix, projection, fLength, shader)
 	}
 }
 
@@ -1774,6 +1946,8 @@ type ReflectionSprite struct {
 	reflectRot           Rotation
 	reflectProjection    int32
 	reflectfLength       float32
+	reflectShader        CustomShaderRenderData
+	inheritShader        bool
 }
 
 func newReflectionSprite() *ReflectionSprite {
@@ -1782,6 +1956,7 @@ func newReflectionSprite() *ReflectionSprite {
 		reflectIntensity:     -1,
 		reflectKeeptransform: true,
 		reflectProjection:    -1,
+		inheritShader:        true,
 	}
 }
 
@@ -1970,6 +2145,9 @@ func (rl ReflectionList) draw(x, y, scl float32) {
 			offsetX += (-s.pos[1] + s.groundLevel) * xshear * Sign(yscale)
 		}
 
+		// Scale rotation pivot by the reflection's base scale
+		refRotPivot := [2]float32{s.rotPivot[0] * xscale, s.rotPivot[1] * yscale * -1}
+
 		var projection int32
 		if s.reflectProjection != -1 {
 			projection = int32(s.reflectProjection)
@@ -1986,6 +2164,15 @@ func (rl ReflectionList) draw(x, y, scl float32) {
 			fLength = sys.stage.reflection.fLength
 		} else {
 			fLength = s.fLength
+		}
+
+		var shader CustomShaderRenderData
+		if s.reflectShader.name != "" {
+			shader = s.reflectShader
+		} else if s.inheritShader && s.customShader.name != "" {
+			shader = s.customShader
+		} else if sys.stage.reflection.shader.name != "" {
+			shader = sys.stage.reflection.shader.renderData(!sys.stage.paused())
 		}
 
 		drawwindow := &sys.scrrect
@@ -2021,13 +2208,19 @@ func (rl ReflectionList) draw(x, y, scl float32) {
 			drawwindow = &window
 		}
 
+		// Leverage PalFX to apply the reflection color
+		r := float32((color>>16)&0xff) / 255.0
+		g := float32((color>>8)&0xff) / 255.0
+		b := float32(color&0xff) / 255.0
+		pfxCopy := s.pfx.withStackedColor(r, g, b)
+
 		s.anim.Draw(drawwindow,
 			(sys.cam.Offset[0]-shake[0])/scl-(x-s.pos[0]-offsetX),
 			(sys.cam.GroundLevel()+sys.cam.Offset[1]-shake[1])/scl-y/scl-(refPosY*yscale-offsetY),
 			scl, scl,
 			s.scl[0]*xscale, s.scl[0]*xscale,
-			-s.scl[1]*yscale, xshear, rot, float32(sys.gameWidth)/2,
-			s.pfx, s.facing, s.airOffsetFix, projection, fLength, color, true, s.customShader)
+			-s.scl[1]*yscale, xshear, rot, float32(sys.gameWidth)/2, refRotPivot,
+			pfxCopy, s.facing, s.airOffsetFix, projection, fLength, true, shader)
 
 		// Restore original animation transparency just in case
 		s.anim.transType = oldTransType
@@ -2048,13 +2241,14 @@ type Anim struct {
 	palfx            *PalFX
 	layerno          int16
 	localScale       float32
-	offsetX          int32
+	offsetX          float32
 	friction         [2]float32
 	accel            [2]float32
 	vel              [2]float32
 	maxDist          [2]float32
 	facing           float32
 	lastUpdateFrame  int32
+	windowDefault    bool // The clip follows sys.scrrect if no window was authored.
 	// initial, unscaled values
 	offsetInit   [2]float32
 	scaleInit    [2]float32
@@ -2073,9 +2267,11 @@ func NewAnim(sff *Sff, action string) *Anim {
 		facing:          1,
 		lastUpdateFrame: -1,
 	}
+	a.windowDefault = true
 	if action != "" {
-		lines, i := SplitAndTrim(action, "\n"), 0
-		a.anim, _ = ReadAnimation(sff, &sff.palList, lines, &i)
+		ac := newAnimCompiler(sff, &sff.palList, true)
+		ac.lines, ac.animNo = SplitAndTrim(action, "\n"), -1
+		a.anim, _ = ac.readAnimation()
 		if len(a.anim.frames) == 0 {
 			return nil
 		}
@@ -2085,23 +2281,16 @@ func NewAnim(sff *Sff, action string) *Anim {
 	return a
 }
 
-// Creates a shallow copy with independent palette mapping
+// Creates a shallow copy with independent palette mapping and PalFX
 func (a *Anim) Copy() *Anim {
 	if a == nil || a.anim == nil || a.anim.sff == nil {
 		return nil
 	}
 	srcSff := a.anim.sff
-	copySff := newSff()
+	copySff := newSff(SffTypeOther)
 	// Copy header and palette info
 	copySff.header = srcSff.header
-	copySff.palList.palettes = srcSff.palList.palettes
-	// Independent paletteMap copy
-	copySff.palList.paletteMap = make([]int, len(srcSff.palList.paletteMap))
-	copy(copySff.palList.paletteMap, srcSff.palList.paletteMap)
-
-	copySff.palList.PalTable = srcSff.palList.PalTable
-	copySff.palList.numcols = srcSff.palList.numcols
-	copySff.palList.PalTex = srcSff.palList.PalTex
+	copySff.palList = srcSff.palList.copyMap()
 	// Serialize frames for NewAnim
 	var frameAnims strings.Builder
 	for _, f := range a.anim.frames {
@@ -2118,6 +2307,7 @@ func (a *Anim) Copy() *Anim {
 	newAnim.offsetInit = a.offsetInit
 	newAnim.scaleInit = a.scaleInit
 	newAnim.windowInit = a.windowInit
+	newAnim.windowDefault = a.windowDefault
 	newAnim.velocityInit = a.velocityInit
 	newAnim.xvel = a.xvel
 	newAnim.yvel = a.yvel
@@ -2135,9 +2325,9 @@ func (a *Anim) Copy() *Anim {
 	newAnim.rot.yangle = a.rot.yangle
 	newAnim.projection = a.projection
 	newAnim.fLength = a.fLength
-	newAnim.palfx = a.palfx
+	newAnim.palfx = a.palfx.Clone()
 	newAnim.lastUpdateFrame = -1
-	// Copy current animation state (timing, loop, interpolation, etc.)
+	// Copy current animation state (timing, loop, interpolation, etac.)
 	newAnim.anim.looptime = a.anim.looptime
 	newAnim.anim.loopstart = a.anim.loopstart
 	newAnim.anim.curtime = a.anim.curtime
@@ -2153,6 +2343,7 @@ func (a *Anim) Copy() *Anim {
 	newAnim.anim.mask = a.anim.mask
 	newAnim.anim.srcAlpha = a.anim.srcAlpha
 	newAnim.anim.dstAlpha = a.anim.dstAlpha
+	newAnim.anim.transType = a.anim.transType
 	// Copy all valid sprites safely
 	for _, c := range a.anim.frames {
 		if c.Group < 0 || c.Number < 0 {
@@ -2164,10 +2355,12 @@ func (a *Anim) Copy() *Anim {
 			continue
 		}
 		dst := newSprite()
-
+		dst.Group = src.Group
+		dst.Number = src.Number
 		dst.Tex = src.Tex
 		dst.palidx = src.palidx
 		dst.coldepth = src.coldepth
+		dst.hitPixels = src.hitPixels
 		// Copy arrays (if not slices, this is fine as-is)
 		dst.Offset = src.Offset
 		dst.Size = src.Size
@@ -2181,6 +2374,45 @@ func (a *Anim) Copy() *Anim {
 		newAnim.anim.sff.sprites[key] = dst
 	}
 	return newAnim
+}
+
+// PaletteCopy makes this animation's palette data private without copying images
+// It preserves playback, remapping and PalFX, and leaves other instances unchanged
+func (a *Anim) PaletteCopy() bool {
+	if a == nil || a.anim == nil || a.anim.sff == nil {
+		return false
+	}
+	source := a.anim.palettedata
+	if source == nil {
+		source = &a.anim.sff.palList
+	}
+	plc := make(paletteCopier)
+	copySff := *a.anim.sff
+	copySff.palList = source.copyPalettes(plc)
+	copySff.sprites = make(map[[2]uint16]*Sprite, len(a.anim.sff.sprites))
+	cloned := make(map[*Sprite]*Sprite)
+	copySprite := func(source *Sprite) *Sprite {
+		if source == nil {
+			return nil
+		}
+		if sprite, ok := cloned[source]; ok {
+			return sprite
+		}
+		sprite := *source
+		sprite.Pal = plc.copy(source.Pal)
+		sprite.PalTex, sprite.paltemp = nil, nil
+		cloned[source] = &sprite
+		return &sprite
+	}
+	for key, sprite := range a.anim.sff.sprites {
+		copySff.sprites[key] = copySprite(sprite)
+	}
+	// Detach the context too: another Anim may wrap the same Animation or SFF
+	copyAnim := *a.anim
+	copyAnim.sff, copyAnim.palettedata = &copySff, &copySff.palList
+	copyAnim.spr = copySprite(a.anim.spr)
+	a.anim = &copyAnim
+	return true
 }
 
 // Returns a shallow copy of an Animation.
@@ -2203,6 +2435,45 @@ func (a *Anim) SetColorKey(mask int16) {
 
 func (a *Anim) SetAlpha(src, dst int16) {
 	a.anim.srcAlpha, a.anim.dstAlpha = src, dst
+	if src < 0 {
+		a.anim.transType = TT_default
+	} else {
+		a.anim.transType = TT_add
+	}
+}
+
+// Blending for a trans name, as in stage backgrounds. A given alpha replaces
+// the default factors of the add and sub types.
+func transBlend(trans string, alpha []int32) (TransType, [2]int32) {
+	tt, factors := TT_default, [2]int32{255, 0}
+	switch strings.ToLower(strings.TrimSpace(trans)) {
+	case "", "default":
+	case "none":
+		tt = TT_none
+	case "add":
+		tt, factors = TT_add, [2]int32{255, 255}
+	case "add1":
+		tt, factors = TT_add, [2]int32{255, 128}
+	case "addalpha":
+		tt = TT_add
+	case "sub":
+		tt, factors = TT_sub, [2]int32{255, 255}
+	case "subadd":
+		tt, factors = TT_subadd, [2]int32{255, 255}
+	default:
+		LogMessage("Invalid trans type: %v", trans)
+	}
+	if tt != TT_default && tt != TT_none {
+		for i := 0; i < len(alpha) && i < 2; i++ {
+			factors[i] = Clamp(alpha[i], 0, 255)
+		}
+	}
+	return tt, factors
+}
+
+func (a *Anim) SetTrans(tt TransType, alpha [2]int32) {
+	a.anim.transType = tt
+	a.anim.srcAlpha, a.anim.dstAlpha = int16(alpha[0]), int16(alpha[1])
 }
 
 func (a *Anim) SetLocalcoord(lx, ly float32) {
@@ -2214,13 +2485,13 @@ func (a *Anim) SetLocalcoord(lx, ly float32) {
 		v = ly * 4 / 3
 	}
 	a.localScale = float32(v / 320)
-	a.offsetX = -int32(math.Floor(float64(lx)/(float64(v)/320)-320) / 2)
+	a.offsetX = localcoordOffsetX(float64(lx), float64(v))
 }
 
 func (a *Anim) SetPos(x, y float32) {
 	a.offsetInit[0] = x
 	a.offsetInit[1] = y
-	a.x = x/a.localScale + float32(a.offsetX)
+	a.x = x/a.localScale + a.offsetX
 	a.y = y / a.localScale
 }
 
@@ -2251,26 +2522,24 @@ func (a *Anim) SetWindow(window [4]float32) {
 	}
 
 	a.windowInit = window
+	a.windowDefault = false
 	a.window = a.drawWindow()
 }
 
 func (a *Anim) drawWindow() [4]int32 {
+	if a.windowDefault {
+		return sys.scrrect
+	}
 	if a.windowInit == [4]float32{0, 0, 0, 0} {
 		return a.window
 	}
 	// Pixel bounds depend on the aspect state selected for this draw pass.
 	window := a.windowInit
-	x := window[0]/a.localScale + float32(a.offsetX)
+	x := window[0]/a.localScale + a.offsetX
 	y := window[1] / a.localScale
 	w := (window[2] - window[0]) / a.localScale
 	h := (window[3] - window[1]) / a.localScale
-	// Truncate to int32 first, like before PR #3575, to avoid an off-by-one error
-	return [4]int32{
-		int32((x + float32(int32(sys.gameWidth)-320)/2) * sys.widthScale),
-		int32((y + float32(int32(sys.gameHeight)-240)) * sys.heightScale),
-		int32(w*sys.widthScale + 0.5),
-		int32(h*sys.heightScale + 0.5),
-	}
+	return screenRect(x+(sys.gameWidth-320)/2, y+sys.gameHeight-240, w, h)
 }
 
 func (a *Anim) SetVelocity(xvel, yvel float32) {
@@ -2362,6 +2631,13 @@ func (a *Anim) Draw(ln int16) {
 	if sys.frameSkip || a == nil || a.anim == nil || a.layerno != ln {
 		return
 	}
+	a.anim.draw(a.drawParams())
+}
+
+func (a *Anim) drawParams() RenderParams {
+	if a == nil || a.anim == nil {
+		return RenderParams{}
+	}
 	// Xshear offset correction
 	xshear := -a.xshear
 	var xsoffset float32
@@ -2375,16 +2651,12 @@ func (a *Anim) Draw(ln int16) {
 		xscl *= -1
 	}
 
-	// Truncate to int32 first, like before PR #3575, to avoid an off-by-one error
-	// sys.gameWidth used to be an int32 before PR #3575.
-	// unfortunately that PR introduces an off-by-one error here,
-	// so we force integer divsion by casting
-	// the result of sys.gameWidth subtraction to int.
-	// we do the same thing to sys.gameHeight just in case
+	// Fractional centering, matching the fractional offsetX (#1615, #3799)
 	window := a.drawWindow()
-	a.anim.Draw(&window, a.x+a.vel[0]-xsoffset+float32(int(sys.gameWidth-320)/2),
-		a.y+a.vel[1]+float32(int(sys.gameHeight-240)), 1, 1, xscl, xscl, a.yscl,
-		xshear, a.rot, 0, a.palfx, a.facing, [2]float32{1, 1}, a.projection, a.fLength, 0, false, CustomShaderRenderData{})
+	return a.anim.drawParams(&window, a.x+a.vel[0]-xsoffset+(sys.gameWidth-320)/2,
+		a.y+a.vel[1]+sys.gameHeight-240, 1, 1, xscl, xscl, a.yscl,
+		xshear, a.rot, 0, [2]float32{0, 0}, a.palfx, a.facing, [2]float32{1, 1},
+		a.projection, a.fLength, false, CustomShaderRenderData{})
 }
 
 func (a *Anim) Reset() {

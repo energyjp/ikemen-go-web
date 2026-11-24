@@ -17,13 +17,13 @@ func TestWatcherDropReasons(t *testing.T) {
 	silent := newTrio(true)
 	silent.run(30)
 	silent.board.cut[boardKey(tIP, tSpecPort)] = true
-	silent.run(400)
+	silent.run(600)
 	if r := silent.host.SpectatorDropReason(silent.specHandle); !strings.Contains(r, "behind") {
 		t.Errorf("silent watcher: reason %q", r)
 	}
 
 	absent := newTrio(false)
-	absent.run(300)
+	absent.run(600)
 	if r := absent.host.SpectatorDropReason(absent.specHandle); !strings.Contains(r, "not connected") {
 		t.Errorf("absent watcher: reason %q", r)
 	}

@@ -177,6 +177,31 @@ func iniFirstValue(k *ini.Key) (val string, dupCount int) {
 	return val, dupCount
 }
 
+// Lowercase ID of a section, with spaces read as underscores.
+func iniSectionID(sec *ini.Section) string {
+	return strings.ToLower(strings.ReplaceAll(sec.Name(), " ", "_"))
+}
+
+// Finds a section by its lowercase ID (spaces read as underscores).
+func iniSection(f *ini.File, id string) *ini.Section {
+	for _, sec := range f.Sections() {
+		if iniSectionID(sec) == id {
+			return sec
+		}
+	}
+	return nil
+}
+
+// Writes every ini-tagged string field of a struct into a section.
+func writeIniFields(section *ini.Section, v interface{}) {
+	rv := reflect.ValueOf(v).Elem()
+	for i := 0; i < rv.NumField(); i++ {
+		if tag := rv.Type().Field(i).Tag.Get("ini"); tag != "" {
+			section.Key(tag).SetValue(rv.Field(i).String())
+		}
+	}
+}
+
 // overlayUserFirstWins overlays values from user into dst.
 // If user contains duplicate keys (AllowShadows=true), the first occurrence wins.
 func overlayUserFirstWins(dst, user *ini.File) {
@@ -217,6 +242,37 @@ func tagInsensitiveKeys(sf reflect.StructField) bool {
 func tagKeyFirstMap(sf reflect.StructField) bool {
 	v := strings.TrimSpace(strings.ToLower(sf.Tag.Get("keyfirst")))
 	return v == "true" || v == "1" || v == "yes"
+}
+
+// Rewrites "<key>.<mapField>" queries to "<mapField>.<key>". With join, all parts
+// before a final map field form one key: "menugame.language.text" -> text["menugame.language"].
+func keyFirstParts(v reflect.Value, parts []queryPart, i int, join bool) ([]queryPart, bool) {
+	isKeyFirst := func(name string) bool {
+		fv, sf, ok := findFieldByINITag(v, name)
+		return ok && fv.Kind() == reflect.Map && fv.Type().Key().Kind() == reflect.String && tagKeyFirstMap(sf)
+	}
+	if i+1 >= len(parts) {
+		return nil, false
+	}
+	j := i + 1
+	if !isKeyFirst(parts[j].name) {
+		if !join {
+			return nil, false
+		}
+		j = len(parts) - 1
+		if j <= i+1 || !isKeyFirst(parts[j].name) {
+			return nil, false
+		}
+	}
+	names := make([]string, 0, j-i)
+	for k := i; k < j; k++ {
+		names = append(names, parts[k].name)
+	}
+	out := make([]queryPart, 0, len(parts)-(j-i)+1)
+	out = append(out, parts[:i]...)
+	out = append(out, parts[j], queryPart{name: strings.Join(names, ".")})
+	out = append(out, parts[j+1:]...)
+	return out, true
 }
 
 // returns true if root has a top-level ini:"<sec>" field with `literal:"yes"`.
@@ -1039,6 +1095,16 @@ func assignField(structPtr interface{}, parts []queryPart, value interface{}, ba
 		if v.Kind() == reflect.Struct {
 			fieldVal, fieldType, found := findFieldByINITag(v, part.name)
 			if found {
+				if part.index != nil {
+					if fieldVal.Kind() != reflect.Array && fieldVal.Kind() != reflect.Slice {
+						return true, fmt.Errorf("field '%s' is not an array or slice", part.name)
+					}
+					idx, err := strconv.Atoi(*part.index)
+					if err != nil || idx < 0 || idx >= fieldVal.Len() {
+						return true, fmt.Errorf("invalid index '%s' for field '%s'", *part.index, part.name)
+					}
+					return true, setFieldValue(fieldVal.Index(idx), value, "", strings.Join(extractNames(parts), "."), "", baseDef)
+				}
 				// If the matched field is a MAP and we're at the final token, assign to the map["default"] element.
 				if fieldVal.Kind() == reflect.Map {
 					if fieldVal.IsNil() {
@@ -1075,8 +1141,15 @@ func assignField(structPtr interface{}, parts []queryPart, value interface{}, ba
 				case "char", "stage":
 					switch fieldType.Name {
 					case "Anim":
-						if fieldVal.Kind() == reflect.Int32 {
-							av := int32(fieldVal.Int())
+						// Single anim or anim list
+						var anims []int32
+						switch fieldVal.Kind() {
+						case reflect.Int32:
+							anims = []int32{int32(fieldVal.Int())}
+						case reflect.Slice:
+							anims, _ = fieldVal.Interface().([]int32)
+						}
+						for _, av := range anims {
 							if av >= 0 {
 								if preload == "char" {
 									sys.sel.charAnimPreload[av] = true
@@ -1086,18 +1159,20 @@ func assignField(structPtr interface{}, parts []queryPart, value interface{}, ba
 							}
 						}
 					case "Spr":
-						// Expect a [2]int32 array
-						if fieldVal.Kind() == reflect.Array && fieldVal.Len() == 2 {
-							// Read both elements as int32
-							a0 := uint16(fieldVal.Index(0).Int())
-							a1 := uint16(fieldVal.Index(1).Int())
-							if a0 >= 0 && a1 >= 0 {
-								key := [2]uint16{a0, a1}
-								if preload == "char" {
-									sys.sel.charSpritePreload[key] = true
-								} else {
-									sys.sel.stageSpritePreload[key] = true
-								}
+						// Single group, index pair or a list of pairs
+						var sprs []int32
+						switch fieldVal.Kind() {
+						case reflect.Array, reflect.Slice:
+							for i := 0; i < fieldVal.Len(); i++ {
+								sprs = append(sprs, int32(fieldVal.Index(i).Int()))
+							}
+						}
+						for _, p := range sprList(sprs) {
+							key := [2]uint16{uint16(p[0]), uint16(p[1])}
+							if preload == "char" {
+								sys.sel.charSpritePreload[key] = true
+							} else {
+								sys.sel.stageSpritePreload[key] = true
 							}
 						}
 					}
@@ -1195,6 +1270,13 @@ func assignField(structPtr interface{}, parts []queryPart, value interface{}, ba
 					} else if ok {
 
 						return nil
+					}
+
+					// Dotted keys after a text map form one key: "text.menugame.language" -> text["menugame.language"].
+					if tagKeyFirstMap(sf) && fieldVal.Type().Key().Kind() == reflect.String &&
+						fieldVal.Type().Elem().Kind() == reflect.String && i+2 < len(parts) {
+						joined := queryPart{name: strings.Join(extractNames(parts[i+1:]), ".")}
+						return assignField(structPtr, append(append([]queryPart{}, parts[:i+1]...), joined), value, baseDef)
 					}
 
 					// Normal map-of-struct behavior (using "default" key).
@@ -1318,16 +1400,8 @@ func assignField(structPtr interface{}, parts []queryPart, value interface{}, ba
 
 			// Handle key-first map fields:
 			// rewrite "<key>.<mapField>[...]" to "<mapField>.<key>[...]" when the map field has `keyfirst:"true"`.
-			if i+1 < len(parts) {
-				if fieldValMap, sfMap, foundMap := findFieldByINITag(v, parts[i+1].name); foundMap &&
-					fieldValMap.Kind() == reflect.Map &&
-					fieldValMap.Type().Key().Kind() == reflect.String &&
-					tagKeyFirstMap(sfMap) {
-					newParts := make([]queryPart, len(parts))
-					copy(newParts, parts)
-					newParts[i], newParts[i+1] = newParts[i+1], newParts[i]
-					return assignField(structPtr, newParts, value, baseDef)
-				}
+			if newParts, ok := keyFirstParts(v, parts, i, true); ok {
+				return assignField(structPtr, newParts, value, baseDef)
 			}
 
 			return fmt.Errorf("field '%s' not found as struct or map field", part.name)
@@ -1509,14 +1583,9 @@ func updateINIFile(obj interface{}, iniFile *ini.File, query string, value strin
 				// Key-first map syntax support:
 				// If the next token names a map field tagged `keyfirst:"true"`, swap and retry.
 				// Example: "<key>.text" -> "text.<key>" (but generalized to any tagged map field).
-				if i+1 < len(parts) {
-					if fvMap, sfMap, ok := findFieldByINITag(currentValue, parts[i+1].name); ok &&
-						fvMap.Kind() == reflect.Map &&
-						fvMap.Type().Key().Kind() == reflect.String &&
-						tagKeyFirstMap(sfMap) {
-						parts[i], parts[i+1] = parts[i+1], parts[i]
-						continue
-					}
+				if newParts, ok := keyFirstParts(currentValue, parts, i, false); ok {
+					parts = newParts
+					continue
 				}
 				// Not a direct field -> check if it's a direct map field with the same tag
 				mapFieldVal, _, mapFound := findMapFieldWithTag(currentValue, part.name)
@@ -1562,11 +1631,15 @@ func updateINIFile(obj interface{}, iniFile *ini.File, query string, value strin
 						return fmt.Errorf("field '%s' not found as struct or map field", part.name)
 					}
 					if !sectionSet {
+						// A top-level pattern map entry is a whole section, so all remaining parts form the key.
 						sectionName = part.name
 						sectionSet = true
-					} else {
-						keyNameParts = append(keyNameParts, part.name)
+						for i++; i < len(parts); i++ {
+							keyNameParts = append(keyNameParts, parts[i].name)
+						}
+						goto finalize
 					}
+					keyNameParts = append(keyNameParts, part.name)
 
 					i++
 					// If there's another part after e.g. Up, that is the actual final key
@@ -1720,15 +1793,10 @@ func GetValue(structPtr interface{}, query string) (interface{}, error) {
 				} else {
 					// Key-first map syntax support (read path):
 					// If the next token names a map field tagged `keyfirst:"true"`, swap and retry.
-					if i+1 < len(parts) {
-						if fvMap, sfMap, ok := findFieldByINITag(current, parts[i+1].name); ok &&
-							fvMap.Kind() == reflect.Map &&
-							fvMap.Type().Key().Kind() == reflect.String &&
-							tagKeyFirstMap(sfMap) {
-							parts[i], parts[i+1] = parts[i+1], parts[i]
-							i--
-							continue
-						}
+					if newParts, ok := keyFirstParts(current, parts, i, true); ok {
+						parts = newParts
+						i--
+						continue
 					}
 					return nil, fmt.Errorf("field '%s' not found in struct or pattern map for query '%s'", part.name, query)
 				}
@@ -1940,11 +2008,13 @@ func getFieldFromHierarchy(primary, parent reflect.Value, name string) (reflect.
 }
 
 // SetAnim sets the Anim field generically for any struct that contains AnimTable and Sff fields.
-func SetAnim(obj interface{}, fVal, structVal, parent reflect.Value, sffOverride *Sff, warnMissing bool) {
+func SetAnim(obj interface{}, fVal, structVal, parent reflect.Value, sffOverride *Sff, warnMissing bool, param string) {
 	anim := int32(-1)
 	spr := [2]int32{-1, 0}
 	offset := [2]float32{0, 0}
 	scale := [2]float32{1, 1}
+	trans := ""
+	var alpha []int32
 	facing := float32(1)
 	xshear := float32(0)
 	angle := float32(0)
@@ -1981,6 +2051,13 @@ func SetAnim(obj interface{}, fVal, structVal, parent reflect.Value, sffOverride
 		scale[0] = float32(fv.Index(0).Float())
 		scale[1] = float32(fv.Index(1).Float())
 	}
+	if fv, ok := get("Alpha"); ok && fv.Kind() == reflect.Slice {
+		alpha, _ = fv.Interface().([]int32)
+	}
+	if fv, ok := get("Trans"); ok && fv.Kind() == reflect.String {
+		trans = fv.String()
+	}
+	tt, blend := transBlend(trans, alpha)
 	if fv, ok := get("Facing"); ok && fv.Kind() >= reflect.Int && fv.Kind() <= reflect.Int64 {
 		facing = float32(fv.Int())
 	}
@@ -2082,17 +2159,29 @@ func SetAnim(obj interface{}, fVal, structVal, parent reflect.Value, sffOverride
 
 	// animNew
 	var a *Anim
-	if animData, exists := animMap.anims[anim]; exists {
+	animData, exists := animMap.anims[anim]
+	if _, isMotif := obj.(*Motif); isMotif && !exists && anim != -1 && warnMissing {
+		if animMap.filename != "" {
+			LogMessage("WARNING: %v: missing action %v in %v", param, anim, animMap.filename)
+		} else {
+			LogMessage("WARNING: %v: missing action %v", param, anim)
+		}
+	}
+	if exists {
 		a = NewAnim(nil, "")
 		a.anim = animData
 		if !warnMissing {
 			a.anim = animData.ShallowCopy()
 			a.anim.warnMissing = false
+		} else if tt != TT_default {
+			// Trans changes the animation, so it can't stay shared with the table.
+			a.anim = animData.ShallowCopy()
 		}
 	} else if hasSpr {
 		a = NewAnim(sffPtr, fmt.Sprintf("%d,%d, 0,0, -1", spr[0], spr[1]))
 		//a.anim.SetAnimElem(1, 0)
 		a.anim.warnMissing = warnMissing
+		a.anim.param = param
 		a.anim.UpdateSprite()
 	} else {
 		a = NewAnim(nil, "")
@@ -2131,7 +2220,10 @@ func SetAnim(obj interface{}, fVal, structVal, parent reflect.Value, sffOverride
 	// animSetFriction
 	a.friction = friction
 	// animSetTile
-	// animSetAlpha
+	// animSetTrans
+	if tt != TT_default && a.anim != nil {
+		a.SetTrans(tt, blend)
+	}
 	// animSetColorKey
 	// animSetPalFX
 
@@ -2156,6 +2248,8 @@ func SetTextSprite(obj interface{}, fVal, structVal, parent reflect.Value) {
 	offset := [2]float32{0, 0}
 	font := [8]int32{-1, 0, 0, 255, 255, 255, 255, -1}
 	scale := [2]float32{1, 1}
+	trans := ""
+	var alpha []int32
 	xshear := float32(0)
 	angle := float32(0)
 	xangle := float32(0)
@@ -2190,6 +2284,12 @@ func SetTextSprite(obj interface{}, fVal, structVal, parent reflect.Value) {
 	if fv, ok := get("Scale"); ok && fv.Kind() == reflect.Array && fv.Len() == 2 {
 		scale[0] = float32(fv.Index(0).Float())
 		scale[1] = float32(fv.Index(1).Float())
+	}
+	if fv, ok := get("Alpha"); ok && fv.Kind() == reflect.Slice {
+		alpha, _ = fv.Interface().([]int32)
+	}
+	if fv, ok := get("Trans"); ok && fv.Kind() == reflect.String {
+		trans = fv.String()
 	}
 	if fv, ok := get("Xshear"); ok && (fv.Kind() == reflect.Float32 || fv.Kind() == reflect.Float64) {
 		xshear = float32(fv.Float())
@@ -2307,6 +2407,9 @@ func SetTextSprite(obj interface{}, fVal, structVal, parent reflect.Value) {
 	ts.SetPos(offset[0], offset[1])
 	// textImgSetScale
 	ts.SetScale(scale[0], scale[1])
+	// textImgSetTrans
+	ts.trans, ts.alpha = transBlend(trans, alpha)
+	ts.transInit, ts.alphaInit = ts.trans, ts.alpha
 	// textImgSetXShear
 	ts.xshear = xshear
 	// textImgSetAngle
@@ -2328,7 +2431,7 @@ func SetTextSprite(obj interface{}, fVal, structVal, parent reflect.Value) {
 	// textImgSetTextSpacing
 	ts.SetTextSpacing(textSpacing[0], textSpacing[1])
 	// textImgSetTextWrap
-	ts.textWrap = textWrap == "w" || textWrap == "1"
+	ts.SetTextWrap(textWrap)
 	// textImgSetVelocity
 	ts.SetVelocity(velocity[0], velocity[1])
 	// textImgSetMaxDist
@@ -2338,6 +2441,10 @@ func SetTextSprite(obj interface{}, fVal, structVal, parent reflect.Value) {
 	// textImgSetFriction
 	ts.friction = friction
 
+	// Storyboard text reads [SceneDef] actions first.
+	if owner, ok := obj.(*Storyboard); ok {
+		ts.glyphStoryboard = owner
+	}
 	fVal.Set(reflect.ValueOf(ts))
 }
 
@@ -2463,6 +2570,7 @@ func SetRect(obj interface{}, fVal, structVal, parent reflect.Value) {
 	alpha := [2]int32{0, 0}
 	pulse := [3]int32{0, 0, 0}
 	var usePulse bool
+	trans := ""
 	//var attachPfx *PalFX
 
 	get := func(name string) (reflect.Value, bool) {
@@ -2503,6 +2611,11 @@ func SetRect(obj interface{}, fVal, structVal, parent reflect.Value) {
 		}
 		usePulse = true
 	}
+	for _, name := range []string{"Trans", "ClearTrans", "BgClearTrans"} {
+		if fv, ok := get(name); ok && fv.Kind() == reflect.String {
+			trans = fv.String()
+		}
+	}
 	if fv, ok := get("Localcoord"); ok && fv.Kind() == reflect.Array && fv.Len() == 2 {
 		localcoord[0] = float32(fv.Index(0).Int())
 		localcoord[1] = float32(fv.Index(1).Int())
@@ -2524,6 +2637,9 @@ func SetRect(obj interface{}, fVal, structVal, parent reflect.Value) {
 	} else {
 		rect.SetAlpha(alpha)
 	}
+	// rectSetTrans
+	tt, _ := transBlend(trans, nil)
+	rect.SetTrans(tt)
 	// rectSetLayerno
 	rect.layerno = layerno
 	// rectSetPalFx
@@ -2605,9 +2721,21 @@ func PopulateDataPointers(obj interface{}, rootLocalcoord [2]int32) {
 	if m, ok := obj.(*Motif); ok {
 		inheritedKeys = m.inheritedKeys
 	}
+	// Check motif snd values against the already loaded SND.
+	var rootSnd *Snd
+	if m, ok := obj.(*Motif); ok && m.Snd != nil && len(m.Snd.table) > 0 {
+		rootSnd = m.Snd
+	}
+	warnMissingSnd := func(param string, gn [2]int32) {
+		if gn[0] < 0 || gn[1] < 0 || rootSnd.Get(gn) != nil {
+			return
+		}
+		LogMessage("WARNING: %v: missing sound %v,%v in %v", param, gn[0], gn[1], rootSnd.filename)
+	}
 
 	// Thread both localcoord and effective SFF through recursion.
-	var populate func(v reflect.Value, parent reflect.Value, currentLocalCoord [2]int32, currentSff *Sff, skipInit bool, warnMissing bool, path string)
+	// label is the parameter name as written, used in warnings.
+	var populate func(v reflect.Value, parent reflect.Value, currentLocalCoord [2]int32, currentSff *Sff, skipInit bool, warnMissing bool, path, label string)
 
 	// Types we look for
 	animPtrType := reflect.TypeOf((*Anim)(nil))
@@ -2617,7 +2745,7 @@ func PopulateDataPointers(obj interface{}, rootLocalcoord [2]int32) {
 	fadePtrType := reflect.TypeOf((*Fade)(nil))
 
 	// The recursive function
-	populate = func(v reflect.Value, parent reflect.Value, currentLocalCoord [2]int32, currentSff *Sff, skipInit bool, warnMissing bool, path string) {
+	populate = func(v reflect.Value, parent reflect.Value, currentLocalCoord [2]int32, currentSff *Sff, skipInit bool, warnMissing bool, path, label string) {
 		if !v.IsValid() {
 			return
 		}
@@ -2625,7 +2753,7 @@ func PopulateDataPointers(obj interface{}, rootLocalcoord [2]int32) {
 			if v.IsNil() {
 				return
 			}
-			populate(v.Elem(), parent, currentLocalCoord, currentSff, skipInit, warnMissing, path)
+			populate(v.Elem(), parent, currentLocalCoord, currentSff, skipInit, warnMissing, path, label)
 			return
 		}
 
@@ -2678,10 +2806,11 @@ func PopulateDataPointers(obj interface{}, rootLocalcoord [2]int32) {
 					}
 				}
 
-				fieldPath := path
+				fieldPath, fieldLabel := path, label
 				if tag := strings.TrimSpace(fType.Tag.Get("ini")); tag != "" &&
 					!strings.HasPrefix(strings.ToLower(tag), "map:") {
 					fieldPath = joinPath(path, tag)
+					fieldLabel = joinPath(label, tag)
 				}
 
 				// Check for skipInit tag on this field
@@ -2694,17 +2823,38 @@ func PopulateDataPointers(obj interface{}, rootLocalcoord [2]int32) {
 					childWarnMissing = false
 				}
 
+				if rootSnd != nil && warnMissing && strings.EqualFold(strings.TrimSpace(fType.Tag.Get("ini")), "snd") &&
+					!(inheritedKeys != nil && inheritedKeys[fieldPath]) {
+					switch val := fVal.Interface().(type) {
+					case [2]int32:
+						warnMissingSnd(fieldLabel, val)
+					case map[string][2]int32:
+						for k, gn := range val {
+							param := fieldLabel
+							if !strings.EqualFold(k, "default") {
+								if tagKeyFirstMap(fType) {
+									// e.g. cursor.done.<itemname>.snd
+									param = strings.TrimSuffix(fieldLabel, ".snd") + "." + k + ".snd"
+								} else {
+									param = fieldLabel + "." + k
+								}
+							}
+							warnMissingSnd(param, gn)
+						}
+					}
+				}
+
 				kind := fVal.Kind()
 
 				// Recurse for struct or non-nil ptr
 				if kind == reflect.Struct || (kind == reflect.Ptr && !fVal.IsNil()) {
-					populate(fVal, v, localCoordForThisStruct, nextSff, childSkipInit, childWarnMissing, fieldPath)
+					populate(fVal, v, localCoordForThisStruct, nextSff, childSkipInit, childWarnMissing, fieldPath, fieldLabel)
 					continue
 				}
 				// If it's a map, recurse as well
 				if kind == reflect.Map {
 					// Pass along the possibly overridden SFF from this field's tag.
-					populate(fVal, parent, localCoordForThisStruct, nextSff, childSkipInit, childWarnMissing, fieldPath)
+					populate(fVal, parent, localCoordForThisStruct, nextSff, childSkipInit, childWarnMissing, fieldPath, fieldLabel)
 					continue
 				}
 				// If it's *Anim
@@ -2716,7 +2866,7 @@ func PopulateDataPointers(obj interface{}, rootLocalcoord [2]int32) {
 							dummyAnim := NewAnim(nil, "")
 							fVal.Set(reflect.ValueOf(dummyAnim))
 						} else {
-							SetAnim(obj, fVal, v, parent, effectiveSffForThisStruct, childWarnMissing)
+							SetAnim(obj, fVal, v, parent, effectiveSffForThisStruct, childWarnMissing, fieldLabel)
 						}
 					}
 					continue
@@ -2725,6 +2875,8 @@ func PopulateDataPointers(obj interface{}, rootLocalcoord [2]int32) {
 				if kind == reflect.Ptr && fVal.Type().AssignableTo(textSpritePtrType) {
 					if fVal.IsNil() && fVal.CanSet() {
 						SetTextSprite(obj, fVal, v, parent)
+						// Resolve action tags from the nearest menu or screen.
+						fVal.Interface().(*TextSprite).glyphSection = path
 					}
 					continue
 				}
@@ -2755,19 +2907,24 @@ func PopulateDataPointers(obj interface{}, rootLocalcoord [2]int32) {
 		// If we have a slice or array, recurse into each element
 		case reflect.Slice, reflect.Array:
 			for i := 0; i < v.Len(); i++ {
-				populate(v.Index(i), parent, currentLocalCoord, currentSff, skipInit, warnMissing, path)
+				populate(v.Index(i), parent, currentLocalCoord, currentSff, skipInit, warnMissing, path, label)
 			}
 		case reflect.Map:
 			for _, key := range v.MapKeys() {
 				val := v.MapIndex(key)
-				childPath := path
+				childPath, childLabel := path, label
 				if key.Kind() == reflect.String {
 					k := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(key.String()), " ", "_"))
 					if k != "" {
 						childPath = k
+						// Keep the key case, glyph keys are case-sensitive.
+						childLabel = strings.TrimSpace(key.String())
+						if label != "" {
+							childLabel = label + "." + childLabel
+						}
 					}
 				}
-				populate(val, parent, currentLocalCoord, currentSff, skipInit, warnMissing, childPath)
+				populate(val, parent, currentLocalCoord, currentSff, skipInit, warnMissing, childPath, childLabel)
 			}
 		default:
 			// basic types: do nothing
@@ -2780,7 +2937,7 @@ func PopulateDataPointers(obj interface{}, rootLocalcoord [2]int32) {
 		return
 	}
 	// Start recursion with the original user-supplied localcoord
-	populate(v.Elem(), v.Elem(), rootLocalcoord, rootSff, false, true, "")
+	populate(v.Elem(), v.Elem(), rootLocalcoord, rootSff, false, true, "", "")
 }
 
 // Split a [Music] key into (prefix, property) while allowing dots in prefix.

@@ -19,6 +19,18 @@ import (
 // remote peer, identified to GGPO's endpoint matching by the (peerIp,
 // peerPort) this transport stamps on every incoming message.
 
+// The page's Uint8Array constructor, looked up once: every lookup of an object
+// hands Go a new reference that its garbage collector must finalize later.
+var jsUint8Array = js.Global().Get("Uint8Array")
+
+// isDatagram: v is a datagram array. Asked with numEmpty = true, a page that
+// knows the argument answers an empty read with the number 0 (no JS object,
+// so nothing for the garbage collector to finalize); an older page still
+// answers with an empty array, read the same way.
+func isDatagram(v js.Value) bool {
+	return v.Type() == js.TypeObject
+}
+
 type WebRTC struct {
 	bridge   js.Value
 	peerIp   string
@@ -37,7 +49,7 @@ func (w *WebRTC) SendTo(msg messages.UDPMessage, remoteIp string, remotePort int
 		return
 	}
 	b := msg.ToBytes()
-	buf := js.Global().Get("Uint8Array").New(len(b))
+	buf := jsUint8Array.New(len(b))
 	js.CopyBytesToJS(buf, b)
 	w.bridge.Call("sendGGPO", buf)
 }
@@ -52,11 +64,14 @@ func (w *WebRTC) Read(messageChan chan MessageChannelItem) {
 		if w.closed.Load() {
 			return
 		}
-		v := w.bridge.Call("readGGPO")
+		v := w.bridge.Call("readGGPO", true)
 		if v.IsNull() {
 			return // channel closed
 		}
-		n := v.Get("length").Int()
+		n := 0
+		if isDatagram(v) {
+			n = v.Get("length").Int()
+		}
 		if n == 0 {
 			time.Sleep(time.Millisecond)
 			continue
@@ -139,7 +154,7 @@ func (h *WebRTCHub) SendTo(msg messages.UDPMessage, remoteIp string, remotePort 
 		return
 	}
 	b := msg.ToBytes()
-	buf := js.Global().Get("Uint8Array").New(len(b))
+	buf := jsUint8Array.New(len(b))
 	js.CopyBytesToJS(buf, b)
 	h.watch.Call("sendTo", slot, buf)
 }
@@ -154,11 +169,14 @@ func (h *WebRTCHub) Read(messageChan chan MessageChannelItem) {
 			if h.closed.Load() {
 				return
 			}
-			v := h.watch.Call("readAny")
+			v := h.watch.Call("readAny", true)
 			if v.IsNull() || v.IsUndefined() {
 				return
 			}
-			n := v.Get("length").Int()
+			n := 0
+			if isDatagram(v) {
+				n = v.Get("length").Int()
+			}
 			if n == 0 {
 				break
 			}

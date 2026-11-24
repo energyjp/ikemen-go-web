@@ -12,6 +12,18 @@ import (
 	"github.com/ikemen-engine/ggpo/internal/protocol"
 )
 
+// heartbeatPolls polls a running endpoint twice: at once (the first poll in
+// RunningState sends the pending input), then once RunningRetryInterval of
+// silence has passed, when the endpoint sends it again. Upstream's resend fix
+// (f34b113e, protocol.go: resend only after that much silence) replaced the
+// old timing, where every poll within the interval of the last input received
+// resent, so two quick polls in a row ended on an input.
+func heartbeatPolls(endpoint *protocol.UdpProtocol) {
+	t0 := polling.DefaultTime()
+	endpoint.OnLoopPoll(func() int64 { return t0 })
+	endpoint.OnLoopPoll(func() int64 { return t0 + protocol.RunningRetryInterval })
+}
+
 func TestMakeUDPProtocol(t *testing.T) {
 	connectStatus := []messages.UdpConnectStatus{
 		{Disconnected: false, LastFrame: 20},
@@ -443,10 +455,7 @@ func TestUDPProtocolHeartbeatGameInput(t *testing.T) {
 	for i := 0; i < protocol.NumSyncPackets+1; i++ {
 		endpoint.GetEvent()
 	}
-	heartbeatTriggerInterval := 2
-	for i := 0; i < heartbeatTriggerInterval; i++ {
-		endpoint.OnLoopPoll(polling.DefaultTime)
-	}
+	heartbeatPolls(&endpoint)
 
 	if connection.LastSentMessage.Type() != messages.InputMsg {
 		t.Errorf("This expected the OnLoopPoll to send a heartbeat game input")
@@ -480,10 +489,7 @@ func TestUDPProtocolOnInputDefaultPanic(t *testing.T) {
 	for i := 0; i < protocol.NumSyncPackets+1; i++ {
 		endpoint.GetEvent()
 	}
-	heartbeatTriggerInterval := 2
-	for i := 0; i < heartbeatTriggerInterval; i++ {
-		endpoint.OnLoopPoll(polling.DefaultTime)
-	}
+	heartbeatPolls(&endpoint)
 
 	if connection.LastSentMessage.Type() != messages.InputMsg {
 		t.Errorf("This expected the OnLoopPoll to send a heartbeat game input")
@@ -524,10 +530,7 @@ func TestUDPProtocolOnInputPanicWithNonEqualConnectStatus(t *testing.T) {
 	for i := 0; i < protocol.NumSyncPackets+1; i++ {
 		endpoint.GetEvent()
 	}
-	heartbeatTriggerInterval := 2
-	for i := 0; i < heartbeatTriggerInterval; i++ {
-		endpoint.OnLoopPoll(polling.DefaultTime)
-	}
+	heartbeatPolls(&endpoint)
 
 	if connection.LastSentMessage.Type() != messages.InputMsg {
 		t.Errorf("This expected the OnLoopPoll to send a heartbeat game input")
@@ -569,10 +572,7 @@ func TestUDPProtocolOnInputAfterSynchronizeCharacterization(t *testing.T) {
 	for i := 0; i < protocol.NumSyncPackets+1; i++ {
 		endpoint.GetEvent()
 	}
-	heartbeatTriggerInterval := 2
-	for i := 0; i < heartbeatTriggerInterval; i++ {
-		endpoint.OnLoopPoll(polling.DefaultTime)
-	}
+	heartbeatPolls(&endpoint)
 
 	if connection.LastSentMessage.Type() != messages.InputMsg {
 		t.Errorf("This expected the OnLoopPoll to send a heartbeat game input")
@@ -615,10 +615,7 @@ func TestUDPProtocolOnInputAfterSynchronize(t *testing.T) {
 	for i := 0; i < protocol.NumSyncPackets+1; i++ {
 		endpoint.GetEvent()
 	}
-	heartbeatTriggerInterval := 2
-	for i := 0; i < heartbeatTriggerInterval; i++ {
-		endpoint.OnLoopPoll(polling.DefaultTime)
-	}
+	heartbeatPolls(&endpoint)
 
 	if connection.LastSentMessage.Type() != messages.InputMsg {
 		t.Errorf("This expected the OnLoopPoll to send a heartbeat game input")
@@ -806,39 +803,46 @@ func TestUDPProtocolSequenceNumberReject(t *testing.T) {
 	}
 }
 
+// A running endpoint that has sent nothing for KeepAliveInterval sends a keep
+// alive. Before upstream's resend fix this test ran two endpoints on the
+// synchronous P2P mock and read the last message after two polls; with the
+// fix far fewer messages go out, and that mock's re-entrant delivery (SendTo
+// answers inside PumpSendQueue, which then pops one entry twice and holds
+// the send queue shut) swallows the keep alive. So: one endpoint on the
+// recording mock, synchronized by hand, polled once at once and once after
+// RunningRetryInterval + 1 ms of silence, when the heartbeat input and then
+// the keep alive go out.
 func TestUDPProtocolKeepAlive(t *testing.T) {
 	connectStatus := []messages.UdpConnectStatus{
 		{Disconnected: false, LastFrame: 20},
 		{Disconnected: false, LastFrame: 22},
 	}
-	peerAdress := "127.2.1.1"
-	peerPort := 7001
-	port2 := 7000
-	f := mocks.FakeMessageHandler{}
-	f2 := mocks.FakeMessageHandler{}
-	connection := mocks.NewFakeP2PConnection(&f, peerPort, peerAdress)
-	endpoint := protocol.NewUdpProtocol(&connection, 0, peerAdress, port2, &connectStatus)
+	connection := mocks.NewFakeConnection()
+	endpoint := protocol.NewUdpProtocol(&connection, 0, "127.2.1.1", 7001, &connectStatus)
 
-	connection2 := mocks.NewFakeP2PConnection(&f2, port2, peerAdress)
-	endpoint2 := protocol.NewUdpProtocol(&connection2, 0, peerAdress, peerPort, &connectStatus)
-	f2.Endpoint = &endpoint
-	f.Endpoint = &endpoint2
-
-	//ggpo.EnableLogger()
 	endpoint.Synchronize()
-	endpoint2.Synchronize()
-
-	advance := func() int64 {
-		return time.Now().Add(time.Millisecond * 11000).UnixMilli()
+	syncRequest := connection.LastSentMessage.(*messages.SyncRequestPacket)
+	msg := messages.NewUDPMessage(messages.SyncReplyMsg)
+	syncReply := msg.(*messages.SyncReplyPacket)
+	syncReply.RandomReply = syncRequest.RandomRequest
+	for i := 0; i < protocol.NumSyncPackets; i++ {
+		endpoint.OnSyncReply(syncReply, syncReply.PacketSize())
+		if r, ok := connection.LastSentMessage.(*messages.SyncRequestPacket); ok {
+			syncReply.RandomReply = r.RandomRequest
+		}
 	}
-	for !endpoint2.IsSynchronized() {
-		endpoint2.OnLoopPoll(advance)
+	if !endpoint.IsSynchronized() {
+		t.Fatal("the endpoint did not synchronize")
 	}
 
-	endpoint.OnLoopPoll(advance)
-	endpoint.OnLoopPoll(advance)
+	t0 := polling.DefaultTime()
+	endpoint.OnLoopPoll(func() int64 { return t0 })
+	if connection.LastSentMessage.Header().HeaderType == uint8(messages.KeepAliveMsg) {
+		t.Errorf("Endpoint sent a keep alive although it had just sent")
+	}
+	endpoint.OnLoopPoll(func() int64 { return t0 + protocol.RunningRetryInterval + 1 })
 	if connection.LastSentMessage.Header().HeaderType != uint8(messages.KeepAliveMsg) {
-		t.Errorf("Endpoint should've sent keep alive packet.")
+		t.Errorf("Endpoint should've sent keep alive packet, last sent type %d", connection.LastSentMessage.Header().HeaderType)
 	}
 }
 
@@ -877,8 +881,12 @@ func TestUDPProtocolHeartBeatCharacterization(t *testing.T) {
 		}
 	}()
 
+	// One RunningRetryInterval apart, so every poll sends a heartbeat input
+	// (see heartbeatPolls).
+	t1 := advance()
 	for i := 0; i < 10; i++ {
-		endpoint2.OnLoopPoll(advance)
+		at := t1 + int64(i+1)*protocol.RunningRetryInterval
+		endpoint2.OnLoopPoll(func() int64 { return at })
 	}
 }
 
@@ -913,9 +921,13 @@ func TestUDPProtocolHeartBeat(t *testing.T) {
 		endpoint2.OnLoopPoll(advance)
 	}
 
+	// One RunningRetryInterval apart, so every round sends a heartbeat input
+	// and then a keep alive (see heartbeatPolls).
+	t1 := advance()
 	for i := 0; i < 20; i++ {
-		endpoint2.OnLoopPoll(advance)
-		endpoint.OnLoopPoll(advance)
+		at := t1 + int64(i+1)*protocol.RunningRetryInterval
+		endpoint2.OnLoopPoll(func() int64 { return at })
+		endpoint.OnLoopPoll(func() int64 { return at })
 	}
 	e1k := connection.MessageHistory[len(connection.MessageHistory)-1]
 	e1i := connection.MessageHistory[len(connection.MessageHistory)-2]

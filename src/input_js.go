@@ -3,6 +3,9 @@
 package main
 
 import (
+	"encoding/binary"
+	"fmt"
+	"math"
 	"strings"
 	"syscall/js"
 )
@@ -15,11 +18,10 @@ import (
 // save/config.json is portable between desktop and web.
 //
 // Gamepads: polled once per frame from navigator.getGamepads() (see
-// pollGamepads, called by the system backend's event pump). Pads with the
-// W3C "standard" mapping are translated to the SDL GameController layout
-// the engine expects (same button order, axes LX LY RX RY LT RT). Real
-// controllers are ranked ahead of junk HID devices (USB microphones
-// advertise buttons and would otherwise claim the P1 slot).
+// pollGamepads, called by the system backend's event pump), as upstream's
+// input_sdl.go contract: a slot per pad, sys.attachGamepad/detachGamepad on
+// hot-plug, ControllerState in SDL's GameController layout (axes LX LY RX RY
+// LT RT). The parts that need no JavaScript are in gamepad_js.go.
 
 type Key = int32
 type ModifierKey = uint16
@@ -156,56 +158,51 @@ const (
 
 var KeyToStringLUT map[Key]string
 var StringToKeyLUT map[string]Key
-var ButtonToStringLUT map[int]string
-var StringToButtonLUT map[string]int
 var jsCodeToKey map[string]Key
 
-// SDL GameController button order the engine expects from
-// GetJoystickButtons (matches input_sdl.go's buttonOrder).
-// Index in this list -> browser standard-mapping button index.
-var sdlOrderToBrowser = [15]int{
-	0,  // A
-	1,  // B
-	2,  // X
-	3,  // Y
-	8,  // BACK
-	16, // GUIDE
-	9,  // START
-	10, // LEFTSTICK
-	11, // RIGHTSTICK
-	4,  // LEFTSHOULDER
-	5,  // RIGHTSHOULDER
-	12, // DPAD_UP
-	13, // DPAD_DOWN
-	14, // DPAD_LEFT
-	15, // DPAD_RIGHT
-}
+// GamepadButton is the platform's gamepad button id (shared input.go maps the
+// digital virtual controls onto these constants). Same numbering as SDL's
+// GameController buttons, which is how pollGamepads stores them.
+type GamepadButton int8
+
+const (
+	GamepadButtonA GamepadButton = iota
+	GamepadButtonB
+	GamepadButtonX
+	GamepadButtonY
+	GamepadButtonBack
+	GamepadButtonGuide
+	GamepadButtonStart
+	GamepadButtonLeftStick
+	GamepadButtonRightStick
+	GamepadButtonLeftShoulder
+	GamepadButtonRightShoulder
+	GamepadButtonDPadUp
+	GamepadButtonDPadDown
+	GamepadButtonDPadLeft
+	GamepadButtonDPadRight
+)
 
 // ControllerState mirrors the SDL backend's shape - shared code
-// (input.go LocalAnalogInput) reaches into these fields directly.
+// (input.go gamepadControlLevel) reaches into these fields directly.
 type ControllerState struct {
 	Axes      [6]int8
-	Buttons   map[int]byte
+	Buttons   map[GamepadButton]byte
 	HasRumble bool
 }
 
-// Browser-side metadata per pad slot (not visible to shared code).
-type jsPadMeta struct {
-	name     string
-	standard bool
-	axisRest []float32
-	rumble   js.Value
-	logged   bool
+// Browser-side state of a pad slot (not visible to shared code).
+type jsPad struct {
+	slot   padSlot // Gamepad.index and id; index -1 = free
+	ident  padIdentity
+	guid   string
+	layout padLayout
 }
 
 type Input struct {
 	controllerstate [MaxPlayerNo]*ControllerState
-	meta            [MaxPlayerNo]jsPadMeta
+	pads            [MaxPlayerNo]jsPad
 }
-
-// Identity order: our buttons are already stored in SDL GameController
-// numbering (0..14). Shared code iterates this to map button ids.
-var buttonOrder []int
 
 var input Input
 
@@ -242,18 +239,6 @@ func initLUTs() {
 		keyKP_EQUALS: "KP_EQUALS", keyMENU: "MENU",
 		keyLCTRL: "LCTRL", keyLSHIFT: "LSHIFT", keyLALT: "LALT", keyLGUI: "LGUI",
 		keyRCTRL: "RCTRL", keyRSHIFT: "RSHIFT", keyRALT: "RALT", keyRGUI: "RGUI",
-	}
-
-	// Same numbering scheme as input_sdl.go: 0-14 buttons in SDL order,
-	// 15-24 synthetic axis tokens, 25 = disabled.
-	ButtonToStringLUT = map[int]string{
-		0: "A", 1: "B", 2: "X", 3: "Y", 4: "BACK", 5: "HOME", 6: "START",
-		7: "LS", 8: "RS", 9: "LB", 10: "RB",
-		11: "DP_U", 12: "DP_D", 13: "DP_L", 14: "DP_R",
-		15: "LS_Y-", 16: "LS_X-", 17: "LS_X+", 18: "LS_Y+",
-		19: "LT", 20: "RT",
-		21: "RS_Y-", 22: "RS_X-", 23: "RS_X+", 24: "RS_Y+",
-		25: "Not used",
 	}
 
 	// KeyboardEvent.code -> Key
@@ -299,20 +284,15 @@ func initLUTs() {
 	}
 
 	StringToKeyLUT = make(map[string]Key)
-	StringToButtonLUT = make(map[string]int)
 	for k, v := range KeyToStringLUT {
 		StringToKeyLUT[v] = k
 	}
-	for k, v := range ButtonToStringLUT {
-		StringToButtonLUT[v] = k
-	}
-
-	buttonOrder = make([]int, 15)
-	for i := range buttonOrder {
-		buttonOrder[i] = i
-	}
 
 	input = Input{}
+	for i := range input.pads {
+		input.pads[i].slot.index = -1
+		input.controllerstate[i] = &ControllerState{Buttons: make(map[GamepadButton]byte)}
+	}
 }
 
 func StringToKey(s string) Key {
@@ -364,251 +344,469 @@ func jsEventModifiers(ev js.Value) (mod ModifierKey) {
 	return
 }
 
-// pollGamepads snapshots navigator.getGamepads() once per frame (called by
-// the system backend). Standard-mapping pads are translated to the SDL
-// GameController layout; others pass through raw with axis rest-value
-// baselining so a resting hat/trigger never reads as held input.
-func pollGamepads() {
-	nav := js.Global().Get("navigator")
-	if nav.IsUndefined() || nav.Get("getGamepads").IsUndefined() {
-		return
+// Scratch reused by pollGamepads every frame.
+var (
+	padSnaps  []padSnapshot
+	padSlots  [MaxPlayerNo]padSlot
+	padDetach []int
+	padAttach [][2]int
+	padIgnore js.Func // catches vibrationActuator promises (a newer effect rejects the older one)
+)
+
+// A number from JavaScript, 0 when it is missing or not a number.
+func jsNumber(v js.Value) float64 {
+	if v.Type() != js.TypeNumber {
+		return 0
 	}
-	pads := nav.Call("getGamepads")
-	// Rank: standard-mapping pads, then unrecognized pads with axes,
-	// then button-only devices (USB mics etc.) last.
-	rank := func(p js.Value) int {
-		if p.Get("mapping").String() == "standard" {
+	return v.Float()
+}
+
+// Copies one Gamepad out of JavaScript. Only buttons 6 and 7 (the triggers)
+// need their analog value.
+func readPadSnapshot(p js.Value, snap *padSnapshot) {
+	snap.index = int(jsNumber(p.Get("index")))
+	snap.id = p.Get("id").String()
+	snap.mapping = p.Get("mapping").String()
+	c := p.Get("connected")
+	snap.connected = c.IsUndefined() || c.Truthy()
+	snap.buttons, snap.axes = snap.buttons[:0], snap.axes[:0]
+	if btns := p.Get("buttons"); btns.Truthy() {
+		for i, n := 0, btns.Length(); i < n && i < len(standardPadButtons); i++ {
+			b := btns.Index(i)
+			pb := padButton{pressed: b.Truthy() && b.Get("pressed").Truthy()}
+			if (i == 6 || i == 7) && b.Truthy() {
+				pb.value = jsNumber(b.Get("value"))
+			}
+			snap.buttons = append(snap.buttons, pb)
+		}
+	}
+	if axes := p.Get("axes"); axes.Truthy() {
+		for i, n := 0, axes.Length(); i < n; i++ {
+			snap.axes = append(snap.axes, jsNumber(axes.Index(i)))
+		}
+	}
+}
+
+// The live Gamepad object at a Gamepad.index, or undefined.
+func livePad(index int) js.Value {
+	nav := js.Global().Get("navigator")
+	if !nav.Truthy() || nav.Get("getGamepads").Type() != js.TypeFunction {
+		return js.Undefined()
+	}
+	list := nav.Call("getGamepads")
+	if !list.Truthy() {
+		return js.Undefined()
+	}
+	for i, n := 0, list.Length(); i < n; i++ {
+		if p := list.Index(i); p.Truthy() && int(jsNumber(p.Get("index"))) == index {
+			return p
+		}
+	}
+	return js.Undefined()
+}
+
+// nextPadSnap grows padSnaps by one reused entry.
+func nextPadSnap() *padSnapshot {
+	if len(padSnaps) < cap(padSnaps) {
+		padSnaps = padSnaps[:len(padSnaps)+1]
+	} else {
+		padSnaps = append(padSnaps, padSnapshot{})
+	}
+	return &padSnaps[len(padSnaps)-1]
+}
+
+// padPackJS copies every pad's numbers into one Float64Array (the same reads
+// as readPadSnapshot), so the engine takes them with a single copy. Walking
+// the Gamepad objects from Go handed it a new JS reference for every object
+// and string it touched (about 23 a frame per pad); each one is a finalizer
+// the next garbage collection runs, and they made each collection's freeze
+// longer. Strings (id, mapping) go as numbers into a table; the engine reads a
+// string once, the first time it sees its number.
+// Layout: [count, then per pad: index, connected, id#, mapping#, nbuttons,
+// (pressed, value) per button, naxes, axes...]. pack() returns the bytes used,
+// or -1 when the page has no getGamepads.
+const padPackJS = `const st = { strs: [], keys: new Map() };
+const f64 = new Float64Array(2048);
+st.u8 = new Uint8Array(f64.buffer);
+const num = (v) => typeof v === 'number' ? v : 0;
+const sid = (v) => {
+  const s = typeof v === 'string' ? v : (v === undefined ? '<undefined>' : v === null ? '<null>' : '<' + typeof v + '>');
+  let k = st.keys.get(s);
+  if (k === undefined) { k = st.strs.length; st.strs.push(s); st.keys.set(s, k); }
+  return k;
+};
+st.str = (k) => st.strs[k];
+st.pack = () => {
+  const nav = globalThis.navigator;
+  if (!nav || typeof nav.getGamepads !== 'function') return -1;
+  const list = nav.getGamepads();
+  let o = 1, n = 0;
+  if (list) {
+    for (let i = 0; i < list.length; i++) {
+      const p = list[i];
+      if (!p) continue;
+      const b = p.buttons ? p.buttons : [], a = p.axes ? p.axes : [];
+      const nb = Math.min(b.length, BTN), na = Math.min(a.length, 64);
+      if (o + 6 + 2 * nb + na > f64.length) break;
+      f64[o++] = num(p.index);
+      f64[o++] = (p.connected === undefined || p.connected) ? 1 : 0;
+      f64[o++] = sid(p.id);
+      f64[o++] = sid(p.mapping);
+      f64[o++] = nb;
+      for (let j = 0; j < nb; j++) {
+        const x = b[j];
+        f64[o++] = x && x.pressed ? 1 : 0;
+        f64[o++] = x && (j === 6 || j === 7) ? num(x.value) : 0;
+      }
+      f64[o++] = na;
+      for (let j = 0; j < na; j++) f64[o++] = num(a[j]);
+      n++;
+    }
+  }
+  f64[0] = n;
+  return o * 8;
+};
+return st;`
+
+var padPack struct {
+	tried bool
+	st    js.Value // the packer's state: pack(), str(k), u8; undefined when it could not start
+	u8    js.Value // st.u8, the bytes pack() writes
+	raw   []byte
+	strs  map[int]string
+}
+
+// readPadSnapsPacked fills padSnaps through padPackJS. ok false: the packer
+// could not start (a page that forbids new Function); use readPadSnapshot.
+func readPadSnapsPacked() (ok, apiMissing bool) {
+	if !padPack.tried {
+		padPack.tried = true
+		padPack.st = js.Undefined()
+		jsTry(func() {
+			padPack.st = js.Global().Get("Function").New("BTN", padPackJS).Invoke(len(standardPadButtons))
+		})
+		if padPack.st.Truthy() {
+			padPack.u8 = padPack.st.Get("u8")
+		}
+		padPack.raw = make([]byte, 2048*8)
+		padPack.strs = map[int]string{}
+	}
+	if !padPack.st.Truthy() {
+		return false, false
+	}
+	n := padPack.st.Call("pack").Int()
+	if n < 0 {
+		return true, true
+	}
+	n = js.CopyBytesToGo(padPack.raw[:n], padPack.u8)
+	at := 0
+	next := func() float64 {
+		if at+8 > n {
 			return 0
 		}
-		if p.Get("axes").Length() > 0 {
-			return 1
-		}
-		return 2
+		v := math.Float64frombits(binary.LittleEndian.Uint64(padPack.raw[at:]))
+		at += 8
+		return v
 	}
-	toI8 := func(f float64) int8 {
-		if f > 1 {
-			f = 1
-		} else if f < -1 {
-			f = -1
+	str := func(k int) string {
+		s, found := padPack.strs[k]
+		if !found {
+			s = padPack.st.Call("str", k).String()
+			padPack.strs[k] = s
 		}
-		return int8(f * 127)
+		return s
 	}
-	slot := 0
-	for r := 0; r <= 2 && slot < len(input.controllerstate); r++ {
-		for i, n := 0, pads.Length(); i < n && slot < len(input.controllerstate); i++ {
-			p := pads.Index(i)
-			if !p.Truthy() || rank(p) != r {
-				continue
-			}
-			if input.controllerstate[slot] == nil {
-				input.controllerstate[slot] = &ControllerState{Buttons: make(map[int]byte)}
-			}
-			g := input.controllerstate[slot]
-			m := &input.meta[slot]
-			m.name = p.Get("id").String()
-			m.standard = p.Get("mapping").String() == "standard"
-			m.rumble = p.Get("vibrationActuator")
-			g.HasRumble = m.rumble.Truthy()
-			btns, axes := p.Get("buttons"), p.Get("axes")
-			nb, na := btns.Length(), axes.Length()
-			if !m.logged {
-				m.logged = true
-				js.Global().Get("console").Call("log",
-					"[gamepad]", slot, m.name, p.Get("mapping").String())
-			}
-			if m.standard {
-				for si, bi := range sdlOrderToBrowser {
-					g.Buttons[si] = 0
-					if bi < nb && btns.Index(bi).Get("pressed").Bool() {
-						g.Buttons[si] = 1
-					}
-				}
-				for a := 0; a < 4; a++ {
-					g.Axes[a] = 0
-					if a < na {
-						g.Axes[a] = toI8(axes.Index(a).Float())
-					}
-				}
-				// Triggers: standard buttons 6/7 -> SDL trigger axes 4/5
-				// (0..127, rest 0 - matching SDL GameController semantics).
-				for ti, bi := range [2]int{6, 7} {
-					g.Axes[4+ti] = 0
-					if bi < nb {
-						g.Axes[4+ti] = toI8(btns.Index(bi).Get("value").Float())
-					}
-				}
-			} else {
-				// Raw pass-through with rest baselining.
-				if len(m.axisRest) != na {
-					m.axisRest = make([]float32, na)
-					for a := 0; a < na; a++ {
-						m.axisRest[a] = float32(axes.Index(a).Float())
-					}
-				}
-				for a := 0; a < 6; a++ {
-					g.Axes[a] = 0
-				}
-				for a := 0; a < na && a < 6; a++ {
-					g.Axes[a] = toI8(axes.Index(a).Float() - float64(m.axisRest[a]))
-				}
-				for b := 0; b < 15; b++ {
-					g.Buttons[b] = 0
-					if b < nb && btns.Index(b).Get("pressed").Bool() {
-						g.Buttons[b] = 1
-					}
-				}
-			}
-			slot++
+	padSnaps = padSnaps[:0]
+	for count := int(next()); count > 0; count-- {
+		snap := nextPadSnap()
+		snap.index = int(next())
+		snap.connected = next() != 0
+		snap.id = str(int(next()))
+		snap.mapping = str(int(next()))
+		snap.buttons, snap.axes = snap.buttons[:0], snap.axes[:0]
+		for nb := int(next()); nb > 0; nb-- {
+			pressed := next() != 0
+			snap.buttons = append(snap.buttons, padButton{pressed: pressed, value: next()})
+		}
+		for na := int(next()); na > 0; na-- {
+			snap.axes = append(snap.axes, next())
 		}
 	}
-	for ; slot < len(input.controllerstate); slot++ {
-		if input.controllerstate[slot] != nil {
-			input.controllerstate[slot] = nil
-			input.meta[slot] = jsPadMeta{}
+	return true, false
+}
+
+// pollGamepads snapshots navigator.getGamepads() once per frame (called by the
+// system backend's pollEvents, before sys.pollDevices). Pads that went away
+// are detached and new ones attached, as SDL's JOYDEVICEREMOVED/ADDED events
+// do on desktop; then every attached slot reads its pad.
+func pollGamepads() {
+	if ok, apiMissing := readPadSnapsPacked(); apiMissing {
+		return
+	} else if !ok {
+		nav := js.Global().Get("navigator")
+		if !nav.Truthy() || nav.Get("getGamepads").Type() != js.TypeFunction {
+			return
+		}
+		list := nav.Call("getGamepads")
+		padSnaps = padSnaps[:0]
+		if list.Truthy() {
+			for i, n := 0, list.Length(); i < n; i++ {
+				p := list.Index(i)
+				if !p.Truthy() {
+					continue
+				}
+				readPadSnapshot(p, nextPadSnap())
+			}
 		}
 	}
+	for s := range input.pads {
+		padSlots[s] = input.pads[s].slot
+	}
+	padDetach, padAttach = padPlan(padSlots[:], padSnaps, padDetach, padAttach)
+	for _, s := range padDetach {
+		input.detachPad(s)
+	}
+	for _, a := range padAttach {
+		input.attachPad(a[0], &padSnaps[a[1]])
+	}
+	for s := range input.pads {
+		pad := &input.pads[s]
+		if pad.slot.index < 0 {
+			continue
+		}
+		for i := range padSnaps {
+			if padSnaps[i].index == pad.slot.index {
+				pad.layout.read(&padSnaps[i], input.controllerstate[s])
+				break
+			}
+		}
+	}
+}
+
+// Zeroes a slot's state; the Buttons map stays allocated, as on desktop.
+func (input *Input) resetPadState(slot int) {
+	st := input.controllerstate[slot]
+	st.Axes = [6]int8{}
+	for k := range st.Buttons {
+		delete(st.Buttons, k)
+	}
+	st.HasRumble = false
+}
+
+func (input *Input) attachPad(slot int, snap *padSnapshot) {
+	pad := &input.pads[slot]
+	pad.slot = padSlot{index: snap.index, id: snap.id}
+	pad.ident = parsePadID(snap.id)
+	pad.guid = padGUID(pad.ident)
+	pad.layout.capture(snap.axes)
+	input.resetPadState(slot)
+	if live := livePad(snap.index); live.Truthy() {
+		act := live.Get("vibrationActuator")
+		input.controllerstate[slot].HasRumble = act.Truthy() && act.Get("playEffect").Type() == js.TypeFunction
+	}
+	// One line per pad: the fastest way to see what the browser reports.
+	js.Global().Get("console").Call("log", fmt.Sprintf("[gamepad %d] id=%q mapping=%q buttons=%d axes=%d index=%d guid=%s rumble=%t",
+		slot, snap.id, snap.mapping, len(snap.buttons), len(snap.axes), snap.index, pad.guid, input.controllerstate[slot].HasRumble))
+	sys.attachGamepad(slot)
+}
+
+func (input *Input) detachPad(slot int) {
+	sys.detachGamepad(slot)
+	pad := &input.pads[slot]
+	js.Global().Get("console").Call("log", fmt.Sprintf("[gamepad %d] disconnected id=%q index=%d", slot, pad.slot.id, pad.slot.index))
+	pad.slot = padSlot{index: -1}
+	pad.ident, pad.guid = padIdentity{}, ""
+	input.resetPadState(slot)
 }
 
 func (input *Input) UpdateGamepadMappings(path string) {
 	// SDL controller mapping databases don't apply to the browser API.
 }
 
-func (input *Input) GetMaxJoystickCount() int {
-	return len(input.controllerstate)
-}
-
 func (input *Input) IsJoystickPresent(joy int) bool {
-	return joy >= 0 && joy < len(input.controllerstate) && input.controllerstate[joy] != nil
+	return joy >= 0 && joy < len(input.pads) && input.pads[joy].slot.index >= 0
 }
 
+// The pad's name without the browser's decorations (vendor and product
+// numbers, "STANDARD GAMEPAD").
 func (input *Input) GetJoystickName(joy int) string {
 	if !input.IsJoystickPresent(joy) {
 		return ""
 	}
-	return input.meta[joy].name
+	return input.pads[joy].ident.name
 }
 
-func (input *Input) GetJoystickAxes(joy int) [6]float32 {
+// joystick is the pad in a slot, or nil. input_sdl.go returns the SDL
+// joystick; system.go's attachGamepad reads its name, serial and path for the
+// controller identity log.
+func (input *Input) joystick(joy int) *webJoystick {
 	if !input.IsJoystickPresent(joy) {
-		return [6]float32{}
+		return nil
 	}
-	return NormalizeAxes(&input.controllerstate[joy].Axes)
+	return &webJoystick{input: input, joy: joy}
 }
 
-func (input *Input) GetJoystickButtons(joy int) []byte {
-	if !input.IsJoystickPresent(joy) {
-		return []byte{}
-	}
-	buttons := make([]byte, len(buttonOrder))
-	for i, button := range buttonOrder {
-		buttons[i] = input.controllerstate[joy].Buttons[button]
-	}
-	return buttons
+// webJoystick is the browser's stand-in for an SDL joystick: browsers expose
+// no serial number and no device path.
+type webJoystick struct {
+	input *Input
+	joy   int
 }
 
-func (input *Input) GetJoystickPath(joy int) string {
-	return input.GetJoystickName(joy)
-}
+func (j *webJoystick) Name() string   { return j.input.GetJoystickName(j.joy) }
+func (j *webJoystick) Serial() string { return "" }
+func (j *webJoystick) Path() string   { return "" }
 
+// IsRawJoystick is true on desktop for a pad SDL's controller database does
+// not know. In the browser every pad is read through the Gamepad API's
+// standard layout or through the fork's own layout for non-standard pads
+// (gamepad_js.go), so no pad is raw and Controller Mapping capture reads the
+// standard control names.
+func (input *Input) IsRawJoystick(joy int) bool { return false }
+
+// rawControlLevel and rawHeld read a raw joystick on desktop. No pad is raw
+// in the browser.
+func rawControlLevel(joy int, token string) int32 { return 0 }
+func rawHeld(joy int) string                     { return "" }
+
+// The desktop's starting mapping for a raw joystick. Never used in the
+// browser (no pad is raw); a recognized pad maps every control to itself.
+var defaultRawControllerMapping = identityControllerMapping()
+
+// An SDL-shaped GUID built from Gamepad.id (padGUID).
 func (input *Input) GetJoystickGUID(joy int) string {
-	return input.GetJoystickName(joy)
+	if !input.IsJoystickPresent(joy) {
+		return ""
+	}
+	return input.pads[joy].guid
 }
 
-func (input *Input) RumbleController(joy int, lo, hi uint16, ticks uint32) {
-	if !input.IsJoystickPresent(joy) || joy >= len(sys.joystickConfig) {
-		return
+// GetJoystickBackend names the input API behind a pad (upstream's controller
+// identity log).
+func (input *Input) GetJoystickBackend(joy int) string {
+	if !input.IsJoystickPresent(joy) {
+		return ""
 	}
-	if !sys.joystickConfig[joy].rumbleOn {
-		return
-	}
-	act := input.meta[joy].rumble
-	if !act.Truthy() || act.Get("playEffect").IsUndefined() {
-		return
-	}
-	gls := sys.gameLogicSpeed()
-	if gls <= 0 || sys.turbo <= 0 {
-		return
-	}
-	durationMs := float64(ticks) * (1.0 / float64(gls) * float64(sys.turbo) * 1000.0)
-	opts := js.Global().Get("Object").New()
-	if ticks > 0 {
-		opts.Set("duration", durationMs)
-		opts.Set("strongMagnitude", float64(lo)/65535)
-		opts.Set("weakMagnitude", float64(hi)/65535)
-	} else {
-		opts.Set("duration", 0)
-		opts.Set("strongMagnitude", 0)
-		opts.Set("weakMagnitude", 0)
-	}
-	act.Call("playEffect", "dual-rumble", opts)
+	return "browser"
 }
 
-func CheckAxisForDpad(axes *[6]float32, base int) string {
-	var s string = ""
-	if (*axes)[0] > sys.cfg.Input.ControllerStickSensitivity {
-		s = ButtonToStringLUT[2+base]
-	} else if -(*axes)[0] > sys.cfg.Input.ControllerStickSensitivity {
-		s = ButtonToStringLUT[1+base]
-	}
-	if (*axes)[1] > sys.cfg.Input.ControllerStickSensitivity {
-		s = ButtonToStringLUT[3+base]
-	} else if -(*axes)[1] > sys.cfg.Input.ControllerStickSensitivity {
-		s = ButtonToStringLUT[base]
-	}
-	if (*axes)[2] > sys.cfg.Input.ControllerStickSensitivity {
-		s = ButtonToStringLUT[8+base]
-	} else if -(*axes)[2] > sys.cfg.Input.ControllerStickSensitivity {
-		s = ButtonToStringLUT[7+base]
-	}
-	if (*axes)[3] > sys.cfg.Input.ControllerStickSensitivity {
-		s = ButtonToStringLUT[9+base]
-	} else if -(*axes)[3] > sys.cfg.Input.ControllerStickSensitivity {
-		s = ButtonToStringLUT[6+base]
-	}
-	return s
+// GetJoystickKey tells identical pads apart on desktop (GUID plus hashes of
+// the serial and the location). Browsers give neither, so it is the GUID;
+// system.go's attachGamepad numbers a second identical pad (_n2), as upstream
+// does for pads without a serial or a path.
+func (input *Input) GetJoystickKey(joy int) string {
+	return strings.ToLower(input.GetJoystickGUID(joy))
 }
 
-func CheckAxisForTrigger(axes *[6]float32) string {
-	var s string = ""
-	for _, i := range [2]int{4, 5} {
-		if (*axes)[i] > 0 {
-			s = ButtonToStringLUT[15+i]
-			break
+// Whether the pad in this slot can rumble (vibrationActuator).
+func (input *Input) HasRumble(joy int) bool {
+	return input.IsJoystickPresent(joy) && input.controllerstate[joy] != nil && input.controllerstate[joy].HasRumble
+}
+
+// GlyphPack picks the controller artwork for hints, in upstream's order: the
+// pack chosen for this device, the keyboard, then the motif's GUID and name
+// tables, then the vendor/product/name table (padGlyphPack) in place of SDL's
+// controller type.
+func (input *Input) GlyphPack(device *InputDevice, glyphs *ControllerGlyphsProperties) string {
+	if device == nil {
+		return "generic"
+	}
+	if chosen := sys.cfg.controllerGlyphs(device); chosen != "" {
+		if set := glyphs.Controller[chosen]; set != nil && strings.EqualFold(set.Type, glyphDeviceType(device)) {
+			return chosen
 		}
 	}
-	return s
-}
-
-// getJoystickKey returns the first active button/axis token and joystick
-// index (options-menu binding scanner).
-func getJoystickKey(controllerIdx int) (string, int) {
-	var s string
-	min, max := 0, input.GetMaxJoystickCount()
-	if controllerIdx >= 0 && controllerIdx < max {
-		min, max = controllerIdx, controllerIdx+1
+	if device.Joy < 0 {
+		return "keyboard"
 	}
-	for joy := min; joy < max; joy++ {
-		if !input.IsJoystickPresent(joy) {
+	if !input.IsJoystickPresent(device.Joy) {
+		return "generic"
+	}
+	if controller := glyphs.GUID[strings.ToLower(device.GUID)]; controller != "" {
+		return strings.ToLower(controller)
+	}
+	// Longest matching name wins; equal lengths are decided alphabetically.
+	name := strings.ToLower(input.GetJoystickName(device.Joy))
+	match, controller := "", ""
+	for pattern, candidate := range glyphs.Name {
+		if pattern == "" || !strings.Contains(name, strings.ToLower(pattern)) {
 			continue
 		}
-		axes := input.GetJoystickAxes(joy)
-		btns := input.GetJoystickButtons(joy)
-		s = CheckAxisForDpad(&axes, len(btns))
-		if s != "" {
-			return s, joy
-		}
-		s = CheckAxisForTrigger(&axes)
-		if s != "" {
-			return s, joy
-		}
-		for i := range btns {
-			if btns[i] > 0 {
-				s = ButtonToStringLUT[i]
-			}
-		}
-		if s != "" && strings.ToLower(s) != "not used" {
-			return s, joy
+		if len(pattern) > len(match) || (len(pattern) == len(match) && pattern < match) {
+			match, controller = pattern, candidate
 		}
 	}
-	return "", -1
+	if controller != "" {
+		return strings.ToLower(controller)
+	}
+	if pack := padGlyphPack(input.pads[device.Joy].ident); pack != "" {
+		return pack
+	}
+	return "generic"
+}
+
+// GlyphSwapNintendo reports whether Nintendo pads report button positions
+// instead of their printed labels (SDL's USE_BUTTON_LABELS=0 on desktop). The
+// W3C standard mapping is positional (button 0 is the bottom face button,
+// labeled B on a Nintendo pad), so the browser always swaps.
+func (input *Input) GlyphSwapNintendo() bool { return true }
+
+// RumbleController rumbles every pad of a participant (upstream's routing:
+// nothing in replays, only the local participant in netplay).
+func (input *Input) RumbleController(participant int, lo, hi uint16, ticks uint32) {
+	if sys.replayFile != nil {
+		return
+	}
+	nc := sys.netConnection
+	if sys.rollback.session != nil {
+		nc = sys.rollback.netConnection
+	}
+	if nc != nil {
+		if participant != nc.locIn {
+			return
+		}
+		participant = 0
+	}
+	for _, id := range sys.inputs.participantDevices(participant) {
+		if device := sys.inputs.device(id); device != nil && device.Connected && device.Joy >= 0 && sys.cfg.rumbleEnabled(device) {
+			input.rumbleJoystick(device.Joy, lo, hi, ticks)
+		}
+	}
+}
+
+// Plays SDL's Rumble(lo, hi, ms) on the pad's vibrationActuator ("dual-rumble";
+// Firefox has none). ticks == 0 stops it.
+func (input *Input) rumbleJoystick(joy int, lo, hi uint16, ticks uint32) {
+	if !input.HasRumble(joy) {
+		return
+	}
+	durationMs, strong, weak, stop, ok := padRumbleEffect(lo, hi, ticks, sys.gameLogicSpeed(), sys.turbo)
+	if !ok {
+		return
+	}
+	live := livePad(input.pads[joy].slot.index)
+	if !live.Truthy() {
+		return
+	}
+	act := live.Get("vibrationActuator")
+	if !act.Truthy() || act.Get("playEffect").Type() != js.TypeFunction {
+		return
+	}
+	if padIgnore.IsUndefined() {
+		padIgnore = js.FuncOf(func(js.Value, []js.Value) any { return nil })
+	}
+	var promise js.Value
+	if stop && act.Get("reset").Type() == js.TypeFunction {
+		promise = act.Call("reset")
+	} else {
+		opts := js.Global().Get("Object").New()
+		opts.Set("startDelay", 0)
+		opts.Set("duration", durationMs)
+		opts.Set("strongMagnitude", Clamp(strong, 0, 1))
+		opts.Set("weakMagnitude", Clamp(weak, 0, 1))
+		promise = act.Call("playEffect", "dual-rumble", opts)
+	}
+	if promise.Truthy() && promise.Get("catch").Type() == js.TypeFunction {
+		promise.Call("catch", padIgnore)
+	}
 }

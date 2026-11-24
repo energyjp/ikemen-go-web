@@ -1,4 +1,4 @@
-//go:build !raw && !android && !js
+//go:build !raw && !android && !ios && !js
 
 package main
 
@@ -23,6 +23,11 @@ func ShowInfoDialog(message, title string) {
 
 func ShowErrorDialog(message string) {
 	dialog.Message(message).Title("I.K.E.M.E.N Error").Error()
+}
+
+// Returns true if the user chose to retry
+func ShowRetryDialog(message string) bool {
+	return dialog.Message("%s", message).Title("I.K.E.M.E.N RetryLoadOnError").YesNo()
 }
 
 // TTF font loading
@@ -84,5 +89,7 @@ func Logcat(s string) {
 
 // platformIdleGC and platformLoadGC are wasm affordances (see platform_js.go);
 // parallel desktop GC doesn't hitch the game thread.
-func platformIdleGC() {}
-func platformLoadGC() {}
+func platformIdleGC()    {}
+func platformLoadGC()    {}
+func platformRoundGC()   {}
+func platformPendingGC() {}

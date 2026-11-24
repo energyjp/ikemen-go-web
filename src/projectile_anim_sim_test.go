@@ -50,13 +50,17 @@ import (
 type projAnimTex struct{}
 
 func (*projAnimTex) SetData(data []byte)                                         {}
-func (*projAnimTex) SetSubData(data []byte, x, y, width, height, stride int32)   {}
+func (*projAnimTex) SetSubData(data []byte)                                      {}
+func (*projAnimTex) SetSubData2(data []byte, x, y, width, height, stride int32)  {}
 func (*projAnimTex) SetDataG(data []byte, mag, min, ws, wt TextureSamplingParam) {}
 func (*projAnimTex) SetPixelData(data []float32)                                 {}
 func (*projAnimTex) IsValid() bool                                               { return true }
 func (*projAnimTex) GetWidth() int32                                             { return 4 }
 func (*projAnimTex) GetHeight() int32                                            { return 4 }
+func (*projAnimTex) GetUV() [4]float32                                           { return [4]float32{0, 0, 1, 1} }
 func (*projAnimTex) CopyData(src *Texture)                                       {}
+func (*projAnimTex) MarkNonSwappable()                                           {}
+func (*projAnimTex) GetFilter() bool                                             { return false }
 
 // Action 100 is the projectile under test: 5 elements with different times
 // (3, 2, 4, 1, 2), a loop start at element 2, and a different Clsn1 and Clsn2
@@ -179,23 +183,26 @@ func withProjAnimWorld(t *testing.T, f func(r *projAnimRun)) {
 		sys.chars[i], sys.projs[i], sys.explods[i], sys.chartexts[i] = nil, nil, nil, nil
 	}
 
-	sff := newSff()
+	sff := newSff(SffTypeChar)
 	for _, gn := range [][2]uint16{{10, 0}, {10, 1}, {10, 2}, {10, 3}, {10, 4},
 		{11, 0}, {11, 1}, {11, 2}, {20, 0}, {20, 1}, {21, 0}, {21, 1}, {21, 2}} {
 		sff.sprites[gn] = &Sprite{Group: gn[0], Number: gn[1], Size: [2]uint16{4, 4},
 			Tex: &projAnimTex{}, palidx: -1}
 	}
-	lines := strings.Split(projAnimAir, "\n")
 	for pn := 0; pn < 2; pn++ {
-		i := 0
 		sys.cgi[pn] = CharGlobalInfo{}
 		sys.cgi[pn].sff = sff
 		sys.cgi[pn].palettedata = newPaldata()
-		sys.cgi[pn].animTable = ReadAnimationTable("projectile_anim_sim_test.air", sff, &sff.palList, lines, &i, false)
+		sys.cgi[pn].localcoord = [2]int32{320, 240}
+		sys.cgi[pn].animTable = ReadAnimationTable("projectile_anim_sim_test.air", sff, &sff.palList, projAnimAir, false)
 		c := &Char{}
 		c.playerNo, c.id, c.teamside = pn, int32(pn+1), pn
-		c.localscl, c.localcoord, c.facing = 1, 320, 1
-		c.clsnBaseScale, c.clsnScale = [2]float32{1, 1}, [2]float32{1, 1}
+		// baselocalscl: develop draws projectiles at the owner's base scale.
+		c.localscl, c.baselocalscl, c.facing = 1, 1, 1
+		// Clsn scale 1. Upstream 4313d916 takes it from the animation owner's
+		// size.xscale/yscale and animlocalscl (clsnBaseScale/clsnScale are gone).
+		c.animPN, c.animlocalscl = pn, 1
+		c.size.xscale, c.size.yscale = 1, 1
 		c.palfx = newPalFX()
 		c.minus = 3 // all tasks finished: getClsn() uses curFrame
 		sys.chars[pn] = []*Char{c}
@@ -349,7 +356,7 @@ func (r *projAnimRun) readCollision() []string {
 			} else {
 				s += " c1[]"
 			}
-			s += fmt.Sprintf(" hit=%v", target.projClsnCheckSingle(p, 2, 1))
+			s += fmt.Sprintf(" hit=%v", target.projClsnCheckSingle(p, 2, 1, false))
 			out = append(out, s)
 		}
 	}

@@ -39,6 +39,15 @@ func ShowErrorDialog(message string) {
 	alert.Invoke("I.K.E.M.E.N Error\n\n" + message)
 }
 
+// ShowRetryDialog (Debug.RetryLoadOnError) never offers a retry in the
+// browser: the player cannot edit the page's virtual filesystem, and a
+// blocking confirm() would stall the single wasm thread. Log the message and
+// let the load fail as it did before the option existed.
+func ShowRetryDialog(message string) bool {
+	fmt.Println("RetryLoadOnError (not offered in the browser): " + message)
+	return false
+}
+
 // TTF font loading for the browser build.
 //
 // Fonts are read from the wasm virtual filesystem only (there is no system

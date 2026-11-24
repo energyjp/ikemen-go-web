@@ -1,7 +1,9 @@
 # Ikemen GO — WebAssembly / browser fork
 
 This is a fork of [Ikemen GO](https://github.com/ikemen-engine/Ikemen-GO) that
-runs in a web browser. It is based on Ikemen GO v1.0.0. The engine compiles to
+runs in a web browser. It follows Ikemen GO's development line after v1.0.0,
+with upstream's modern-input branch (the new input system, still a
+pre-release) merged in for Mugen Studio 2.5. The engine compiles to
 WebAssembly and renders through WebGL 2; no plugins, no server-side game logic.
 Upstream's own `README.md` still describes the engine itself — this file covers
 only what the fork adds.
@@ -20,7 +22,7 @@ bash tools/build-engine.sh
 That runs
 
 ```sh
-GOEXPERIMENT=arenas GOOS=js GOARCH=wasm CGO_ENABLED=0 \
+GOOS=js GOARCH=wasm CGO_ENABLED=0 \
   go build -trimpath -buildvcs=false -o bin/ikemen-v2.wasm ./src
 ```
 

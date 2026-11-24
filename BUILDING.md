@@ -5,25 +5,53 @@ All three must be available as development packages via **pkg-config** (`libav*`
 `build/build.sh` **auto-detects your OS** and, by default, **auto-builds a decoder-only libvpx and minimal FFmpeg**
 (same config as CI). You don't need system FFmpeg dev packages unless you prefer them.
 
+## Go version requirement
+
+Ikemen GO requires **Go 1.27 or newer** (`go.mod` declares `go 1.27.0`; CI builds with 1.27.x).
+
+> **Distro Go packages are usually too old.** Ubuntu 24.04's `golang-go` is 1.22
+> and Debian 12's is 1.19. Install an official toolchain from
+> <https://go.dev/dl/> (or a channel that tracks upstream, e.g. `snap install go
+> --classic`) rather than `apt install golang-go`.
+
+## What the builds require at runtime
+
+See [README.md](./README.md#system-requirements) for the user-facing table.
+
+- **Windows 10 / macOS 13** are Go 1.27's own minimums. `releases.yml` pins the
+  macOS deployment target to 13.0 so it does not follow the runner's SDK.
+- **Linux glibc 2.35** comes from `libavutil` (`hypot@GLIBC_2.35`).
+  `build/glibc_compat.h` remaps glibc 2.38's `__isoc23_*` and `fmod` aliases, and
+  release builds set `BUILD_SDL2=yes` so SDL2 is not taken from the runner
+  (Ubuntu's needs 2.38). The workflow prints the measured floor of every shipped
+  ELF; check the build log rather than assuming.
+
+Local builds use system SDL2 (`BUILD_SDL2` defaults to `no`), so they match your
+distro. The floors above apply to the published archives.
+
 ---
 
-## Windows (MSYS2 / MINGW64)
+## Windows (MSYS2 / UCRT64)
 
 ### Dependencies
-Install MSYS2 from https://www.msys2.org and open **MSYS2 MINGW64**, then:
+Install MSYS2 from https://www.msys2.org and open **MSYS2 UCRT64**, then:
 ```bash
 pacman -Syu --noconfirm
 pacman -S --noconfirm \
-  git make diffutils mingw-w64-x86_64-pkg-config \
-  mingw-w64-x86_64-go mingw-w64-x86_64-toolchain \
-  mingw-w64-x86_64-nasm mingw-w64-x86_64-yasm \
-  mingw-w64-x86_64-tools-git mingw-w64-x86_64-libxmp \
-  mingw-w64-x86_64-SDL2
+  git make diffutils mingw-w64-ucrt-x86_64-pkg-config \
+  mingw-w64-ucrt-x86_64-go mingw-w64-ucrt-x86_64-toolchain \
+  mingw-w64-ucrt-x86_64-nasm \
+  mingw-w64-ucrt-x86_64-tools mingw-w64-ucrt-x86_64-libxmp \
+  mingw-w64-ucrt-x86_64-SDL2
 ```
 
-> On MSYS2 we auto-fix "trimmed" Go by setting `GOROOT=/mingw64/lib/go` if needed.
+> On MSYS2 we auto-fix "trimmed" Go by setting `GOROOT=/ucrt64/lib/go` if needed.
 
-### Build 64-bit (Ikemen_GO.exe)
+> **Coming from MINGW64?** MSYS2 deprecated it and is removing its packages.
+> Install the packages above and build from the UCRT64 shell. `build.sh` rebuilds
+> its cached libs on the first run.
+
+### Build (Ikemen_GO.exe)
 
 ```bash
 git clone https://github.com/ikemen-engine/Ikemen-GO.git
@@ -34,31 +62,20 @@ cd Ikemen-GO
 make Ikemen_GO.exe
 ```
 
-### Build 32-bit (Ikemen_GO_x86.exe)
-
-> Requires 32-bit MinGW cross tools in addition to the above:
-> `pacman -S --noconfirm mingw-w64-i686-toolchain mingw-w64-i686-pkg-config mingw-w64-i686-nasm mingw-w64-i686-yasm mingw-w64-i686-libxmp mingw-w64-i686-SDL2`
-
-```bash
-# build.sh
-./build/build.sh Win32
-# or make
-make Ikemen_GO_x86.exe
-```
+32-bit Windows is not supported.
 
 ### Run (Windows)
 
 ```bash
-./Ikemen_GO.exe          # 64-bit
-./Ikemen_GO_x86.exe      # 32-bit
+./Ikemen_GO.exe
 ```
 
 ### Use system FFmpeg instead (optional)
 
-Install `mingw-w64-x86_64-ffmpeg` (and/or i686 variant for 32-bit), then:
+Install `mingw-w64-ucrt-x86_64-ffmpeg`, then:
 
 ```bash
-BUILD_FFMPEG=no ./build/build.sh Win64   # or Win32
+BUILD_FFMPEG=no ./build/build.sh Win64
 ```
 
 ---
@@ -67,9 +84,12 @@ BUILD_FFMPEG=no ./build/build.sh Win64   # or Win32
 
 ### Dependencies (Debian/Ubuntu)
 
+Install Go 1.27+ from <https://go.dev/dl/> (see "Go version requirement" above),
+then the C toolchain and libraries:
+
 ```bash
 sudo apt update && sudo apt install -y \
-  golang-go git pkg-config make nasm yasm build-essential \
+  git pkg-config make nasm yasm build-essential \
   libxmp-dev libsdl2-dev
 ```
 
@@ -231,6 +251,43 @@ If you need changes in that wrapper, fork it and point the build to your fork vi
 
 ---
 
+## iOS / iPadOS (IPA, macOS only)
+
+This builds the engine **and** produces an unsigned **IPA** from the
+[ikemen-ios](https://github.com/Jesuszilla/ikemen-ios) Xcode wrapper.
+
+### Requirements
+
+* macOS with Xcode 26 or newer
+* Go 1.27+ and Homebrew: `brew install pkg-config git nasm`
+
+All other dependencies (FFmpeg, libxmp, SDL2, MoltenVK) are built or downloaded for the device automatically.
+
+### Build (from repo root)
+
+```bash
+./build/build.sh iOS
+# or
+make ios-ipa
+```
+
+### Outputs
+
+* `bin/ikemen-go.ipa` (unsigned IPA, see [Running](./README.md#running))
+* `bin/libikemen.a` and `bin/libikemen.h` (engine static library + header)
+* `build/ios-app/ikemen-ios` (cloned wrapper project, ready to open in Xcode)
+
+To run it straight from Xcode instead, open `build/ios-app/ikemen-ios/I.K.E.M.E.N-Go.xcodeproj`,
+choose your team under *Signing & Capabilities*, and press Run with your device connected.
+Simulator builds are not supported.
+
+### Customizing the iOS wrapper
+
+Same as Android: fork `ikemen-ios` and point the build to it with `IOS_APP_REPO` and
+`IOS_APP_REF`, or set `IOS_WRAPPER_DIR` to use an existing local checkout in place.
+
+---
+
 ## Assets required to run (desktop builds)
 
 Place these folders **next to the executable or app bundle**:
@@ -241,7 +298,7 @@ The release CI bundles these automatically.
 
 ## Notes & licensing
 
-* The minimal FFmpeg we build matches CI: shared libs only; `file` protocol; Matroska/WebM demuxers;
+* The minimal FFmpeg we build matches CI: shared libs (static on iOS, where apps cannot ship their own dylibs); `file` protocol; Matroska/WebM demuxers;
   libvpx VP8/VP9 decoders (including WebM alpha), Opus/Vorbis decoders, and parsers; no FFmpeg CLI tools.
 * FFmpeg is used under **LGPL v2.1**; releases attach the corresponding source snapshot.
 * libvpx is statically linked into FFmpeg and used under its BSD-style license.
@@ -253,7 +310,7 @@ The release CI bundles these automatically.
 
 * **Missing tools**: re-run the dependency commands for your OS/arch.
 * **FFmpeg link errors**: use the default `build.sh` (auto-builds FFmpeg), or install system FFmpeg dev packages and run with `BUILD_FFMPEG=no`.
-* **libxmp not found**: install libxmp-dev (Linux), libxmp (macOS/Homebrew), or the MSYS2 package mingw-w64-*-libxmp on Windows.
+* **libxmp not found**: install libxmp-dev (Linux), libxmp (macOS/Homebrew), or the MSYS2 package mingw-w64-ucrt-x86_64-libxmp on Windows.
 * **SDL2 not found / pkg-config errors**: if you see an error mentioning that the sdl2 package is missing from the pkg-config search path, install SDL2 development files.
 * **Windows DLLs**: verify `.\lib\*.dll` exists (local build places FFmpeg DLLs there).
 * **Linux GL compatibility**: try `MESA_GL_VERSION_OVERRIDE=2.1` for a fallback.

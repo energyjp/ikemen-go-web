@@ -26,6 +26,12 @@ func platformCoreInit() error {
 	return nil
 }
 func platformInitJoysticks() {}
+func platformIOSSDLInit() error {
+	return nil
+}
+
+// iOS-only (main.go calls it on the iOS path, never taken on js).
+func setOrientationHints() {}
 
 // osPreferredLanguage: the browser knows this natively.
 func osPreferredLanguage() string {
@@ -101,10 +107,38 @@ func platformIdleGC() {
 	// these blind spots are only a few frames wide and both peers are
 	// lockstepped on them, so a collection here is a stall the other side
 	// waits out. Match loads are wide enough to hide one: platformLoadGC.
+	// Between rounds a rollback session collects too: platformRoundGC.
 	if sys.netConnection != nil || sys.rollback.session != nil {
 		return
 	}
 	runtime.GC()
+}
+
+// platformRoundGC is platformIdleGC for the between-rounds spot, which has just
+// cleared every sound. A rollback session collects there too: without it the
+// automatic GC fired mid-round online, a ~0.15 s freeze heard as an audio
+// stutter. Rollback can reach a round transition inside a re-simulation (and
+// more than once), so the collection waits for the start of the next real
+// frame (platformPendingGC, from runFrame) and runs once.
+func platformRoundGC() {
+	if sys.rollback.session != nil && sys.netConnection == nil {
+		idleGCPending = true
+		return
+	}
+	platformIdleGC()
+}
+
+// Set by platformRoundGC/platformLoadGC during a rollback session.
+var idleGCPending bool
+
+// platformPendingGC runs a collection platformRoundGC or platformLoadGC asked
+// for during a rollback session. Called once per real frame, outside any
+// re-simulation, so it runs once however many times the frame was simulated.
+func platformPendingGC() {
+	if idleGCPending {
+		idleGCPending = false
+		runtime.GC()
+	}
 }
 
 // platformLoadGC forces a garbage collection at a match load, the widest blind
@@ -114,10 +148,11 @@ func platformIdleGC() {
 // starts on a fresh heap instead of carrying the previous match's garbage into
 // the fight, where the automatic GC would eventually fire mid-round.
 //
-// Rollback still opts out: it re-simulates frames, and stalling that loop is
-// what trips the disconnect timeout.
+// Rollback does not collect here (it can be inside a re-simulation): it asks
+// for one at the start of the next real frame (platformPendingGC).
 func platformLoadGC() {
 	if sys.rollback.session != nil {
+		idleGCPending = true
 		return
 	}
 	runtime.GC()

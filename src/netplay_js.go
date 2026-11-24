@@ -5,6 +5,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net"
 	"syscall/js"
 	"time"
 
@@ -28,6 +29,16 @@ import (
 
 const webrtcPeerIP = "webrtc"
 
+// The fixed GGPO ports of the two sides (2.4's values). Each side registers
+// its remote player at the OTHER side's port, and the transport stamps every
+// incoming datagram with that same port, so the pair must agree. They are not
+// sockets: the configured Netplay.Rollback.Port is still exchanged in the
+// handshake (desktop needs it) and ignored here (platformRollbackPeer).
+const (
+	webrtcHostGGPOPort  = 7600
+	webrtcGuestGGPOPort = 7550
+)
+
 // ---------------------------------------------------------------------------
 // lobby stream (NetConnection)
 
@@ -49,15 +60,42 @@ func (c *webrtcConn) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
+// SetDeadline: only reads can wait (send queues in the page bridge and never
+// blocks), so the read deadline is the whole deadline.
+func (c *webrtcConn) SetDeadline(t time.Time) error {
+	c.deadline = t
+	return nil
+}
+
+// SetWriteDeadline is a no-op for the same reason.
+func (c *webrtcConn) SetWriteDeadline(t time.Time) error {
+	return nil
+}
+
+// webrtcAddr is the address of either end of the page's DataChannel. It is
+// deliberately not a *net.TCPAddr: shared code that needs a real IP (the
+// guest's localhost rollback port pick) checks the type and skips.
+type webrtcAddr struct{}
+
+func (webrtcAddr) Network() string { return "webrtc" }
+func (webrtcAddr) String() string  { return webrtcPeerIP }
+
+func (c *webrtcConn) LocalAddr() net.Addr  { return webrtcAddr{} }
+func (c *webrtcConn) RemoteAddr() net.Addr { return webrtcAddr{} }
+
 func (c *webrtcConn) Read(p []byte) (int, error) {
 	for {
-		r := c.bridge.Call("read", len(p))
+		// true: a page that knows it answers "nothing yet" with 0, not an
+		// empty array (one less JS object per poll for the GC to finalize).
+		r := c.bridge.Call("read", len(p), true)
 		if r.IsNull() {
 			return 0, errors.New("webrtc: connection closed")
 		}
-		if n := r.Get("length").Int(); n > 0 {
-			js.CopyBytesToGo(p[:n], r)
-			return n, nil
+		if r.Type() == js.TypeObject {
+			if n := r.Get("length").Int(); n > 0 {
+				js.CopyBytesToGo(p[:n], r)
+				return n, nil
+			}
 		}
 		if !c.deadline.IsZero() && time.Now().After(c.deadline) {
 			return 0, webrtcTimeout{}
@@ -71,7 +109,7 @@ func (c *webrtcConn) Read(p []byte) (int, error) {
 }
 
 func (c *webrtcConn) Write(p []byte) (int, error) {
-	buf := js.Global().Get("Uint8Array").New(len(p))
+	buf := jsUint8ArrayCtor.New(len(p))
 	js.CopyBytesToJS(buf, p)
 	if !c.bridge.Call("send", buf).Bool() {
 		return 0, errors.New("webrtc: send failed")
@@ -103,10 +141,11 @@ func (nc *NetConnection) webrtcStart(host bool) error {
 	nc.ln = &webrtcCloser{bridge: bridge}
 	nc.host = host
 	nc.conn = nil
+	// Fixed input channels, as upstream eae619c3 (GetHostGuestRemap is gone).
 	if host {
-		nc.locIn, nc.remIn = nc.GetHostGuestRemap()
+		nc.locIn, nc.remIn = 0, 1
 	} else {
-		nc.remIn, nc.locIn = nc.GetHostGuestRemap()
+		nc.remIn, nc.locIn = 0, 1
 	}
 	mode := "join"
 	if host {
@@ -153,10 +192,11 @@ func (nc *NetConnection) webrtcStartQueue(mode string) error {
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
+		// Fixed input channels, as upstream eae619c3.
 		if nc.host {
-			nc.locIn, nc.remIn = nc.GetHostGuestRemap()
+			nc.locIn, nc.remIn = 0, 1
 		} else {
-			nc.remIn, nc.locIn = nc.GetHostGuestRemap()
+			nc.remIn, nc.locIn = 0, 1
 		}
 		// enterNetPlay ran with the placeholder address 'webrtc-queue',
 		// which preset the rollback session as guest-of-'webrtc-queue'.
@@ -274,8 +314,10 @@ func (nc *NetConnection) webrtcAwaitBody(bridge js.Value, host bool) {
 			conn.Close()
 			return
 		}
-		nc.conn = conn
+		// Hand the stream to the main thread (upstream ea69d1f3): only the
+		// main thread writes nc.conn, in IsConnected.
 		hlog("conn established; entering synchronize")
+		nc.publishConnection(conn)
 	}
 }
 
@@ -379,6 +421,12 @@ func platformReportResult(winSide int, p1Char, p2Char string) {
 // ---------------------------------------------------------------------------
 // GGPO rollback transport
 
+// The browser build has no netplay deadlines: upstream's Netplay.SyncTimeout
+// and Netplay.LoadingTimeout (4d009150) would cut off a slow page load, so
+// the WebRTC path keeps waiting as 2.4 did (Decision 10; netDeadline in
+// netplay.go).
+const platformNetDeadlines = false
+
 // The engine creates a fresh GGPO session (and transport) per match; the
 // previous match's transport must be stopped so its reader releases the
 // shared DataChannel queue.
@@ -392,12 +440,63 @@ func platformGGPOTransport() []transport.Connection {
 	// The port this side expects the REMOTE player's packets to come from:
 	// must match the port registered via NewRemotePlayer (host registers
 	// the guest as 7550, guest registers the host as 7600).
-	remotePort := 7600
+	remotePort := webrtcHostGGPOPort
 	if sys.netConnection != nil && sys.netConnection.host {
-		remotePort = 7550
+		remotePort = webrtcGuestGGPOPort
 	}
 	activeGGPOTransport = transport.NewWebRTC(bridge, webrtcPeerIP, remotePort)
 	return []transport.Connection{activeGGPOTransport}
+}
+
+// platformRollbackPeer gives preMatchSetup the rollback peer of a WebRTC
+// match: the stream has no IP address (rollback.go would otherwise read a
+// *net.TCPAddr from it), and the ports are the fixed pair the transport
+// stamps, not the ones the handshake exchanged. remoteIp is webrtcPeerIP, the
+// same value the handshake and the queue path put in session.remoteIp/host.
+func platformRollbackPeer(host bool) (remoteIp string, localPort, remotePort int, ok bool) {
+	if host {
+		return webrtcPeerIP, webrtcHostGGPOPort, webrtcGuestGGPOPort, true
+	}
+	return webrtcPeerIP, webrtcGuestGGPOPort, webrtcHostGGPOPort, true
+}
+
+// platformMatchGone asks the page whether it dropped this match's connection
+// because the other player is gone: the lobby server says so at once when a
+// player leaves or is kicked (webrtc.js lobbyPlayDrop, lobbyGone), long before
+// GGPO's DisconnectTimeout or the browser notices a closed tab. 2.4 ended the
+// match through an Esc the page pressed; here Esc is synchronized input
+// (OnKeyPressed), which a loop stalled on the gone player never confirms, so
+// the rollback loop asks every turn instead (hijackRunMatch). The page also
+// learns from this call that the engine handles the drop itself, and presses
+// no Esc. An older page without the call: false, and GGPO's timeout ends it.
+func platformMatchGone() bool {
+	// Asked every turn: the bridge is looked up once (each lookup of a JS object
+	// is a new reference for the garbage collector to finalize). The page sets
+	// ikemenNet once and never replaces it.
+	if !matchGoneBridge.Truthy() {
+		bridge := js.Global().Get("ikemenNet")
+		if !bridge.Truthy() || bridge.Get("matchGone").Type() != js.TypeFunction {
+			return false
+		}
+		matchGoneBridge = bridge
+	}
+	return matchGoneBridge.Call("matchGone").Truthy()
+}
+
+// ikemenNet once platformMatchGone found its matchGone (undefined until then).
+var matchGoneBridge js.Value
+
+// The page's Uint8Array constructor, looked up once (each lookup is a new
+// reference for the garbage collector to finalize).
+var jsUint8ArrayCtor = js.Global().Get("Uint8Array")
+
+// platformNetFail hands a failed connection's message to the page's netplay
+// log (shown under the game), besides the engine's session warning.
+func platformNetFail(msg string) {
+	bridge := js.Global().Get("ikemenNet")
+	if bridge.Truthy() && bridge.Get("olog").Type() == js.TypeFunction {
+		bridge.Call("olog", "engine: "+msg)
+	}
 }
 
 // platformNetStats feeds connection quality to the page overlay.

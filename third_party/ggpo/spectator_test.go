@@ -83,6 +83,14 @@ func TestNewSpectatorBackendSession(t *testing.T) {
 		p2p.Idle(0, advance)
 		stb.Idle(0, advance)
 	}
+	// The host sends a frame again once RunningRetryInterval has passed with
+	// nothing new from the other side (upstream's resend fix, f34b113e): one
+	// more round, that much later.
+	later := func() int64 {
+		return time.Now().Add(time.Millisecond * time.Duration(2000+protocol.RunningRetryInterval)).UnixMilli()
+	}
+	p2p.Idle(0, later)
+	stb.Idle(0, later)
 	var disconnectFlags int
 	_, err = stb.SyncInput(&disconnectFlags)
 	if err != nil {
@@ -161,10 +169,22 @@ func TestNewSpectatorBackendInput(t *testing.T) {
 		stb.Idle(0)
 		stb.AdvanceFrame(ggpo.DefaultChecksum)
 	}
+	// The players and the host send their frames again once
+	// RunningRetryInterval has passed with nothing new from the other side
+	// (upstream's resend fix, f34b113e): a few rounds, that much apart.
+	for r := 1; r <= 3; r++ {
+		at := time.Now().Add(time.Millisecond * time.Duration(2000+r*protocol.RunningRetryInterval)).UnixMilli()
+		later := func() int64 { return at }
+		p2p2.Idle(0, later)
+		p2p.Idle(0, later)
+		stb.Idle(0, later)
+	}
 	var ignore int
 	vals, err := stb.SyncInput(&ignore)
 	if err != nil {
-		t.Errorf("Error when spectator synchronize inputs. %s", err)
+		// Fatal: vals is empty after an error, and indexing it would panic
+		// and abort every later test in the package.
+		t.Fatalf("Error when spectator synchronize inputs. %s", err)
 	}
 	if !bytes.Equal(inputBytes, vals[0]) {
 		t.Errorf("Returned p1 input %v doesn't equal given p1 input %v", vals[0], inputBytes)

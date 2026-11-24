@@ -14,6 +14,7 @@ type Backend interface {
 	AddPlayer(player *Player, handle *PlayerHandle) error
 	AddLocalInput(player PlayerHandle, values []byte, size int) error
 	SyncInput(disconnectFlags *int) ([][]byte, error)
+	SyncInputConfirmed(disconnectFlags *int) ([][]byte, error)
 	AdvanceFrame(checksum uint32) error
 	DisconnectPlayer(handle PlayerHandle) error
 	GetNetworkStats(handle PlayerHandle) (protocol.NetworkStats, error)

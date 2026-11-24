@@ -2,11 +2,17 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
+	"io"
 	"math"
 	"os"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"golang.org/x/image/font"
 )
 
 const MaxFontBatchSize = 250
@@ -19,23 +25,56 @@ type FontRenderer interface {
 }
 
 type Font interface {
+	Metrics() font.Metrics
 	SetColor(red float32, green float32, blue float32, alpha float32)
+	SetBlending(eq BlendEquation, src, dst BlendFunc)
 	SetPalFX(spfx ShaderPalFX)
 	UpdateResolution(windowWidth int, windowHeight int)
 	Printf(x, y float32, xscl, yscl float32, spacingXAdd float32, align int32, blend bool, window [4]int32,
 		rxadd float32, rot Rotation, projectionMode int32, fLength float32, rcx, rcy float32,
 		fs string, argv ...interface{}) error
-	Width(scale float32, spacingXAdd float32, fs string, argv ...interface{}) float32
+	// rscl is the y scale the text is drawn at, 0 measures at the DEF size
+	Width(rscl, scale float32, spacingXAdd float32, fs string, argv ...interface{}) float32
+	SetCustomShader(shader CustomShaderRenderData)
 }
 
 type character struct {
 	textureID uint32 // ID handle of the glyph texture
+	texture   Texture
 	uv        [4]float32
 	width     int //glyph width
 	height    int //glyph height
 	advance   int //glyph advance
 	bearingH  int //glyph bearing horizontal
 	bearingV  int //glyph bearing vertical
+}
+
+// Max extra TTF glyph sizes per font. After that the closest size is reused.
+const ttfMaxRasterSizes = 8
+
+// Pixel size at which TTF text drawn at yscl appears on screen.
+func ttfRasterSize(nominal int32, yscl float32) int32 {
+	px := float64(nominal) * math.Abs(float64(yscl)) * float64(sys.heightScale)
+	if px <= 0 || math.IsNaN(px) || math.IsInf(px, 0) {
+		return nominal
+	}
+	// Must fit an atlas page, but never go below the DEF size
+	limit := Max(sys.cfg.Video.FontTextureAtlasSize/2, nominal)
+	return Clamp(int32(math.Round(px)), 1, limit)
+}
+
+// Returns size, or the closest existing one when the limit is reached.
+func ttfPickRasterSize[T any](sets map[int32]T, size int32) int32 {
+	if _, ok := sets[size]; ok || len(sets) < ttfMaxRasterSizes {
+		return size
+	}
+	best := int32(-1)
+	for s := range sets {
+		if best < 0 || Abs(s-size) < Abs(best-size) || (Abs(s-size) == Abs(best-size) && s > best) {
+			best = s
+		}
+	}
+	return best
 }
 
 type color struct {
@@ -63,13 +102,17 @@ type FntCharImage struct {
 
 // TtfFont implements TTF font rendering on supported platforms
 type TtfFont interface {
+	Metrics() font.Metrics
 	SetColor(red float32, green float32, blue float32, alpha float32)
+	SetBlending(eq BlendEquation, src, dst BlendFunc)
 	SetPalFX(spfx ShaderPalFX)
-	Width(scale float32, spacingXAdd float32, fs string, argv ...interface{}) float32
+	// rscl is the y scale the text is drawn at, 0 measures at the DEF size
+	Width(rscl, scale float32, spacingXAdd float32, fs string, argv ...interface{}) float32
 	Printf(x, y float32, xscl, yscl float32, spacingXAdd float32, align int32, blend bool, window [4]int32,
 		rxadd float32, rot Rotation, projectionMode int32, fLength float32, rcx, rcy float32,
 		fs string, argv ...interface{}) error
 	UpdateResolution(windowWidth int, windowHeight int)
+	SetCustomShader(shader CustomShaderRenderData)
 }
 
 // Fnt is a interface for basic font information
@@ -89,6 +132,22 @@ type Fnt struct {
 	lastPalBank int32
 	lastPalBase *uint32
 	paltexCache map[*uint32]Texture
+
+	// Inline glyphs drawn with this font, from the DEF file or [Files] fontN.glyphs.*
+	glyphOffset  [2]float32
+	glyphScale   [2]float32
+	glyphSpacing float32
+
+	// [Def] bold = n (TrueType): each piece of text is drawn n more times, one
+	// font pixel further right each time, a heavier stroke for a font that has
+	// one weight (a fallback font standing in for a bold pack font).
+	bold float32
+
+	// [Files] fontN.fallback: the font a text is drawn in when this font cannot
+	// draw one of its characters above ASCII (fallbackFor). Whether a text needs
+	// it is kept per text in fallbackUse.
+	fallback    *Fnt
+	fallbackUse map[string]bool
 }
 
 func newFnt() *Fnt {
@@ -97,6 +156,7 @@ func newFnt() *Fnt {
 		BankType:    "palette",
 		lastPalBank: -1,
 		paltexCache: make(map[*uint32]Texture),
+		glyphScale:  [2]float32{1, 1},
 	}
 }
 
@@ -227,8 +287,14 @@ func loadFntV1(filename string) (*Fnt, error) {
 	px = spr.RlePcxDecode(px)
 	fp.Seek(int64(txtDataOffset), 0)
 	buf = make([]byte, txtDataLength)
-	if err := read(buf); err != nil {
+	n, err = io.ReadFull(fp, buf)
+	if err != nil && err != io.ErrUnexpectedEOF {
 		return nil, err
+	}
+	// Like MUGEN, read what's there when the header claims more text than the file has.
+	if n < len(buf) {
+		LogMessage("WARNING: %v: text data is %v bytes, header says %v", filename, n, txtDataLength)
+		buf = buf[:n]
 	}
 	lines := SplitAndTrim(string(buf), "\n")
 	i := 0
@@ -399,6 +465,10 @@ func loadDefInfo(f *Fnt, filename string, is IniSection, height int32) {
 	if len(ary) > 1 && len(ary[1]) > 0 {
 		f.offset[1] = Atoi(ary[1])
 	}
+	is.ReadF32("glyphs.offset", &f.glyphOffset[0], &f.glyphOffset[1])
+	is.ReadF32("glyphs.scale", &f.glyphScale[0], &f.glyphScale[1])
+	is.ReadF32("glyphs.spacing", &f.glyphSpacing)
+	is.ReadF32("bold", &f.bold)
 
 	if len(is["file"]) > 0 {
 		if f.Type == "truetype" {
@@ -411,7 +481,7 @@ func loadDefInfo(f *Fnt, filename string, is IniSection, height int32) {
 
 func LoadFntSff(f *Fnt, fontfile string, filename string) {
 	fileDir := SearchFile(filename, []string{fontfile, sys.motif.Def, "", "data/"}, "font/")
-	sff, err := loadSff(fileDir, false, false, false)
+	sff, err := loadSff(fileDir, SffTypeFont, false, false)
 
 	if err != nil {
 		panic(err)
@@ -477,7 +547,8 @@ func (f *Fnt) CharWidth(c rune, bt int32) int32 {
 	}
 	fci := f.images[bt][c]
 	if fci == nil {
-		return 0
+		// DrawText draws missing characters as spaces.
+		return int32(f.Size[0])
 	}
 	return int32(fci.w)
 }
@@ -493,7 +564,7 @@ func (f *Fnt) TextWidth(txt string, bank int32, spacingXAdd int32) (w int32) {
 		if f.ttf == nil {
 			return 0
 		}
-		return int32(math.Round(float64(f.ttf.Width(1, float32(spacingXAdd), "%s", txt))))
+		return int32(math.Round(float64(f.ttfWidth(0, 1, float32(spacingXAdd), txt))))
 	}
 	if f.BankType != "sprite" {
 		bank = 0
@@ -514,6 +585,128 @@ func (f *Fnt) TextWidth(txt string, bank int32, spacingXAdd int32) (w int32) {
 		ri++
 	}
 	return
+}
+
+// A TrueType font that can tell whether it has a glyph (every renderer's font_*.go).
+type ttfRuneFont interface {
+	HasRune(r rune) bool
+}
+
+// drawsRune reports whether f has a picture for r: a bitmap font a character in
+// its bank (bank 0 unless the font switches banks by sprite), a TrueType font a
+// glyph. A renderer that cannot tell counts as drawing it.
+func (f *Fnt) drawsRune(r rune, bank int32) bool {
+	if f.Type == "truetype" {
+		if rf, ok := f.ttf.(ttfRuneFont); ok {
+			return rf.HasRune(r)
+		}
+		return true
+	}
+	if f.BankType != "sprite" {
+		bank = 0
+	}
+	return f.images[bank][r] != nil
+}
+
+const fallbackUseMax = 1024
+
+// fallbackFor returns the font txt is drawn in: f, or f.fallback ([Files]
+// fontN.fallback) when f cannot draw one of txt's characters above ASCII and
+// the fallback can draw them all. A screenpack's bitmap font (or a TrueType one
+// without kana and kanji) then draws a Japanese move name whole in the
+// fallback, while its English text keeps the pack's own font: a missing ASCII
+// character never switches (an all-capitals font stays as it was). Inline tags
+// (<...>, glyphs and colors) are not text. Kept per text: menus draw the same
+// rows every frame.
+func (f *Fnt) fallbackFor(txt string, bank int32, literal bool) *Fnt {
+	if f == nil || f.fallback == nil || f.fallback == f {
+		return f
+	}
+	ascii := true
+	for i := 0; i < len(txt); i++ {
+		if txt[i] >= utf8.RuneSelf {
+			ascii = false
+			break
+		}
+	}
+	if ascii {
+		return f
+	}
+	if use, ok := f.fallbackUse[txt]; ok {
+		if use {
+			return f.fallback
+		}
+		return f
+	}
+	missing, fbDraws := false, true
+	inTag := false
+	for _, r := range txt {
+		if !literal {
+			if inTag {
+				inTag = r != '>'
+				continue
+			}
+			if r == '<' {
+				inTag = true
+				continue
+			}
+		}
+		if r < utf8.RuneSelf {
+			continue
+		}
+		if !f.drawsRune(r, bank) {
+			missing = true
+		}
+		if !f.fallback.drawsRune(r, bank) {
+			fbDraws = false
+		}
+	}
+	use := missing && fbDraws
+	if f.fallbackUse == nil || len(f.fallbackUse) >= fallbackUseMax {
+		f.fallbackUse = make(map[string]bool)
+	}
+	f.fallbackUse[txt] = use
+	if use {
+		return f.fallback
+	}
+	return f
+}
+
+// Unrounded TextWidth, measured with the glyphs DrawTtf uses at y scale rscl.
+func (f *Fnt) lineWidth(txt string, bank, spacingXAdd int32, rscl float32) float32 {
+	if f.Type == "truetype" && f.ttf != nil && txt != "" {
+		return f.ttfWidth(rscl, 1, float32(spacingXAdd), txt)
+	}
+	return float32(f.TextWidth(txt, bank, spacingXAdd))
+}
+
+// A TrueType font that also takes its text as a plain string (font_webgl.go).
+// Printf and Width take it through ...interface{}, which boxes the string
+// into a new heap object on every call; text is measured and drawn per run,
+// per line and per frame.
+type ttfStringFont interface {
+	PrintString(x, y float32, xscl, yscl float32, spacingXAdd float32,
+		align int32, blend bool, window [4]int32,
+		rxadd float32, rot Rotation, projectionMode int32, fLength float32, rcx, rcy float32, txt string) error
+	WidthString(rscl, scale float32, spacingXAdd float32, txt string) float32
+}
+
+func (f *Fnt) ttfWidth(rscl, scale, spacingXAdd float32, txt string) float32 {
+	if sf, ok := f.ttf.(ttfStringFont); ok {
+		return sf.WidthString(rscl, scale, spacingXAdd, txt)
+	}
+	return f.ttf.Width(rscl, scale, spacingXAdd, "%s", txt)
+}
+
+func (f *Fnt) ttfPrint(x, y, xscl, yscl, spacingXAdd float32, align int32, blend bool, window [4]int32,
+	rxadd float32, rot Rotation, projectionMode int32, fLength, rcx, rcy float32, txt string) {
+	if sf, ok := f.ttf.(ttfStringFont); ok {
+		sf.PrintString(x, y, xscl, yscl, spacingXAdd, align, blend, window,
+			rxadd, rot, projectionMode, fLength, rcx, rcy, txt)
+		return
+	}
+	f.ttf.Printf(x, y, xscl, yscl, spacingXAdd, align, blend, window,
+		rxadd, rot, projectionMode, fLength, rcx, rcy, "%s", txt)
 }
 
 func (f *Fnt) getCharSpr(c rune, bank, bt int32) *Sprite {
@@ -601,17 +794,41 @@ func (f *Fnt) Print(txt string, x, y, xscl, yscl, rxadd float32, rot Rotation, p
 	window *[4]int32, palfx *PalFX, frgba [4]float32) {
 	if !sys.frameSkip {
 		if f.Type == "truetype" {
-			f.DrawTtf(txt, x, y, xscl, yscl, rxadd, rot, projectionMode, fLength, align, true, window, frgba, palfx, 0)
+			f.DrawTtf(txt, x, y, xscl, yscl, rxadd, rot, projectionMode, fLength, align, true, window, frgba, TT_default, [2]int32{255, 0}, palfx, 0, 0, CustomShaderRenderData{})
 		} else {
-			f.DrawText(txt, x, y, xscl, yscl, rxadd, rot, projectionMode, fLength, bank, align, window, frgba, palfx, 0)
+			f.DrawText(txt, x, y, xscl, yscl, rxadd, rot, projectionMode, fLength, bank, align, window, frgba, TT_default, [2]int32{255, 0}, palfx, 0, 0, CustomShaderRenderData{})
 		}
 	}
 }
 
-// DrawText prints on screen a specified text with the current font sprites
+// Where a bitmap text line starts before alignment, and its rotation point.
+func (f *Fnt) textPosition(x, y, xscl, yscl float32, rot Rotation) (float32, float32, float32, float32) {
+	x += float32(f.offset[0])*xscl + float32(sys.gameWidth-320)/2
+	y += float32(f.offset[1]-int32(f.Size[1])+1)*yscl + float32(sys.gameHeight-240)
+
+	var rcx, rcy float32
+
+	if rot.IsZero() {
+		if xscl < 0 {
+			x *= -1
+		}
+		if yscl < 0 {
+			y *= -1
+		}
+		rcx, rcy = rcx*sys.widthScale, 0
+	} else {
+		rcx, rcy = (x+rcx)*sys.widthScale, y*sys.heightScale
+		x, y = Abs(xscl)*float32(f.offset[0]), Abs(yscl)*float32(f.offset[1])
+	}
+
+	return x, y, rcx, rcy
+}
+
+// DrawText prints on screen a specified text with the current font sprites.
+// advance moves the text along its line, in font pixels, keeping the line's rotation point.
 func (f *Fnt) DrawText(txt string, x, y, xscl, yscl, rxadd float32,
 	rot Rotation, projectionMode int32, fLength float32, bank, align int32, window *[4]int32,
-	frgba [4]float32, palfx *PalFX, spacingXAdd int32) {
+	frgba [4]float32, trans TransType, alpha [2]int32, palfx *PalFX, spacingXAdd int32, advance float32, shader CustomShaderRenderData) {
 
 	if len(txt) == 0 || xscl == 0 || yscl == 0 {
 		return
@@ -633,29 +850,14 @@ func (f *Fnt) DrawText(txt string, x, y, xscl, yscl, rxadd float32,
 		}
 	}
 
-	x += float32(f.offset[0])*xscl + float32(sys.gameWidth-320)/2
-	y += float32(f.offset[1]-int32(f.Size[1])+1)*yscl + float32(sys.gameHeight-240)
-
-	var rcx, rcy float32
-
-	if rot.IsZero() {
-		if xscl < 0 {
-			x *= -1
-		}
-		if yscl < 0 {
-			y *= -1
-		}
-		rcx, rcy = rcx*sys.widthScale, 0
-	} else {
-		rcx, rcy = (x+rcx)*sys.widthScale, y*sys.heightScale
-		x, y = Abs(xscl)*float32(f.offset[0]), Abs(yscl)*float32(f.offset[1])
-	}
+	x, y, rcx, rcy := f.textPosition(x, y, xscl, yscl, rot)
 
 	if align == 0 {
 		x -= float32(f.TextWidth(txt, bank, spacingXAdd)) * xscl * 0.5
 	} else if align < 0 {
 		x -= float32(f.TextWidth(txt, bank, spacingXAdd)) * xscl
 	}
+	x += advance * xscl
 
 	var pal []uint32
 	if len(f.palettes) != 0 {
@@ -669,13 +871,18 @@ func (f *Fnt) DrawText(txt string, x, y, xscl, yscl, rxadd float32,
 		f.lastPalBase = nil
 	}
 
-	alpha := frgba[3]
-	alphaVal := int32(255 * sys.brightness * alpha)
+	alphaVal := int32(255 * sys.brightness * frgba[3])
 
 	// Set the trans type
 	tt := TT_none
-	if alpha < 1.0 {
+	if frgba[3] < 1.0 {
 		tt = TT_add
+	}
+	blendAlpha := [2]int32{alphaVal, 255 - alphaVal}
+	// A set trans replaces the alpha of the font color.
+	if trans != TT_default {
+		tt = trans
+		blendAlpha = [2]int32{int32(float32(alpha[0]) * sys.brightness), alpha[1]}
 	}
 
 	// Sprite fonts can't use frgba like TTF can, so we will leverage PalFX.mul to apply color
@@ -699,7 +906,7 @@ func (f *Fnt) DrawText(txt string, x, y, xscl, yscl, rxadd float32,
 		rot:            rot,
 		tint:           0,
 		blendMode:      tt,
-		blendAlpha:     [2]int32{alphaVal, 255 - alphaVal},
+		blendAlpha:     blendAlpha,
 		mask:           0,
 		pfx:            pfxCopy,
 		window:         window,
@@ -709,6 +916,7 @@ func (f *Fnt) DrawText(txt string, x, y, xscl, yscl, rxadd float32,
 		fLength:        fLength * sys.heightScale,
 		xOffset:        0,
 		yOffset:        0,
+		customShader:   shader,
 	}
 
 	for _, c := range txt {
@@ -718,7 +926,7 @@ func (f *Fnt) DrawText(txt string, x, y, xscl, yscl, rxadd float32,
 
 func (f *Fnt) DrawTtf(txt string, x, y, xscl, yscl, rxadd float32, rot Rotation,
 	projectionMode int32, fLength float32, align int32,
-	blend bool, window *[4]int32, frgba [4]float32, palfx *PalFX, spacingXAdd float32) {
+	blend bool, window *[4]int32, frgba [4]float32, trans TransType, alpha [2]int32, palfx *PalFX, spacingXAdd, advance float32, shader CustomShaderRenderData) {
 
 	if len(txt) == 0 {
 		return
@@ -737,6 +945,8 @@ func (f *Fnt) DrawTtf(txt string, x, y, xscl, yscl, rxadd float32, rot Rotation,
 
 	x += float32(f.offset[0])*xscl + float32(sys.gameWidth-320)/2
 	//y += float32(f.offset[1]-int32(f.Size[1])+1)*yscl + float32(sys.gameHeight-240)
+	rcx := x
+	x += advance * xscl
 
 	// Use same window as sprites and let the renderer handle it
 	//win := [4]int32{(*window)[0], sys.scrrect[3] - ((*window)[1] + (*window)[3]),
@@ -747,26 +957,45 @@ func (f *Fnt) DrawTtf(txt string, x, y, xscl, yscl, rxadd float32, rot Rotation,
 		blendMode = TT_add
 	}
 	alphaVal := int32(255 * Clamp(frgba[3], float32(0), float32(1)))
+	blendAlpha := [2]int32{alphaVal, 255 - alphaVal}
+	if trans != TT_default {
+		blendMode, blendAlpha = trans, alpha
+	}
 
 	var spfx ShaderPalFX
 
 	if palfx != nil {
-		spfx = palfx.getFinalPalFx(blendMode, [2]int32{alphaVal, 255 - alphaVal})
+		spfx = palfx.getFinalPalFx(blendMode, blendAlpha)
 	} else {
 		spfx = NewShaderPalFX()
 	}
+	f.ttf.SetCustomShader(shader)
+	// A set trans replaces the alpha of the font color and blends the text like a sprite.
+	if trans != TT_default {
+		renderWithBlending(func(eq BlendEquation, src, dst BlendFunc, a float32) {
+			f.ttf.SetPalFX(spfx)
+			f.ttf.SetBlending(eq, src, dst)
+			f.ttf.SetColor(frgba[0], frgba[1], frgba[2], a)
+			f.ttfPrint(x, y, xscl, yscl, spacingXAdd, align, true, *window,
+				rxadd, rot, projectionMode, fLength, rcx, y, txt)
+		}, blendMode, blendAlpha, false, &spfx, true)
+		return
+	}
 	f.ttf.SetPalFX(spfx)
-
+	f.ttf.SetBlending(BlendAdd, BlendSrcAlpha, BlendOneMinusSrcAlpha)
 	f.ttf.SetColor(frgba[0], frgba[1], frgba[2], frgba[3])
-	f.ttf.Printf(x, y, xscl, yscl, spacingXAdd, align, blend, *window,
-		rxadd, rot, projectionMode, fLength, x, y,
-		"%s", txt) //x, y, scale, spacingXAdd, align, blend, window, transform, string, printf args
+	f.ttfPrint(x, y, xscl, yscl, spacingXAdd, align, blend, *window,
+		rxadd, rot, projectionMode, fLength, rcx, y, txt)
 }
 
 type TextSprite struct {
 	ownerid        int32
 	id             int32
 	text, textInit string
+	glyphSection   string
+	literal        bool // user-entered text has no motif escapes or glyph tags
+	glyphStoryboard *Storyboard // storyboard text reads [SceneDef] actions first
+	glyphDevice    int // zero follows the last active menu device
 	template       string
 	params         []interface{}
 	fnt            *Fnt
@@ -780,23 +1009,31 @@ type TextSprite struct {
 	fLength        float32
 	xvel, yvel     float32
 	localScale     float32
-	scaleRatio     float32 // Scale correction when different localcoords interact
-	offsetX        int32
+	localcoordW    int32 // Localcoord width of the text's params
+	wrapLocalW     int32 // Localcoord width given to SetLocalcoord (0 = the motif's): the wrap width
+	fontLocalW     int32 // Localcoord width the font was made for
+	offsetX        float32
 	layerno        int16
 	palfx          *PalFX
+	trans          TransType
+	alpha          [2]int32
 	frgba          [4]float32 // ttf fonts
 	removetime     int32      // text sctrl
 	elapsedTicks   float32
 	textSpacing    [2]float32
 	textDelay      float32
 	textWrap       bool
+	wrapChars      bool // textwrap = c: lines break at any character instead of between words
 	vel            [2]float32
 	accel          [2]float32
 	friction       [2]float32
 	maxDist        [2]float32
 	hidewithbars   bool
+	windowDefault  bool // The clip follows sys.scrrect if no window was authored.
 	// initial, unscaled values
 	offsetInit   [2]float32
+	transInit    TransType
+	alphaInit    [2]int32
 	scaleInit    [2]float32
 	windowInit   [4]float32
 	velocityInit [2]float32
@@ -805,9 +1042,37 @@ type TextSprite struct {
 	// (menus, lifebar labels, the multi-line F1 info box) re-allocates its
 	// processed string and line slice 60 times a second. Dynamic text changes
 	// ts.text, which misses the cache and recomputes - so no staleness.
-	procSrc   string
-	procText  string
-	procLines []string
+	procSrc      string
+	procText     string
+	procLines    []string
+	customShader CustomShader
+
+	// ts.literal the text cache was made with (it decides the \n decoding),
+	// and whether procText has tags to resolve (glyphs, colors).
+	procLiteral bool
+	procTagged  bool
+	// The glyph runs of each line of procText (cachedRuns), and what they were
+	// resolved with: tags resolve through the motif, the devices, mappings and
+	// setups, which only change with the glyph generation (glyphgen.go).
+	runLines [][]glyphRun
+	runKey   glyphRunKey
+	// The hint text this sprite shows (HintProperties.draw), and for what.
+	hintGen     uint64
+	hintContext string
+	hintDevice  int
+	hintText    string
+}
+
+// What a TextSprite's cached glyph runs were resolved with. gen, device,
+// section and story are zero for text without tags: plain text keeps its runs
+// until the text changes.
+type glyphRunKey struct {
+	text    string
+	literal bool
+	gen     uint64
+	device  int
+	section string
+	story   *Storyboard
 }
 
 func NewTextSprite() *TextSprite {
@@ -832,12 +1097,16 @@ func (ts *TextSprite) loadDefaults() {
 		yscl:       1,
 		window:     sys.scrrect,
 		frgba:      [...]float32{1.0, 1.0, 1.0, 1.0},
+		trans:      TT_default,
+		alpha:      [2]int32{255, 0},
+		transInit:  TT_default,
+		alphaInit:  [2]int32{255, 0},
 		removetime: 1,
 		localScale: 1,
-		scaleRatio: 1,
 		friction:   [2]float32{1.0, 1.0},
 		scaleInit:  [2]float32{1.0, 1.0},
 	}
+	ts.windowDefault = true
 
 	ts.params = prm
 
@@ -847,6 +1116,7 @@ func (ts *TextSprite) loadDefaults() {
 		ts.palfx = pfx
 	}
 	ts.palfx.clear()
+	ts.customShader.clear()
 }
 
 // Creates a shallow copy with independent palette mapping
@@ -867,6 +1137,31 @@ func (ts *TextSprite) Copy() *TextSprite {
 	return nt
 }
 
+// refreshFrom makes ts a copy of src, as Copy does, without allocating: ts
+// keeps its own PalFX (overwritten with src's values) and its text caches,
+// which stay valid because they are keyed on the text they were made from.
+// For text drawn from a template every frame with a text of its own (the
+// on-screen keyboard's keys), where a Copy per frame allocated the sprite and
+// its PalFX and lost the caches.
+func (ts *TextSprite) refreshFrom(src *TextSprite) {
+	pfx := ts.palfx
+	procSrc, procText, procLines := ts.procSrc, ts.procText, ts.procLines
+	procLiteral, procTagged := ts.procLiteral, ts.procTagged
+	runLines, runKey := ts.runLines, ts.runKey
+	*ts = *src
+	ts.procSrc, ts.procText, ts.procLines = procSrc, procText, procLines
+	ts.procLiteral, ts.procTagged = procLiteral, procTagged
+	ts.runLines, ts.runKey = runLines, runKey
+	ts.hintGen, ts.hintContext, ts.hintDevice, ts.hintText = 0, "", 0, ""
+	if src.palfx != nil {
+		if pfx == nil || pfx == src.palfx {
+			pfx = newPalFX()
+		}
+		*pfx = *src.palfx
+		ts.palfx = pfx
+	}
+}
+
 func (ts *TextSprite) SetLocalcoord(lx, ly int32) {
 	if lx <= 0 || ly <= 0 {
 		return
@@ -876,7 +1171,8 @@ func (ts *TextSprite) SetLocalcoord(lx, ly int32) {
 		v = float64(ly) * 4 / 3
 	}
 	ts.localScale = float32(320 / v)
-	ts.offsetX = -int32(math.Floor(float64(lx)/(v/320)-320) / 2)
+	ts.offsetX = localcoordOffsetX(float64(lx), v)
+	ts.wrapLocalW = lx
 }
 
 // Like SetLocalcoord but for char texts, so scaling works more like characters
@@ -896,17 +1192,19 @@ func (ts *TextSprite) SetLocalcoordChar(lc [2]int32) {
 
 	// Scale coordinate space so that localcoord width matches full screen width
 	ts.localScale = float32(gameW / localW)
+	ts.localcoordW = lc[0]
+	ts.wrapLocalW = 0 // wraps as before: the motif's width
 
 	// Shift coordinate origin to where the screen edge is, regardless of aspect ratio
 	// Note: offsetX is not in local scale
 	extraW := gameW - v
-	ts.offsetX = -int32(math.Floor((extraW) / 2))
+	ts.offsetX = float32(-extraW / 2)
 }
 
 func (ts *TextSprite) SetPos(x, y float32) {
 	ts.offsetInit[0] = x
 	ts.offsetInit[1] = y
-	ts.x = x*ts.localScale + float32(ts.offsetX)
+	ts.x = x*ts.localScale + ts.offsetX
 	ts.y = y * ts.localScale
 }
 
@@ -922,14 +1220,40 @@ func (ts *TextSprite) SetScale(xscl, yscl float32) {
 	ts.yscl = yscl * ts.localScale
 }
 
-func (ts *TextSprite) ApplyScaleRatio() {
+// Sets the scale so the font looks the same in any localcoord.
+func (ts *TextSprite) SetCharScale(xscl, yscl float32) {
+	ts.SetScale(xscl, yscl)
+	if ts.localcoordW > 0 && ts.fontLocalW > 0 {
+		ratio := float32(ts.localcoordW) / float32(ts.fontLocalW)
+		ts.xscl *= ratio
+		ts.yscl *= ratio
+	}
 	if ts.fnt == sys.debugFont.fnt {
 		ts.xscl *= sys.debugFont.xscl
 		ts.yscl *= sys.debugFont.yscl
-	} else {
-		ts.xscl *= ts.scaleRatio
-		ts.yscl *= ts.scaleRatio
 	}
+}
+
+// Switches to another localcoord, keeping the current params in the new one.
+func (ts *TextSprite) ChangeLocalcoordChar(lc [2]int32) {
+	if lc[0] <= 0 {
+		return
+	}
+	oldScale := ts.localScale
+	ts.SetLocalcoordChar(lc)
+	// Rescale everything that was multiplied by the old localScale
+	k := ts.localScale / oldScale
+	ts.x = (ts.x-ts.offsetX)*k + ts.offsetX
+	ts.y *= k
+	ts.xvel *= k
+	ts.yvel *= k
+	ts.vel[0] *= k
+	ts.vel[1] *= k
+	ts.maxDist[0] *= k
+	ts.maxDist[1] *= k
+	ts.accel[0] *= k
+	ts.accel[1] *= k
+	ts.SetCharScale(ts.scaleInit[0], ts.scaleInit[1])
 }
 
 func (ts *TextSprite) SetWindow(window [4]float32) {
@@ -937,38 +1261,42 @@ func (ts *TextSprite) SetWindow(window [4]float32) {
 		return
 	}
 	ts.windowInit = window
+	ts.windowDefault = false
 	ts.window = ts.drawWindow()
 }
 
 func (ts *TextSprite) drawWindow() [4]int32 {
+	if ts.windowDefault {
+		return sys.scrrect
+	}
 	if ts.windowInit == [4]float32{0, 0, 0, 0} {
 		return ts.window
 	}
 	// Pixel bounds depend on the aspect state selected for this draw pass.
 	window := ts.windowInit
-	x := window[0]*ts.localScale + float32(ts.offsetX)
+	x := window[0]*ts.localScale + ts.offsetX
 	y := window[1] * ts.localScale
 	w := (window[2] - window[0]) * ts.localScale
 	h := (window[3] - window[1]) * ts.localScale
-	drawWindow := [4]int32{}
-	drawWindow[0] = int32((x + float32(sys.gameWidth-320)/2) * sys.widthScale)
-	// TODO: test if this truetype adjustment is needed
-	//drawWindow[1] = int32((y + float32(sys.gameHeight-240)) * sys.heightScale)
 	// Keep scissor Y consistent with the respective draw paths:
 	//  - Sprite fonts (DrawText) add +(sys.gameHeight-240) to Y
 	//  - TTF fonts (DrawTtf) do NOT add that offset
-	if ts.fnt != nil && ts.fnt.Type == "truetype" {
-		drawWindow[1] = int32(y * sys.heightScale)
-	} else {
-		drawWindow[1] = int32((y + float32(sys.gameHeight-240)) * sys.heightScale)
+	if ts.fnt == nil || ts.fnt.Type != "truetype" {
+		y += sys.gameHeight - 240
 	}
-	drawWindow[2] = int32(w*sys.widthScale + 0.5)
-	drawWindow[3] = int32(h*sys.heightScale + 0.5)
-	return drawWindow
+	return screenRect(x+(sys.gameWidth-320)/2, y, w, h)
 }
 
 func (ts *TextSprite) SetColor(r, g, b, a int32) {
 	ts.frgba = [4]float32{float32(r) / 255, float32(g) / 255, float32(b) / 255, float32(a) / 255}
+}
+
+// SetTextWrap: empty, n or 0 disable wrapping, c wraps at any character,
+// any other value wraps between words.
+func (ts *TextSprite) SetTextWrap(mode string) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	ts.textWrap = mode != "" && mode != "0" && mode[0] != 'n'
+	ts.wrapChars = ts.textWrap && mode[0] == 'c'
 }
 
 func (ts *TextSprite) SetTextSpacing(xs, ys float32) {
@@ -997,18 +1325,41 @@ func (ts *TextSprite) IsFullyTyped() bool {
 	if ts.textDelay <= 0 {
 		return true // There's no partial logic
 	}
-	if int32(len(ts.text)) <= int32(ts.elapsedTicks/ts.textDelay) {
+	length := len(ts.text)
+	if !ts.literal && strings.Contains(ts.text, "<") {
+		length = 0
+		for _, runs := range ts.cachedRuns() {
+			for _, run := range runs {
+				length += utf8.RuneCountInString(run.text)
+				if run.anim != nil {
+					length++
+				}
+			}
+		}
+	}
+	if int32(length) <= int32(ts.elapsedTicks/ts.textDelay) {
 		return true
 	}
 	return false
 }
 
-func (ts *TextSprite) TextWidth(txt string) int32 {
+func (ts *TextSprite) TextWidth(txt string) float32 {
 	if ts.fnt == nil {
 		return 0
 	}
+	// Measured in the font the text is drawn in (draw).
+	if fb := ts.fnt.fallbackFor(txt, ts.bank, ts.literal); fb != ts.fnt {
+		f := ts.fnt
+		ts.fnt = fb
+		w := ts.TextWidth(txt)
+		ts.fnt = f
+		return w
+	}
+	if !ts.literal && strings.Contains(txt, "<") {
+		return ts.glyphTextWidth(ts.lineRuns(txt))
+	}
 	spacingXAdd := int32(math.Round(float64(ts.textSpacing[0])))
-	return ts.fnt.TextWidth(txt, ts.bank, spacingXAdd)
+	return ts.fnt.lineWidth(txt, ts.bank, spacingXAdd, ts.yscl)
 }
 
 func (ts *TextSprite) getLineLength(windowWrap bool) int32 {
@@ -1017,8 +1368,15 @@ func (ts *TextSprite) getLineLength(windowWrap bool) int32 {
 		return 0
 	}
 
-	// Base "full screen" width in text space.
+	// Base "full screen" width in text space: the width of the localcoord the
+	// text's scale came from. The motif's width only stands in when the text
+	// never got one; a storyboard (or any section) with its own localcoord
+	// otherwise wrapped at the motif's width in the storyboard's units, the
+	// middle of the screen for a 1280x720 storyboard under a 640x480 pack.
 	lcWidth := float32(sys.motif.Info.Localcoord[0])
+	if ts.wrapLocalW > 0 {
+		lcWidth = float32(ts.wrapLocalW)
+	}
 	if ts.localScale > 0 {
 		lcWidth = lcWidth * ts.localScale
 	}
@@ -1026,11 +1384,11 @@ func (ts *TextSprite) getLineLength(windowWrap bool) int32 {
 	var left, right float32
 	if windowWrap && ts.windowInit != [4]float32{0, 0, 0, 0} && ts.localScale > 0 {
 		// windowInit is in motif localcoords; convert to text space.
-		left = ts.windowInit[0]*ts.localScale + float32(ts.offsetX)
-		right = ts.windowInit[2]*ts.localScale + float32(ts.offsetX)
+		left = ts.windowInit[0]*ts.localScale + ts.offsetX
+		right = ts.windowInit[2]*ts.localScale + ts.offsetX
 	} else {
 		// No explicit window: use the whole localcoord width.
-		left = float32(ts.offsetX)
+		left = ts.offsetX
 		right = left + lcWidth
 	}
 
@@ -1047,6 +1405,9 @@ func (ts *TextSprite) getLineLength(windowWrap bool) int32 {
 }
 
 func (ts *TextSprite) decodeEscapes(text string) string {
+	if ts.literal {
+		return text
+	}
 	return strings.ReplaceAll(text, "\\n", "\n")
 }
 
@@ -1056,21 +1417,136 @@ func (ts *TextSprite) decodeEscapes(text string) string {
 // PERSISTENT sprite before it snapshots a throwaway Copy for deferred drawing -
 // if only Draw populated the cache, it would populate the discarded copy and
 // reprocess the whole string every single frame.
+// The key is the text AND ts.literal: literal text keeps its \n as written.
+// A changed text is looked up in textCache first, so a sprite that draws many
+// texts in turn (a menu's rows) does not process them again every frame.
 func (ts *TextSprite) ensureProcessed() {
-	if ts.procLines != nil && ts.procSrc == ts.text {
+	if ts.procLines != nil && ts.procSrc == ts.text && ts.procLiteral == ts.literal {
 		return
 	}
-	processed := strings.ReplaceAll(ts.text, "\t", "    ")
-	processed = ts.decodeEscapes(processed)
+	e := textCacheEntryFor(ts.text, ts.literal)
 	ts.procSrc = ts.text
-	ts.procText = processed
-	ts.procLines = strings.Split(processed, "\n")
+	ts.procLiteral = ts.literal
+	ts.procText = e.procText
+	ts.procLines = e.procLines
+	ts.procTagged = e.tagged
+	// New lines get new runs. Never cleared in place: a Copy may share them.
+	ts.runLines = nil
+}
+
+// cachedRuns returns the glyph runs of every line of ts.text, resolving tags
+// only when the text, ts.literal or (for text with tags) the glyph generation,
+// device, section or storyboard changed. The runs are what drawGlyphText
+// resolved every frame before: the same lines, the same color carried from
+// line to line, and lines without tags as one plain run. The returned slices
+// are never modified, so a Copy, and every sprite drawing the same text, can
+// keep using them.
+func (ts *TextSprite) cachedRuns() [][]glyphRun {
+	ts.ensureProcessed()
+	key := glyphRunKey{text: ts.procText, literal: ts.literal}
+	if ts.procTagged {
+		key.gen = sys.glyphGeneration()
+		key.device, key.section, key.story = ts.glyphDevice, ts.glyphSection, ts.glyphStoryboard
+	}
+	if ts.runLines != nil && ts.runKey == key {
+		return ts.runLines
+	}
+	e := textCacheEntryFor(ts.text, ts.literal)
+	for i := range e.runs {
+		if e.runs[i].lines != nil && e.runs[i].key == key {
+			ts.runLines, ts.runKey = e.runs[i].lines, key
+			return ts.runLines
+		}
+	}
+	lines := make([][]glyphRun, len(ts.procLines))
+	color := glyphColor{}
+	for i, line := range ts.procLines {
+		if ts.procTagged && strings.Contains(line, "<") {
+			lines[i] = ts.glyphRunsColored(line, &color)
+		} else {
+			lines[i] = []glyphRun{{text: line}}
+		}
+	}
+	e.runs[e.next].key, e.runs[e.next].lines = key, lines
+	e.next = (e.next + 1) % len(e.runs)
+	ts.runLines, ts.runKey = lines, key
+	return lines
+}
+
+// lineRuns is glyphRuns(line) for text with tags (a fresh color, as
+// glyphRuns starts), kept in lineRunCache until the glyph generation, device,
+// section or storyboard changes: TextWidth and the mouse's text hit test
+// measure the same tagged rows every frame.
+func (ts *TextSprite) lineRuns(line string) []glyphRun {
+	key := glyphRunKey{text: line, gen: sys.glyphGeneration(),
+		device: ts.glyphDevice, section: ts.glyphSection, story: ts.glyphStoryboard}
+	if runs, ok := lineRunCache[key]; ok {
+		return runs
+	}
+	if len(lineRunCache) >= textCacheMax {
+		clear(lineRunCache)
+	}
+	runs := ts.glyphRuns(line)
+	lineRunCache[key] = runs
+	return runs
+}
+
+// TEXT CACHES SHARED BY EVERY TextSprite. Menus draw their rows through one
+// sprite per style (main.lua f_menuItemTextDraw sets each row's text on the
+// menu's sprite, draws it and measures it), so a sprite's own cache is
+// replaced row after row; these keep each text's processing and glyph runs.
+// Keys are texts, so dynamic text (a timer) adds entries: past textCacheMax
+// the map starts over. Rendering state only, never part of the simulation.
+type textCacheKey struct {
+	text    string
+	literal bool
+}
+
+type textCacheEntry struct {
+	procText  string
+	procLines []string
+	tagged    bool
+	// The last few resolutions of the runs (a text drawn for several devices
+	// or sections at once, such as each player's hint), replaced in turn.
+	runs [4]struct {
+		key   glyphRunKey
+		lines [][]glyphRun
+	}
+	next int
+}
+
+const textCacheMax = 4096
+
+var (
+	textCache    = make(map[textCacheKey]*textCacheEntry)
+	lineRunCache = make(map[glyphRunKey][]glyphRun)
+)
+
+func textCacheEntryFor(text string, literal bool) *textCacheEntry {
+	k := textCacheKey{text, literal}
+	if e := textCache[k]; e != nil {
+		return e
+	}
+	if len(textCache) >= textCacheMax {
+		clear(textCache)
+	}
+	processed := strings.ReplaceAll(text, "\t", "    ")
+	if !literal {
+		processed = strings.ReplaceAll(processed, "\\n", "\n")
+	}
+	e := &textCacheEntry{
+		procText:  processed,
+		procLines: strings.Split(processed, "\n"),
+		tagged:    !literal && strings.Contains(processed, "<"),
+	}
+	textCache[k] = e
+	return e
 }
 
 // wrapText wraps the fullLine text based on the typedLen and other parameters
 func (ts *TextSprite) wrapText(fullLine string, typedLen int) {
 	// If typedLen <= 0, nothing to display
-	if ts.fnt == nil || ts.window[2] <= 0 {
+	if ts.fnt == nil || ts.drawWindow()[2] <= 0 {
 		return
 	}
 	// If typing hasn't started yet, make sure nothing is shown.
@@ -1079,17 +1555,56 @@ func (ts *TextSprite) wrapText(fullLine string, typedLen int) {
 		return
 	}
 
-	// Return byte index of the first n runes in s.
+	// Recognized inline tags are indivisible when wrapping or revealing text.
+	// Keep the source-rune cursor used by dialogue and storyboard timing.
+	tagLength := func(s string) int {
+		if ts.literal || len(s) == 0 || s[0] != '<' {
+			return 0
+		}
+		end := strings.IndexByte(s, '>')
+		if end < 0 {
+			return 0
+		}
+		tag := s[1:end]
+		if tag == "/" {
+			return end + 1
+		}
+		if hex, ok := colorTag(tag); ok {
+			if _, err := strconv.ParseUint(hex, 16, 24); err == nil {
+				return end + 1
+			}
+			return 0
+		}
+		tag = strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(tag, "&lt;", "<"), "&gt;", ">"), "&amp;", "&")
+		if _, ok := ts.resolveGlyph(tag); ok {
+			return end + 1
+		}
+		return 0
+	}
+
+	// Return the byte index after at most n source runes, stopping before a tag
+	// whose closing bracket has not been reached by the typewriter yet.
 	toByteIndex := func(s string, n int) int {
 		if n <= 0 {
 			return 0
 		}
 		count := 0
-		for idx := range s {
+		for idx := 0; idx < len(s); {
 			if count == n {
 				return idx
 			}
+			if size := tagLength(s[idx:]); size > 0 {
+				runes := utf8.RuneCountInString(s[idx : idx+size])
+				if count+runes > n {
+					return idx
+				}
+				count += runes
+				idx += size
+				continue
+			}
+			_, size := utf8.DecodeRuneInString(s[idx:])
 			count++
+			idx += size
 		}
 		return len(s)
 	}
@@ -1157,6 +1672,14 @@ func (ts *TextSprite) wrapText(fullLine string, typedLen int) {
 					if strings.HasPrefix(s[i:], "\\n") {
 						break
 					}
+					if ts.wrapChars && rawRunes > 0 {
+						break
+					}
+					if size := tagLength(s[i:]); size > 0 {
+						rawRunes += utf8.RuneCountInString(s[i : i+size])
+						i += size
+						continue
+					}
 					rr, ss := utf8.DecodeRuneInString(s[i:])
 					if rr == '\n' || rr == ' ' || rr == '\t' {
 						break
@@ -1189,13 +1712,11 @@ func (ts *TextSprite) wrapText(fullLine string, typedLen int) {
 		return
 	}
 
-	spacingXAdd := int32(math.Round(float64(ts.textSpacing[0])))
 	lineLen := ts.getLineLength(true)
 
 	measureWidth := func(text string) int32 {
-		// Draw() expands tabs to four spaces, so width calculation must do the same.
 		text = strings.ReplaceAll(text, "\t", "    ")
-		return int32(math.Round(float64(ts.fnt.TextWidth(text, ts.bank, spacingXAdd)) * float64(ts.xscl)))
+		return int32(math.Round(float64(ts.TextWidth(text)) * float64(ts.xscl)))
 	}
 
 	tokens := tokenize(fullLine)
@@ -1402,6 +1923,19 @@ func (ts *TextSprite) Update() {
 	if ts.palfx != nil {
 		ts.palfx.step()
 	}
+
+	// Shader time and animation
+	if ts.customShader.time > 0 {
+		ts.customShader.time--
+		if ts.customShader.time == 0 {
+			ts.customShader.clear()
+		}
+	}
+	if ts.customShader.name != "" {
+		ts.customShader.sTime++
+		ts.customShader.tex1.step()
+		ts.customShader.tex2.step()
+	}
 }
 
 func (ts *TextSprite) Draw(ln int16) {
@@ -1425,63 +1959,664 @@ func (ts *TextSprite) draw(ln int16, clip *[4]int32) {
 	// Preprocess (tab-expand, \n-decode, line split) once per distinct string.
 	// Usually a no-op here: textImgDraw already primed it on the source sprite.
 	ts.ensureProcessed()
-	text := ts.procText
-
-	maxChars := int32(len(text))
-
-	// If textDelay is greater than 0, it controls the maximum number of characters
-	if ts.textDelay > 0 {
-		// Offset the delay so that we show the first character immediately
-		elapsed := ts.elapsedTicks + ts.textDelay
-		maxChars = int32(elapsed / ts.textDelay)
+	// A text the font cannot draw goes whole to its [Files] fallback font.
+	if fb := ts.fnt.fallbackFor(ts.procText, ts.bank, ts.literal); fb != ts.fnt {
+		f := ts.fnt
+		ts.fnt = fb
+		ts.drawGlyphText(ts.procText, window)
+		ts.fnt = f
+		return
 	}
+	ts.drawGlyphText(ts.procText, window)
+}
 
-	maxChars = Clamp(maxChars, 0, int32(len(text)))
-	// Control of total displayed characters
-	totalCharsShown := 0
+// A piece of text, or a single inline glyph sprite.
+type glyphRun struct {
+	text  string
+	anim  *Animation
+	color glyphColor
+}
 
+type glyphColor struct {
+	rgb    [3]float32
+	active bool
+}
+
+// Input names refer directly to [Glyphs]. A glyph pack overrides only the group
+// and the image numbers that differ from the base keyboard or gamepad artwork.
+func (ts *TextSprite) bindingGlyph(token string, keyboard bool) []glyphRun {
+	m := &sys.motif
+	name := "gamepad." + token
+	kind := "gamepad"
+	if keyboard {
+		name = "keyboard." + token
+		kind = "keyboard"
+	}
+	if base := m.glyph(name); base != nil {
+		device := sys.glyphDevice(ts.glyphDevice)
+		set := input.GlyphPack(device, &m.ControllerGlyphs)
+		if device != nil && glyphDeviceType(device) != kind {
+			// Text naming the other kind's tokens never borrows this device's pack.
+			set = ""
+		}
+		fallback := "generic"
+		if keyboard {
+			fallback = "keyboard"
+		}
+		for _, id := range []string{set, fallback} {
+			variant := m.ControllerGlyphs.Controller[id]
+			if variant == nil || !strings.EqualFold(variant.Type, kind) {
+				continue
+			}
+			group, index := base.Spr[0], base.Spr[1]
+			if variant.Group >= 0 {
+				group = variant.Group
+			}
+			// Respect SDL's label/position preference when Nintendo artwork is used.
+			if !keyboard && (id == "switch" || id == "switch2" || id == "joycon") && input.GlyphSwapNintendo() {
+				swapped := map[string]string{"A": "B", "B": "A", "X": "Y", "Y": "X"}[token]
+				if g := m.glyph("gamepad." + swapped); g != nil {
+					index = g.Spr[1]
+				}
+			}
+			tokens := variant.Gamepad
+			if keyboard {
+				tokens = variant.Key
+			}
+			if value, ok := tokens[token]; ok {
+				index = value
+			}
+			if a := m.glyphAnimation(group, index); a != nil {
+				return []glyphRun{{anim: a}}
+			}
+		}
+	}
+	if a := m.namedGlyph(name); a != nil {
+		return []glyphRun{{anim: a}}
+	}
+	return []glyphRun{{text: token}}
+}
+
+// Glyph of the physical input behind a virtual control, found through the device's Controller Mapping.
+// Remote players and raw joysticks, whose inputs have no artwork, get the standard controller artwork.
+func (ts *TextSprite) virtualGlyph(vc VirtualControl) []glyphRun {
+	device := sys.glyphDevice(ts.glyphDevice)
+	if device == nil || !device.Connected || device.Raw {
+		return ts.bindingGlyph(vc.String(), false)
+	}
+	token := sys.inputCfg.mapping(device)[vc]
+	if token == "" || token == "-" {
+		return nil
+	}
+	return ts.bindingGlyph(token, device.Joy < 0)
+}
+
+// Glyph of an engine button: Button Setup -> virtual control -> physical input.
+func (ts *TextSprite) inputGlyph(key string) []glyphRun {
+	field := map[string]string{"U": "up", "D": "down", "L": "left", "B": "left",
+		"R": "right", "F": "right", "s": "start", "m": "menu"}[key]
+	if field == "" {
+		field = key
+	}
+	setup := sys.participantSetup(0)
+	if sys.netplay() && sys.menuPlayer > 0 {
+		setup = sys.channelSetup(sys.uiControllerKey(sys.menuPlayer - 1))
+	} else if device := sys.glyphDevice(ts.glyphDevice); device != nil {
+		if participant := sys.inputs.owner(device.ID); participant >= 0 {
+			// Paired devices share the primary device's setup. The active device
+			// still supplies its own physical Controller Mapping in virtualGlyph.
+			setup = sys.participantSetup(participant)
+		} else {
+			_, setup = sys.inputCfg.setup(device.Setup)
+		}
+	}
+	for i, name := range engineButtonNames {
+		if name == field {
+			if len(setup[i]) == 0 {
+				return nil
+			}
+			return ts.virtualGlyph(setup[i][0])
+		}
+	}
+	return []glyphRun{{text: key}}
+}
+
+// Reads a motif action for an <action:...> tag, preferring the screen this text
+// belongs to. player.* means the side of the active player.
+func (ts *TextSprite) glyphAction(path string) ([]string, error) {
+	if strings.HasPrefix(path, "player.") {
+		side := TS_Left
+		if device := sys.glyphDevice(ts.glyphDevice); device != nil {
+			if owner := sys.inputs.owner(device.ID); owner >= 0 && sys.inputs.Participants[owner].Side != TS_None {
+				side = sys.inputs.Participants[owner].Side
+			}
+		}
+		if nc := sys.inputConnection(); nc != nil {
+			side = TeamSide(nc.locIn%2 + 1)
+		}
+		path = fmt.Sprintf("p%d.%s", side, strings.TrimPrefix(path, "player."))
+	}
+	lookup := func(obj interface{}, query string) ([]string, bool) {
+		value, err := GetValue(obj, query)
+		action, ok := value.([]string)
+		return action, err == nil && ok
+	}
+	if ts.glyphStoryboard != nil {
+		if action, ok := lookup(ts.glyphStoryboard, "scenedef."+path+".action"); ok {
+			return action, nil
+		}
+	}
+	for scope := ts.glyphSection; scope != ""; {
+		if action, ok := lookup(&sys.motif, scope+"."+path+".action"); ok {
+			return action, nil
+		}
+		if i := strings.LastIndex(scope, "."); i >= 0 {
+			scope = scope[:i]
+		} else {
+			break
+		}
+	}
+	if action, ok := lookup(&sys.motif, path+".action"); ok {
+		return action, nil
+	}
+	return nil, fmt.Errorf("%s is not an action", path)
+}
+
+// Turns one <...> tag into a glyph or its text fallback. Unknown tags stay in the text as written.
+func (ts *TextSprite) resolveGlyph(tag string) ([]glyphRun, bool) {
+	// Nothing to look up before a motif is loaded.
+	if sys.motif.IniFile == nil {
+		return nil, false
+	}
+	if strings.HasPrefix(tag, "input:") {
+		return ts.inputGlyph(strings.TrimPrefix(tag, "input:")), true
+	}
+	if strings.HasPrefix(tag, "key:") {
+		return ts.bindingGlyph(strings.TrimPrefix(tag, "key:"), true), true
+	}
+	// <control:A> names action tokens directly, as an action would list them.
+	if strings.HasPrefix(tag, "control:") {
+		tokens := strings.Split(strings.TrimPrefix(tag, "control:"), ",")
+		for i := range tokens {
+			tokens[i] = strings.TrimSpace(tokens[i])
+		}
+		return ts.actionGlyphs(tokens), true
+	}
+	if strings.HasPrefix(tag, "virtual:") {
+		return ts.bindingGlyph(parseVirtualControl(strings.TrimPrefix(tag, "virtual:")).String(), false), true
+	}
+	// <controllericon> draws the icon of this device's glyph pack; <controllericon:name> a given pack.
+	if tag == "controllericon" || strings.HasPrefix(tag, "controllericon:") {
+		set := strings.TrimPrefix(strings.TrimPrefix(tag, "controllericon"), ":")
+		if set == "" {
+			device := sys.glyphDevice(ts.glyphDevice)
+			set = input.GlyphPack(device, &sys.motif.ControllerGlyphs)
+		}
+		if a := sys.motif.glyphPackIcon(strings.ToLower(set)); a != nil {
+			return []glyphRun{{anim: a}}, true
+		}
+		return nil, true
+	}
+	if strings.HasPrefix(tag, "action:") {
+		var tokens []string
+		paths := strings.Split(strings.TrimPrefix(tag, "action:"), ",")
+		for _, path := range paths {
+			action, err := ts.glyphAction(strings.TrimSpace(path))
+			if err != nil {
+				return nil, false
+			}
+			tokens = append(tokens, action...)
+		}
+		// Several actions show their directions in one order: up, down, left, right.
+		if len(paths) > 1 {
+			order := map[VirtualControl]int{
+				VC_DP_U: 0, VC_LS_YN: 0, VC_RS_YN: 0, VC_DP_D: 1, VC_LS_YP: 1, VC_RS_YP: 1,
+				VC_DP_L: 2, VC_LS_XN: 2, VC_RS_XN: 2, VC_DP_R: 3, VC_LS_XP: 3, VC_RS_XP: 3,
+			}
+			sort.SliceStable(tokens, func(i, j int) bool {
+				a, aok := order[parseVirtualControl(tokens[i])]
+				b, bok := order[parseVirtualControl(tokens[j])]
+				return aok && (!bok || a < b)
+			})
+		}
+		return ts.actionGlyphs(tokens), true
+	}
+	// <glyph:NAME> draws a [Glyphs] entry as it is, without Mirror Commands or Command Display.
+	if strings.HasPrefix(tag, "glyph:") {
+		if a := sys.motif.namedGlyph(strings.TrimPrefix(tag, "glyph:")); a != nil {
+			return []glyphRun{{anim: a}}, true
+		}
+		return nil, true
+	}
+	// Mirror Commands flips the glyphs while the player who opened the pause menu faces left.
+	if sys.cfg.Input.CommandMirror {
+		p := sys.menuPlayer - 1
+		// The menu owner is an input slot. Turns fighters stay in P1/P2 even
+		// when the active co-op member is controlled through P3/P4 or later.
+		if p >= 0 && p < MaxSimul*2 && sys.tmode[p&1] == TM_Turns {
+			p &= 1
+		}
+		if p >= 0 && p < len(sys.chars) && len(sys.chars[p]) > 0 &&
+			sys.chars[p][0] != nil && sys.chars[p][0].facing < 0 {
+			if mirror, ok := sys.motif.ControllerGlyphs.Mirror[tag]; ok {
+				tag = mirror
+			}
+		}
+	}
+	// Command Display set to Mapping shows the key or button bound to the engine button.
+	if button, ok := sys.motif.ControllerGlyphs.Command[tag]; ok && sys.cfg.Input.CommandMapping {
+		if device := sys.glyphDevice(ts.glyphDevice); device != nil && device.Connected {
+			if runs := ts.inputGlyph(button); len(runs) == 1 && runs[0].anim != nil {
+				return runs, true
+			}
+		}
+	}
+	if a := sys.motif.namedGlyph(tag); a != nil {
+		return []glyphRun{{anim: a}}, true
+	}
+	return nil, false
+}
+
+// The glyphs of an action's tokens. A keyboard shows its KEY: tokens and the mouse its
+// MOUSE: tokens, and an action with only those shows them on every device.
+func (ts *TextSprite) actionGlyphs(tokens []string) []glyphRun {
+	// The left stick usually repeats the d-pad in an action; show the d-pad only.
+	listed := make(map[VirtualControl]bool)
+	for _, token := range tokens {
+		listed[parseVirtualControl(token)] = true
+	}
+	dpad := map[VirtualControl]VirtualControl{VC_LS_YN: VC_DP_U, VC_LS_YP: VC_DP_D, VC_LS_XN: VC_DP_L, VC_LS_XP: VC_DP_R}
+	device := sys.glyphDevice(ts.glyphDevice)
+	hasKey, hasMouse, hasVirtual := false, false, false
+	for _, token := range tokens {
+		if _, ok := actionKey(token); ok {
+			hasKey = true
+		} else if _, ok := actionMouse(token); ok {
+			hasMouse = true
+		} else if _, ok := actionButton(token); ok || parseVirtualControl(token) != VC_None {
+			hasVirtual = true
+		}
+	}
+	mouseOnly := hasMouse && (sys.hintGlyphPack(device) == "mouse" || !hasKey && !hasVirtual)
+	keysOnly := !mouseOnly && hasKey && (device == nil || device.Joy < 0 || !hasVirtual)
+	var runs []glyphRun
+	for _, token := range tokens {
+		if button, ok := actionMouse(token); ok {
+			if mouseOnly {
+				runs = append(runs, ts.mouseGlyph(button)...)
+			}
+		} else if mouseOnly {
+			continue
+		} else if key, ok := actionKey(token); ok {
+			if keysOnly {
+				runs = append(runs, ts.bindingGlyph(KeyToString(key), true)...)
+			}
+		} else if keysOnly {
+			continue
+		} else if button, ok := actionButton(token); ok {
+			runs = append(runs, ts.inputGlyph(engineButtonNames[button])...)
+		} else if vc := parseVirtualControl(token); vc != VC_None {
+			if d, ok := dpad[vc]; ok && listed[d] {
+				continue
+			}
+			runs = append(runs, ts.virtualGlyph(vc)...)
+		} else if len(tokens) == 1 {
+			runs = append(runs, glyphRun{text: token})
+		}
+	}
+	return runs
+}
+
+// A mouse button from [Glyphs] <mouse.LEFT> and so on, or its name.
+func (ts *TextSprite) mouseGlyph(button int) []glyphRun {
+	if a := sys.motif.namedGlyph("mouse." + mouseButtonNames[button]); a != nil {
+		return []glyphRun{{anim: a}}
+	}
+	return []glyphRun{{text: mouseButtonNames[button]}}
+}
+
+// Splits text into colored runs and inline glyphs.
+func (ts *TextSprite) glyphRuns(text string) []glyphRun {
+	color := glyphColor{}
+	return ts.glyphRunsColored(text, &color)
+}
+
+// Hex color of a <color:RRGGBB> tag. <#RRGGBB> also works where "#" isn't an ini comment, e.g. movelists.
+func colorTag(tag string) (string, bool) {
+	if hex, ok := strings.CutPrefix(tag, "color:"); ok && len(hex) == 6 {
+		return hex, true
+	}
+	if len(tag) == 7 && tag[0] == '#' {
+		return tag[1:], true
+	}
+	return "", false
+}
+
+func (ts *TextSprite) glyphRunsColored(text string, color *glyphColor) []glyphRun {
+	var runs []glyphRun
+	appendRuns := func(parts ...glyphRun) {
+		for _, part := range parts {
+			if part.anim == nil && part.text == "" {
+				continue
+			}
+			part.color = *color
+			if n := len(runs); n > 0 && runs[n-1].anim == nil && part.anim == nil && runs[n-1].color == part.color {
+				runs[n-1].text += part.text
+			} else {
+				runs = append(runs, part)
+			}
+		}
+	}
+	for len(text) > 0 {
+		start := strings.IndexByte(text, '<')
+		if start < 0 {
+			appendRuns(glyphRun{text: text})
+			break
+		}
+		end := strings.IndexByte(text[start:], '>')
+		if end < 0 {
+			appendRuns(glyphRun{text: text})
+			break
+		}
+		end += start
+		if start > 0 {
+			appendRuns(glyphRun{text: text[:start]})
+		}
+		tag := text[start+1 : end]
+		if tag == "/" {
+			*color = glyphColor{}
+		} else if hex, ok := colorTag(tag); ok {
+			if rgb, err := strconv.ParseUint(hex, 16, 24); err == nil {
+				*color = glyphColor{rgb: [3]float32{float32(rgb>>16) / 255, float32((rgb>>8)&255) / 255, float32(rgb&255) / 255}, active: true}
+			} else {
+				appendRuns(glyphRun{text: text[start : end+1]})
+			}
+		} else {
+			tag = strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(tag, "&lt;", "<"), "&gt;", ">"), "&amp;", "&")
+			if g, ok := ts.resolveGlyph(tag); ok {
+				appendRuns(g...)
+			} else {
+				appendRuns(glyphRun{text: text[start : end+1]})
+			}
+		}
+		text = text[end+1:]
+	}
+	return runs
+}
+
+// Width of a glyph scaled to the font height, in text units.
+func (ts *TextSprite) glyphWidth(a *Animation) float32 {
+	if a == nil || a.spr == nil || a.spr.Size[1] == 0 || ts.xscl == 0 {
+		return 0
+	}
+	return float32(ts.fnt.Size[1]) * float32(a.spr.Size[0]) / float32(a.spr.Size[1]) * ts.fnt.glyphScale[0] * Abs(ts.yscl/ts.xscl)
+}
+
+// Apply configured glyph spacing once at any text/glyph or glyph/glyph boundary.
+// Like the font's own spacing it is in font pixels, so it follows the text scale.
+// Ordinary text-run boundaries retain font and text character spacing.
+func (ts *TextSprite) glyphRunSpacing(run, next glyphRun) float32 {
+	if run.anim != nil || next.anim != nil {
+		return ts.fnt.glyphSpacing
+	}
+	spacing := float32(math.Round(float64(ts.textSpacing[0])))
+	if ts.fnt.Type != "truetype" {
+		spacing += float32(ts.fnt.Spacing[0])
+	}
+	return spacing
+}
+
+func (ts *TextSprite) glyphTextWidth(runs []glyphRun) float32 {
+	var width float32
+	spacing := int32(math.Round(float64(ts.textSpacing[0])))
+	for i, run := range runs {
+		if i > 0 {
+			width += ts.glyphRunSpacing(runs[i-1], run)
+		}
+		width += ts.glyphWidth(run.anim) + ts.fnt.lineWidth(run.text, ts.bank, spacing, ts.yscl)
+	}
+	return width
+}
+
+// How far glyphs reach below the bottom of the text line.
+func (ts *TextSprite) glyphDescent() float32 {
+	if ts.fnt.Type != "truetype" || ts.fnt.ttf == nil {
+		return 0
+	}
+	metrics := ts.fnt.ttf.Metrics()
+	if height := metrics.Ascent + metrics.Descent; height > 0 {
+		// TrueType glyphs sit partly below the baseline, like the font's letters.
+		return float32(ts.fnt.Size[1]) * float32(metrics.Descent) / float32(height) * ts.yscl
+	}
+	return 0
+}
+
+// Top and bottom of a text line, made taller to fit its glyphs.
+// Measured from the top of the line, so top is negative if a glyph sticks out above.
+func (ts *TextSprite) glyphLineExtent(line string, height float32) (top, bottom float32) {
+	bottom = height
+	if ts.literal || !strings.Contains(line, "<") {
+		return
+	}
+	for _, run := range ts.lineRuns(line) {
+		if run.anim == nil || run.anim.spr == nil || run.anim.spr.Size[1] == 0 {
+			continue
+		}
+		// All glyphs have the same height, so checking one is enough.
+		glyphBottom := height + ts.glyphDescent() + ts.fnt.glyphOffset[1]*ts.localScale
+		glyphTop := glyphBottom - float32(ts.fnt.Size[1])*ts.yscl*ts.fnt.glyphScale[1]
+		return min(0, glyphTop), max(height, glyphBottom)
+	}
+	return
+}
+
+// Draws text with inline glyphs. Glyph anims are copied first, because the same glyph
+// can appear on several rows with different alpha.
+func (ts *TextSprite) drawGlyphText(text string, window [4]int32) {
+	if ts.xscl == 0 || ts.yscl == 0 {
+		return
+	}
+	f := ts.fnt
+	// Bottom of a line and its rotation point below y, as DrawText places a bitmap cell.
+	bottom := float32(f.offset[1]+1) * ts.yscl
+	yOffset := sys.gameHeight - 240
+	pivotY := float32(f.offset[1]-int32(f.Size[1])+1)*ts.yscl + yOffset
+	if f.Type == "truetype" {
+		// TrueType y is a baseline, and DrawTtf has no bitmap screen offset.
+		bottom, yOffset, pivotY = ts.glyphDescent(), 0, 0
+	}
 	// "phantom pixel" adjustment to match mugen flipping behavior (extra pixel)
 	var phantomX float32
 	if ts.align == -1 {
-		phantomX = 1 * ts.localScale
+		phantomX = ts.localScale
 	}
-
-	lines := ts.procLines
-
-	spacingXAdd := int32(math.Round(float64(ts.textSpacing[0])))
-
-	for i, line := range lines {
-		lineLength := len(line)
-
-		// Shows the characters progressively
-		charsToShow := int(Min(int32(lineLength), maxChars-int32(totalCharsShown)))
-		if charsToShow <= 0 {
-			continue
-		}
-
-		newY := ts.y + float32(i)*((float32(ts.fnt.Size[1])+float32(ts.fnt.Spacing[1])+ts.textSpacing[1])*ts.yscl)
-
-		// Xshear offset correction
-		xshear := -ts.xshear
-		xsoffset := xshear * (float32(ts.fnt.offset[1]) * ts.yscl)
-
-		// Draw the visible line
-		if ts.fnt.Type == "truetype" {
-			ts.fnt.DrawTtf(line[:charsToShow], ts.x+ts.vel[0]-xsoffset+phantomX, newY+ts.vel[1], ts.xscl, ts.yscl,
-				xshear, ts.rot, ts.projection, ts.fLength, ts.align, true, &window, ts.frgba, ts.palfx, float32(spacingXAdd))
+	// Number of characters still to draw, for the typewriter effect.
+	remaining := math.MaxInt
+	if ts.textDelay > 0 {
+		remaining = int((ts.elapsedTicks + ts.textDelay) / ts.textDelay)
+	}
+	spacing := int32(math.Round(float64(ts.textSpacing[0])))
+	color := glyphColor{}
+	// draw passes the cached text (ensureProcessed), whose lines and glyph runs
+	// are cached too (cachedRuns): nothing is split or resolved again while the
+	// text, its tags' inputs and the glyph generation stay the same. Other
+	// callers (lifebar text) resolve their string here, as before.
+	var cached [][]glyphRun
+	var lines []string
+	if ts.procLines != nil && text == ts.procText {
+		cached = ts.cachedRuns()
+	} else {
+		lines = strings.Split(text, "\n")
+	}
+	var one [1]glyphRun
+	count := len(cached)
+	if cached == nil {
+		count = len(lines)
+	}
+	for i := 0; i < count; i++ {
+		var runs []glyphRun
+		if cached != nil {
+			runs = cached[i]
+		} else if line := lines[i]; !ts.literal && strings.Contains(line, "<") {
+			runs = ts.glyphRunsColored(line, &color)
 		} else {
-			ts.fnt.DrawText(line[:charsToShow], ts.x+ts.vel[0]-xsoffset+phantomX, newY+ts.vel[1], ts.xscl, ts.yscl,
-				xshear, ts.rot, ts.projection, ts.fLength, ts.bank, ts.align, &window, ts.frgba, ts.palfx, spacingXAdd)
+			one[0] = glyphRun{text: line}
+			runs = one[:]
 		}
-
-		totalCharsShown += charsToShow
-		if totalCharsShown >= int(maxChars) {
-			break
+		x := ts.x + ts.vel[0] + phantomX
+		y := ts.y + ts.vel[1] + float32(i)*(float32(f.Size[1])+float32(f.Spacing[1])+ts.textSpacing[1])*ts.yscl
+		// Every run is drawn from the same line start and rotation point, moved along the
+		// line by advance (font pixels). Alignment uses the width of the whole line.
+		var advance float32
+		if ts.align == 0 {
+			advance = -ts.glyphTextWidth(runs) / 2
+		} else if ts.align == -1 {
+			advance = -ts.glyphTextWidth(runs)
+		}
+		for n, run := range runs {
+			if remaining <= 0 {
+				return
+			}
+			if n > 0 {
+				advance += ts.glyphRunSpacing(runs[n-1], run)
+			}
+			if run.anim != nil && run.anim.spr != nil {
+				ts.drawGlyph(run.anim, run.color, x, y, advance, bottom, pivotY, float32(yOffset), window)
+				advance += ts.glyphWidth(run.anim)
+				remaining--
+			}
+			if run.text != "" && remaining > 0 {
+				visible, typed := runePrefix(run.text, remaining)
+				xpos := x + ts.xshear*float32(f.offset[1])*ts.yscl
+				frgba := ts.frgba
+				if run.color.active {
+					copy(frgba[:3], run.color.rgb[:])
+				}
+				// Through package scratch: &window of the parameter escapes into
+				// the draws and moved window to the heap on every call.
+				glyphTextWindow = window
+				if f.Type == "truetype" {
+					f.DrawTtf(visible, xpos, y, ts.xscl, ts.yscl, -ts.xshear, ts.rot, ts.projection, ts.fLength, 1, true, &glyphTextWindow, frgba, ts.trans, ts.alpha, ts.palfx, float32(spacing), advance, ts.customShader.renderData(true))
+					for b := float32(1); b <= f.bold; b++ {
+						glyphTextWindow = window
+						f.DrawTtf(visible, xpos, y, ts.xscl, ts.yscl, -ts.xshear, ts.rot, ts.projection, ts.fLength, 1, true, &glyphTextWindow, frgba, ts.trans, ts.alpha, ts.palfx, float32(spacing), advance+b, ts.customShader.renderData(true))
+					}
+				} else {
+					f.DrawText(visible, xpos, y, ts.xscl, ts.yscl, -ts.xshear, ts.rot, ts.projection, ts.fLength, ts.bank, 1, &glyphTextWindow, frgba, ts.trans, ts.alpha, ts.palfx, spacing, advance, ts.customShader.renderData(true))
+				}
+				advance += f.lineWidth(visible, ts.bank, spacing, ts.yscl)
+				remaining -= typed
+			}
 		}
 	}
 }
 
+// runePrefix returns the first n runes of s (all of s when it has fewer) and
+// how many runes that is, without converting s to a rune slice. Text without
+// the typewriter effect asks for math.MaxInt runes and gets s itself.
+func runePrefix(s string, n int) (string, int) {
+	if n >= len(s) {
+		return s, utf8.RuneCountInString(s)
+	}
+	count := 0
+	for i := range s {
+		if count == n {
+			return s[:i], count
+		}
+		count++
+	}
+	return s, count
+}
+
+// Draws one inline glyph advance font pixels along the line that starts at x, y.
+func (ts *TextSprite) drawGlyph(src *Animation, color glyphColor, x, y, advance, bottom, pivotY, yOffset float32, window [4]int32) {
+	f := ts.fnt
+	// A copy, because the same glyph can appear on several rows with different
+	// alpha. It lives in package scratch: a local copy escapes into Draw and was
+	// allocated for every glyph on every frame. Drawing is immediate
+	// (RenderSprite), so one scratch serves every glyph.
+	glyphDrawAnim = *src
+	a := &glyphDrawAnim
+	// Flipped text mirrors its glyphs too.
+	scale := float32(f.Size[1]) * Abs(ts.yscl) / float32(a.spr.Size[1])
+	xs, ys := scale*f.glyphScale[0]*Sign(ts.xscl), scale*f.glyphScale[1]*Sign(ts.yscl)
+	// A smaller copy of the art when the glyph is drawn much smaller than it
+	// (image.go glyphMipLevels); its scale grows by as much as it is smaller.
+	if spr := glyphMip(a.spr, float32(a.spr.Size[1])*Abs(ys)*sys.heightScale); spr != a.spr {
+		xs *= float32(a.spr.Size[0]) / float32(spr.Size[0])
+		ys *= float32(a.spr.Size[1]) / float32(spr.Size[1])
+		a.spr = spr
+	}
+	a.transType = TT_add
+	a.srcAlpha = int16(255 * Clamp(ts.frgba[3], float32(0), float32(1)))
+	a.dstAlpha = 255 - a.srcAlpha
+	if ts.trans != TT_default {
+		a.transType = ts.trans
+		a.srcAlpha, a.dstAlpha = int16(ts.alpha[0]), int16(ts.alpha[1])
+	}
+	// Unrotated bitmap text is mirrored around its start, so a flipped line still runs to the right.
+	step := ts.xscl
+	if f.Type != "truetype" && ts.rot.IsZero() {
+		step = Abs(ts.xscl)
+	}
+	lineX := x + float32(f.offset[0])*ts.xscl + (sys.gameWidth-320)/2
+	// Align the glyph's bottom independently of its SFF axes.
+	xpos := lineX + advance*step + float32(a.spr.Offset[0])*xs + f.glyphOffset[0]*ts.localScale
+	ypos := y + bottom + float32(int32(a.spr.Offset[1])-int32(a.spr.Size[1]))*ys + f.glyphOffset[1]*ts.localScale + yOffset
+	xpos += ts.xshear * float32(a.spr.Offset[1]) * ys
+	// Rotated glyphs turn around the line's rotation point, like the text.
+	var pivot [2]float32
+	if !ts.rot.IsZero() {
+		pivot = [2]float32{lineX - xpos, y + pivotY - ypos}
+	}
+	// Glyphs take the color of the text around them, like sprite font characters.
+	rgb := ts.frgba
+	if color.active {
+		copy(rgb[:3], color.rgb[:])
+	}
+	pfx := glyphStackedColor(ts.palfx, rgb[0], rgb[1], rgb[2])
+	glyphDrawWindow = window
+	a.Draw(&glyphDrawWindow, xpos, ypos, 1, 1, xs, xs, ys, -ts.xshear, ts.rot, 0, pivot, pfx, 1, [2]float32{1, 1}, ts.projection, ts.fLength, false, CustomShaderRenderData{})
+}
+
+// The smallest of a glyph sprite's copies (itself first, then each half the
+// one before) that is still at least px pixels tall on screen.
+func glyphMip(spr *Sprite, px float32) *Sprite {
+	best := spr
+	for _, m := range spr.mips {
+		if m == nil || m.Tex == nil || float32(m.Size[1]) < px {
+			break
+		}
+		best = m
+	}
+	return best
+}
+
+var (
+	glyphDrawAnim   Animation
+	glyphDrawWindow [4]int32
+	glyphDrawPalFX  PalFX
+	glyphTextWindow [4]int32
+)
+
+// PalFX.withStackedColor written into glyphDrawPalFX instead of a new PalFX.
+func glyphStackedColor(pf *PalFX, r, g, b float32) *PalFX {
+	if r == 1.0 && g == 1.0 && b == 1.0 {
+		return pf
+	}
+	glyphDrawPalFX = pf.sample()
+	if pf != nil {
+		glyphDrawPalFX.remap = pf.remap
+	}
+	glyphDrawPalFX.eMul[0] = int32(float32(glyphDrawPalFX.eMul[0]) * r)
+	glyphDrawPalFX.eMul[1] = int32(float32(glyphDrawPalFX.eMul[1]) * g)
+	glyphDrawPalFX.eMul[2] = int32(float32(glyphDrawPalFX.eMul[2]) * b)
+	return &glyphDrawPalFX
+}
+
 func (ts *TextSprite) Reset() {
+	ts.glyphDevice = 0
+	ts.trans, ts.alpha = ts.transInit, ts.alphaInit
 	ts.SetPos(ts.offsetInit[0], ts.offsetInit[1])
 	ts.SetScale(ts.scaleInit[0], ts.scaleInit[1])
 	ts.SetWindow(ts.windowInit)

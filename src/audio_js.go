@@ -8,7 +8,7 @@ import (
 	"sync"
 
 	"github.com/ebitengine/oto/v3"
-	"github.com/gopxl/beep/v2"
+	"github.com/ikemen-engine/beep/v2"
 )
 
 // Browser audio sink: beep.Mixer pulled by an oto/v3 player (WebAudio).
@@ -105,6 +105,12 @@ func (s *BeepSpeaker) Close() {
 
 // FillAudio is the SDL pull-model hook; oto's player drives itself.
 func (s *BeepSpeaker) FillAudio() {}
+
+// platformAudioResampleQuality pins Sound.AudioResampleQuality to 1 in the
+// browser (Decision 9): every voice is resampled on the single wasm thread, and
+// upstream's default of 4 costs several times more per sample. The config
+// loader writes the pinned value back, so it is stamped on every boot.
+func platformAudioResampleQuality(q int) int { return 1 }
 
 func newSpeaker() AudioSink {
 	return &BeepSpeaker{}

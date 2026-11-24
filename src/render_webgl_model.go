@@ -100,6 +100,9 @@ var wglModelCubeSamplers = []string{"lambertianEnvSampler", "GGXEnvSampler"}
 
 type wglModel struct {
 	enabled bool
+	// The pipeline was built completely (initModelPipeline returned nil), so a
+	// runtime re-enable (SetModelOptions) can reuse it.
+	built bool
 	// Float color attachments are available, so environment lighting renders.
 	envOK bool
 
@@ -213,6 +216,7 @@ func (r *Renderer_WebGL) initModel() {
 		m.enabled = false
 		return
 	}
+	m.built = true
 	m.enabled = true
 }
 
@@ -340,6 +344,16 @@ func (r *Renderer_WebGL) initModelPipeline() error {
 		r.ChangeProgram(s)
 		for name, unit := range s.textures {
 			r.SetUniformISub(s, s.uniformIndex(name), int32(unit))
+		}
+	}
+	// The environment passes reuse ident.vert, which places its quad with
+	// OutputTransform; left at vec4(0) the quad collapses to a point. These
+	// passes fill their whole target, so the transform is the identity.
+	for _, s := range []*ShaderProgram_WebGL{m.panorama, m.filter} {
+		s.RegisterUniforms("OutputTransform")
+		if idx := s.uniformIndex("OutputTransform"); idx >= 0 {
+			r.ChangeProgram(s)
+			r.SetUniformFSub(s, idx, 1, 1, 0, 0)
 		}
 	}
 	r.flushCmds()
@@ -487,7 +501,8 @@ func (r *Renderer_WebGL) prepareModelPipeline(bufferIndex uint32, env *Environme
 	r.emitI(wcBindVAO)
 	r.emitI(m.vaoID)
 	r.glc("bindFramebuffer", r.c("FRAMEBUFFER"), r.fbo)
-	r.glc("viewport", 0, 0, sys.scrrect[2], sys.scrrect[3])
+	viewport := sys.currentDrawViewport()
+	r.SetViewport(viewport[0], viewport[1], viewport[2], viewport[3])
 	r.SetDepthMask(true)
 	r.glc("clear", r.ci("DEPTH_BUFFER_BIT"))
 	// As upstream: blending on with the current function; each primitive sets
@@ -934,15 +949,17 @@ func halveRGBA8(src []byte, w, h int32) ([]byte, int32, int32) {
 	return dst, nw, nh
 }
 
-func (r *Renderer_WebGL) newModelTexture(width, height, depth int32, filter bool) Texture {
+// The model texture constructors never fail on WebGL (createTexture does not
+// report an error); the error return is the interface's.
+func (r *Renderer_WebGL) newModelTexture(width, height, depth int32, filter bool) (Texture, error) {
 	// SetDataG gives it its storage, mipmaps and sampling.
 	r.SetActiveTexture0()
 	t := r.generateTexture(width, height, depth, filter)
 	r.gcRelease(t)
-	return t
+	return t, nil
 }
 
-func (r *Renderer_WebGL) newDataTexture(width, height int32) Texture {
+func (r *Renderer_WebGL) newDataTexture(width, height int32) (Texture, error) {
 	r.SetActiveTexture0()
 	t := r.generateTexture(width, height, 128, false)
 	r.glc("bindTexture", r.c("TEXTURE_2D"), t.handle)
@@ -951,12 +968,12 @@ func (r *Renderer_WebGL) newDataTexture(width, height int32) Texture {
 	r.glc("texParameteri", r.c("TEXTURE_2D"), r.c("TEXTURE_WRAP_S"), r.c("CLAMP_TO_EDGE"))
 	r.glc("texParameteri", r.c("TEXTURE_2D"), r.c("TEXTURE_WRAP_T"), r.c("CLAMP_TO_EDGE"))
 	r.gcRelease(t)
-	return t
+	return t, nil
 }
 
 // newHDRTexture holds the environment panorama. RGBA16F, not RGBA32F: it is
 // sampled LINEAR, which 32-bit float needs OES_texture_float_linear for.
-func (r *Renderer_WebGL) newHDRTexture(width, height int32) Texture {
+func (r *Renderer_WebGL) newHDRTexture(width, height int32) (Texture, error) {
 	r.SetActiveTexture0()
 	t := r.generateTexture(width, height, 128, false)
 	t.halfFloat = true
@@ -966,18 +983,18 @@ func (r *Renderer_WebGL) newHDRTexture(width, height int32) Texture {
 	r.glc("texParameteri", r.c("TEXTURE_2D"), r.c("TEXTURE_WRAP_S"), r.c("MIRRORED_REPEAT"))
 	r.glc("texParameteri", r.c("TEXTURE_2D"), r.c("TEXTURE_WRAP_T"), r.c("MIRRORED_REPEAT"))
 	r.gcRelease(t)
-	return t
+	return t, nil
 }
 
 // newCubeMapTexture: RGBA16F faces (HALF_FLOAT, as render_gles32.go). Without
 // float color buffers the environment is never rendered, so no storage.
-func (r *Renderer_WebGL) newCubeMapTexture(widthHeight int32, mipmap bool, lowestMipLevel int32) Texture {
+func (r *Renderer_WebGL) newCubeMapTexture(widthHeight int32, mipmap bool, lowestMipLevel int32) (Texture, error) {
 	r.SetActiveTexture0()
 	t := r.generateTexture(widthHeight, widthHeight, 24, false)
 	t.cube = true
 	r.gcRelease(t)
 	if !r.model.envOK {
-		return t
+		return t, nil
 	}
 	cube := r.c("TEXTURE_CUBE_MAP")
 	r.glc("bindTexture", cube, t.handle)
@@ -995,7 +1012,7 @@ func (r *Renderer_WebGL) newCubeMapTexture(widthHeight int32, mipmap bool, lowes
 	r.glc("texParameteri", cube, r.c("TEXTURE_WRAP_S"), r.c("CLAMP_TO_EDGE"))
 	r.glc("texParameteri", cube, r.c("TEXTURE_WRAP_T"), r.c("CLAMP_TO_EDGE"))
 	r.glc("bindTexture", cube, js.Null())
-	return t
+	return t, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1003,8 +1020,8 @@ func (r *Renderer_WebGL) newCubeMapTexture(widthHeight int32, mipmap bool, lowes
 //
 // These run once per environment load, from a main-thread task: between
 // frames, or mid-frame when a loader drains the task queue. They leave the
-// scene framebuffer bound with the full viewport, and blend/depth/scissor/cull
-// as they found them.
+// scene framebuffer bound with the current draw viewport, and
+// blend/depth/scissor/cull as they found them.
 
 type wglEnvPass struct {
 	blend    bool
@@ -1029,7 +1046,8 @@ func (r *Renderer_WebGL) endEnvPass(p wglEnvPass) {
 	r.glc("framebufferTexture2D", r.c("FRAMEBUFFER"), r.c("COLOR_ATTACHMENT0"), r.c("TEXTURE_2D"), js.Null(), 0)
 	r.glc("bindVertexArray", js.Null())
 	r.glc("bindFramebuffer", r.c("FRAMEBUFFER"), r.fbo)
-	r.glc("viewport", 0, 0, sys.scrrect[2], sys.scrrect[3])
+	viewport := sys.currentDrawViewport()
+	r.SetViewport(viewport[0], viewport[1], viewport[2], viewport[3])
 	r.glc("activeTexture", r.ci("TEXTURE0"))
 	r.glc("bindTexture", r.c("TEXTURE_2D"), js.Null())
 	r.glc("bindTexture", r.c("TEXTURE_CUBE_MAP"), js.Null())
@@ -1072,7 +1090,7 @@ func (r *Renderer_WebGL) RenderCubeMap(envTex Texture, cubeTex Texture) {
 	p := r.beginEnvPass(s, r.model.panoramaVAO)
 	defer r.endEnvPass(p)
 	size := cube.width
-	r.glc("viewport", 0, 0, size, size)
+	r.glViewport(0, 0, size, size)
 	unit := s.textures["panorama"]
 	r.glc("activeTexture", r.ci("TEXTURE0")+unit)
 	r.glc("bindTexture", r.c("TEXTURE_2D"), env.handle)
@@ -1110,7 +1128,7 @@ func (r *Renderer_WebGL) RenderFilteredCubeMap(distribution int32, cubeTex Textu
 	p := r.beginEnvPass(s, r.model.filterVAO)
 	defer r.endEnvPass(p)
 	size := filtered.width >> mipmapLevel
-	r.glc("viewport", 0, 0, size, size)
+	r.glViewport(0, 0, size, size)
 	unit := s.textures["cubeMap"]
 	r.glc("activeTexture", r.ci("TEXTURE0")+unit)
 	r.glc("bindTexture", r.c("TEXTURE_CUBE_MAP"), cube.handle)
@@ -1134,7 +1152,7 @@ func (r *Renderer_WebGL) RenderLUT(distribution int32, cubeTex Texture, lutTex T
 	s := r.model.filter
 	p := r.beginEnvPass(s, r.model.filterVAO)
 	defer r.endEnvPass(p)
-	r.glc("viewport", 0, 0, lut.width, lut.height)
+	r.glViewport(0, 0, lut.width, lut.height)
 	unit := s.textures["cubeMap"]
 	r.glc("activeTexture", r.ci("TEXTURE0")+unit)
 	// The LUT becomes a half-float render target. Re-specified on a unit the

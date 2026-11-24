@@ -9,14 +9,18 @@ type stageCamera struct {
 	boundright              int32
 	boundhigh               int32
 	boundlow                int32
+	zboundtop               int32
+	zboundbot               int32
 	verticalfollow          float32
 	floortension            int32
 	tensionhigh             int32
 	tensionlow              int32
 	lowestcap               bool
 	tension                 int32
+	ztension                int32
 	tensionvel              float32
-	overdrawhigh            int32 // TODO: not implemented
+	ztensionvel             float32
+	overdrawhigh            int32 // TODO: left and right, probably. Because EnvShake has angles now
 	overdrawlow             int32
 	cuthigh                 int32
 	cutlow                  int32
@@ -33,6 +37,7 @@ type stageCamera struct {
 	zoomout                 float32
 	ytensionenable          bool
 	autocenter              bool
+	zautocenter             bool
 	zoomanchor              bool
 	boundhighzoomdelta      float32
 	verticalfollowzoomdelta float32
@@ -48,8 +53,13 @@ type stageCamera struct {
 	aspectcorrection        float32
 	zoomanchorcorrection    float32
 	ywithoutbound           float32
+	zwithoutbound           float32
 	highest                 float32
 	prevHighest             float32
+	zfrontest               float32
+	prevZfrontest           float32
+	zbackest                float32
+	prevZbackest            float32
 	lowest                  float32
 	prevLowest              float32
 	leftest                 float32
@@ -58,23 +68,31 @@ type stageCamera struct {
 	prevRightest            float32
 	leftestvel              float32
 	rightestvel             float32
-	snapToTarget            bool
+	skipSmoothing           bool
 	maxRight                float32
 	minLeft                 float32
 	autoZoom                bool
 }
 
 func newStageCamera() *stageCamera {
-	return &stageCamera{verticalfollow: 0.2, tensionvel: 1, tension: 50,
-		cuthigh: 0, cutlow: math.MinInt32,
-		localcoord: [2]int32{320, 240},
-		localscl:   sys.gameWidth / 320,
-		topz:       0, botz: 0, ztopscale: 1, zbotscale: 1, depthtoscreen: 1,
-		startzoom: 1, zoomin: 1, zoomout: 1,
-		ytensionenable: false, tensionhigh: 0, tensionlow: 0,
+	return &stageCamera{
+		localcoord:     [2]int32{320, 240},
+		localscl:       sys.gameWidth / 320,
+		verticalfollow: 0.2,
+		ytensionenable: false,
+		tensionhigh:    0,
+		ztensionvel:    1, tensionlow: 0,
+		tension:    50,
+		tensionvel: 1,
+		cuthigh:    0, cutlow: math.MinInt32,
+		startzoom: 1, zoomout: 1, zoomin: 1,
+		zoomindelay: 0, zoominspeed: 1, zoomoutspeed: 1,
+		topz: 0, botz: 0, ztopscale: 1, zbotscale: 1, depthtoscreen: 1,
 		fov: 40, yshift: 0, far: 10000, near: 0.1,
-		zoomindelay: 0, zoominspeed: 1, zoomoutspeed: 1, yscrollspeed: 1,
-		boundhighzoomdelta: 0, verticalfollowzoomdelta: 0}
+		yscrollspeed:            1,
+		boundhighzoomdelta:      0,
+		verticalfollowzoomdelta: 0,
+	}
 }
 
 type CameraView int
@@ -147,6 +165,7 @@ func (c *Camera) Reset() {
 	c.boundLo = float32(Max(c.boundhigh, c.boundlow)) * c.localscl
 	c.boundlow = Max(c.boundhigh, c.boundlow)
 	c.tensionvel = Max(Min(c.tensionvel, 20), 0)
+	c.ztensionvel = Max(Min(c.ztensionvel, 20), 0)
 	if c.verticalfollow < 0 {
 		c.ytensionenable = true
 	}
@@ -185,10 +204,11 @@ func (c *Camera) Init() {
 	c.Pos[0] = float32(c.startx) * c.localscl
 	c.Pos[1] = float32(c.starty) * c.localscl
 	c.ywithoutbound = c.Pos[1]
+	c.zwithoutbound = 0
 	c.zoomindelaytime = c.zoomindelay
 
 	// We want the camera to just snap to place the first time it moves
-	c.snapToTarget = true
+	c.skipSmoothing = true
 
 	// Set screen position immediately so that char triggers and postype will be correct in the first frame of the round
 	// https://github.com/ikemen-engine/Ikemen-GO/issues/3600
@@ -200,6 +220,8 @@ func (c *Camera) ResetTracking() {
 	c.rightest = -math.MaxFloat32
 	c.highest = math.MaxFloat32
 	c.lowest = -math.MaxFloat32
+	c.zfrontest = math.MaxFloat32
+	c.zbackest = -math.MaxFloat32
 	c.leftestvel = 0
 	c.rightestvel = 0
 }
@@ -240,6 +262,17 @@ func (c *Camera) SaveRestoreTracking() {
 	} else {
 		c.prevRightest = c.rightest
 	}
+
+	if c.zfrontest == math.MaxFloat32 {
+		c.zfrontest = c.prevZfrontest
+	} else {
+		c.prevZfrontest = c.zfrontest
+	}
+	if c.zbackest == -math.MaxFloat32 {
+		c.zbackest = c.prevZbackest
+	} else {
+		c.prevZbackest = c.zbackest
+	}
 }
 
 func (c *Camera) Update(scl, x, y float32) {
@@ -263,10 +296,37 @@ func (c *Camera) ScaleBound(scl, sclmul float32) float32 {
 	return 1
 }
 
+// Area the stage camera can ever show, at its widest zoom. For Zoom stageBound parameter
+// Top assumes boundhighzoomdelta = 1, which keeps the top edge fixed at the zoomout view
+func (c *Camera) StageViewArea() (left, right, top, bottom float32) {
+	minScl, outScl := float32(1), float32(1)
+	if c.zoomEnabled() {
+		minScl, outScl = c.MinScale, c.zoomout
+	}
+	above := c.GroundLevel()
+	below := float32(sys.gameHeight) - above
+	left, right = c.minLeft, c.maxRight
+	top = float32(c.boundhigh)*c.localscl - above/outScl
+	bottom = float32(c.boundlow)*c.localscl + below/minScl
+	return
+}
+
 func (c *Camera) XBound(scl, x float32) float32 {
-	return Clamp(x,
-		c.boundL-c.halfWidth+c.halfWidth/scl,
-		c.boundR+c.halfWidth-c.halfWidth/scl)
+	left, right, _, _ := c.StageViewArea()
+	return Clamp(x, left+c.halfWidth/scl, right-c.halfWidth/scl)
+}
+
+// Lowest scale whose view still fits inside the stage view area
+func (c *Camera) MinZoomScale() float32 {
+	left, right, top, bottom := c.StageViewArea()
+	return Max(float32(sys.gameWidth)/(right-left), float32(sys.gameHeight)/(bottom-top))
+}
+
+func (c *Camera) YBound(scl, y float32) float32 {
+	_, _, top, bottom := c.StageViewArea()
+	above := c.GroundLevel()
+	below := float32(sys.gameHeight) - above
+	return Clamp(y, top+above/scl, bottom-below/scl)
 }
 
 func (c *Camera) BaseScale() float32 {
@@ -386,13 +446,43 @@ func (c *Camera) action(x, y, scale float32, pause bool) (newX, newY, newScale f
 			targetX := (targetLeft + targetRight) / 2
 			targetScale := Min(c.halfWidth*2/(targetRight-targetLeft), maxScale)
 
+			// Calculate the Z camera offset from the tracked Z positions
+			ztension := Max(0, float32(c.ztension)*c.localscl)
+			zTop := sys.zmin + ztension
+			zBottom := sys.zmax - ztension
+			zFront := c.zfrontest * c.localscl
+			zBack := c.zbackest * c.localscl
+			botBound := zBack - zBottom
+			topBound := zFront - zTop
+
+			var zCameraOffset float32
+			base := float32(0)
+			if c.depthtoscreen != 0 {
+				base = c.zwithoutbound / c.depthtoscreen
+			}
+			if c.zautocenter {
+				base = (zFront + zBack) / 2
+			}
+			if botBound <= topBound {
+				zCameraOffset = Clamp(base, botBound, topBound)
+			} else {
+				zCameraOffset = (botBound + topBound) / 2
+			}
+
+			// Limit Z camera offset to the configured bounds
+			zCameraOffset = Max(zCameraOffset, float32(c.zboundtop)*c.localscl)
+			zCameraOffset = Min(zCameraOffset, float32(c.zboundbot)*c.localscl)
+			zCameraOffset *= c.depthtoscreen
+
 			if !c.ytensionenable {
 				//newY = c.ywithoutbound
+				// Remove the previous Z offset before calculating the new Y position
+				newY -= c.zwithoutbound / scale
 				ywithoutbound := c.ywithoutbound
 				verticalfollow := Max(c.verticalfollow, 0.0) + (targetScale-c.zoomout)*Max(c.verticalfollowzoomdelta, 0.0)
 				targetY := (c.highest + float32(c.floortension)*c.localscl) * verticalfollow
 
-				if c.snapToTarget {
+				if c.skipSmoothing {
 					ywithoutbound = targetY
 					newY = ywithoutbound
 				} else {
@@ -416,7 +506,16 @@ func (c *Camera) action(x, y, scale float32, pause bool) (newX, newY, newScale f
 				}
 				c.ywithoutbound = ywithoutbound
 			} else {
-				targetScale = Min(Min(Max(float32(sys.gameHeight)/((c.lowest+float32(c.tensionlow)*c.localscl)-(c.highest-float32(c.tensionhigh)*c.localscl)), c.zoomout), c.zoomin), targetScale)
+				// Account for the Z range when calculating the target scale
+				zSoft := c.zoomin
+				if ztension > 0 {
+					t := Clamp((Max(0, botBound-topBound))/(2*ztension), 0, 1)
+					zSoft = c.zoomin + (c.zoomout-c.zoomin)*t
+				}
+				zSpan := (zBack - zFront + 2*ztension) * c.depthtoscreen
+				zFit := Max(Min(float32(sys.gameHeight)/zSpan, c.zoomin), c.zoomout)
+				zMaxScale := Min(zFit, zSoft)
+				targetScale = Min(Min(Min(Max(float32(sys.gameHeight)/((c.lowest+float32(c.tensionlow)*c.localscl)-(c.highest-float32(c.tensionhigh)*c.localscl)), c.zoomout), c.zoomin), zMaxScale), targetScale)
 				targetX = Min(Max(targetX, float32(c.boundleft)*c.localscl-c.halfWidth*(1/c.zoomout-1/targetScale)), float32(c.boundright)*c.localscl+c.halfWidth*(1/c.zoomout-1/targetScale))
 				targetLeft = targetX - c.halfWidth/targetScale
 				targetRight = targetX + c.halfWidth/targetScale
@@ -424,7 +523,7 @@ func (c *Camera) action(x, y, scale float32, pause bool) (newX, newY, newScale f
 				newY = c.ywithoutbound
 				targetY := c.GroundLevel()/targetScale + (c.highest - float32(c.tensionhigh)*c.localscl)
 
-				if c.snapToTarget {
+				if c.skipSmoothing {
 					newY = targetY
 				} else {
 					diff := float32(sys.gameWidth) / 320 * 2.5
@@ -447,7 +546,7 @@ func (c *Camera) action(x, y, scale float32, pause bool) (newX, newY, newScale f
 			newLeft, newRight := oldLeft, oldRight
 			logicScale := 60.0 / float32(sys.gameLogicSpeed())
 
-			if c.snapToTarget {
+			if c.skipSmoothing {
 				newLeft, newRight = targetLeft, targetRight
 			} else {
 				diff := float32(sys.gameWidth) / 3200
@@ -491,6 +590,23 @@ func (c *Camera) action(x, y, scale float32, pause bool) (newX, newY, newScale f
 			newY = c.reduceYScrollSpeed(newY, y)
 			newY = c.boundY(newY, newScale)
 
+			newZ := c.zwithoutbound
+			if c.skipSmoothing {
+				newZ = zCameraOffset
+			} else {
+				diff := float32(sys.gameWidth) / 3200
+				blend := Clamp(0.05*c.ztensionvel, 0, 1)
+				for i := 0; i < 3; i++ {
+					newZ = newZ + (zCameraOffset-newZ)*blend
+					if Abs(zCameraOffset-newZ) < diff {
+						newZ = zCameraOffset
+						break
+					}
+				}
+			}
+
+			c.zwithoutbound = newZ
+			newY += newZ
 		case Follow_View:
 			newX = c.FollowChar.pos[0]
 			newY = c.FollowChar.pos[1] * Pow(c.verticalfollow, Min(1, 1/Pow(c.Scale, 4)))
@@ -503,7 +619,7 @@ func (c *Camera) action(x, y, scale float32, pause bool) (newX, newY, newScale f
 		}
 	}
 
-	c.snapToTarget = false
+	c.skipSmoothing = false
 	return
 }
 

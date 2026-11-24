@@ -74,6 +74,10 @@ const (
 	wcFrontFace    = 28 // mode
 	wcAttribOn     = 29 // index (enableVertexAttribArray)
 	wcBindBuffer   = 30 // target, bufID
+
+	wcUniform1fv16 = 31 // locID, 16 f    (uniform1fv: a custom shader's param[16])
+
+	wcViewport = 32 // x, y, w, h (GL's bottom-left origin)
 )
 
 // The interpreter. Wrapped by the Function constructor at Init:
@@ -137,6 +141,8 @@ return function (n) {
 		case 28: gl.frontFace(i32[p++]); break;
 		case 29: gl.enableVertexAttribArray(i32[p++]); break;
 		case 30: gl.bindBuffer(i32[p++], T[i32[p++]]); break;
+		case 31: gl.uniform1fv(T[i32[p++]], f32, p, 16); p += 16; break;
+		case 32: gl.viewport(i32[p++], i32[p++], i32[p++], i32[p++]); break;
 		default: throw new Error("wglCmdBuf: bad opcode at " + (p - 1));
 		}
 	}

@@ -531,8 +531,8 @@ func TestP2PBackendDisconnectPlayerRemoteCharacterization(t *testing.T) {
 	p2p2.AddPlayer(&player2, &p2handle2)
 
 	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("The code did not panic due attempting to load frames when none had been saved.")
+		if r := recover(); r != nil {
+			t.Errorf("Disconnect before the first input panicked: %v", r)
 		}
 	}()
 	p2p2.DisconnectPlayer(p2handle1)
@@ -652,8 +652,8 @@ func TestP2PBackendMoockInputExchangeCharacterization(t *testing.T) {
 	input1 := []byte{1, 2, 3, 4}
 	input2 := []byte{5, 6, 7, 8}
 	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("The code did not panic.")
+		if r := recover(); r != nil {
+			t.Errorf("Disconnect timeout before the first input panicked: %v", r)
 		}
 	}()
 
@@ -1037,8 +1037,8 @@ func TestP2PBackendMoockDisconnectTimeoutCharacterization2(t *testing.T) {
 	doPollTimeOuts := 0
 	iterations := 2
 	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("The code did not panic due to trying to load frame that hadn't been saved.")
+		if r := recover(); r != nil {
+			t.Errorf("Disconnect timeout before the first input panicked: %v", r)
 		}
 	}()
 	for i := 0; i < iterations; i++ {
@@ -1327,6 +1327,15 @@ func TestP2PBackendNPlayersShareInput(t *testing.T) {
 			}
 		}
 	}
+	// The host sends a frame again once RunningRetryInterval has passed with
+	// nothing new from the other side (upstream's resend fix, f34b113e): one
+	// more round, that much later.
+	later := func() int64 {
+		return time.Now().Add(time.Millisecond * time.Duration(2000+protocol.RunningRetryInterval)).UnixMilli()
+	}
+	p2p.Idle(0, later)
+	p2p2.Idle(0, later)
+	p2p3.Idle(0, later)
 	val1, _ := p2p.SyncInput(&ignore)
 	val2, _ := p2p2.SyncInput(&ignore)
 	val3, _ := p2p3.SyncInput(&ignore)

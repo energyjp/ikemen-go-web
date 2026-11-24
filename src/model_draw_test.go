@@ -26,7 +26,8 @@ type skinTestTexture struct {
 }
 
 func (t *skinTestTexture) SetData(data []byte)                                         {}
-func (t *skinTestTexture) SetSubData(data []byte, x, y, width, height, stride int32)   {}
+func (t *skinTestTexture) SetSubData(data []byte)                                      {}
+func (t *skinTestTexture) SetSubData2(data []byte, x, y, width, height, stride int32)  {}
 func (t *skinTestTexture) SetDataG(data []byte, mag, min, ws, wt TextureSamplingParam) {}
 func (t *skinTestTexture) SetPixelData(data []float32) {
 	t.uploads++
@@ -35,7 +36,10 @@ func (t *skinTestTexture) SetPixelData(data []float32) {
 func (t *skinTestTexture) IsValid() bool         { return true }
 func (t *skinTestTexture) GetWidth() int32       { return 4 }
 func (t *skinTestTexture) GetHeight() int32      { return 4 }
+func (t *skinTestTexture) GetUV() [4]float32     { return [4]float32{0, 0, 1, 1} }
 func (t *skinTestTexture) CopyData(src *Texture) {}
+func (t *skinTestTexture) MarkNonSwappable()     {}
+func (t *skinTestTexture) GetFilter() bool       { return false }
 
 func skinTestU32(v uint32) *uint32 { return &v }
 

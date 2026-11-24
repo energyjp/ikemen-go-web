@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gopxl/beep/v2"
+	"github.com/ikemen-engine/beep/v2"
 	"github.com/veandco/go-sdl2/sdl"
 )
 
@@ -111,6 +111,9 @@ func (s *SDLSpeaker) Close() {
 		sdl.CloseAudioDevice(s.dev)
 	}
 }
+
+// platformAudioResampleQuality: desktop uses the configured quality as is.
+func platformAudioResampleQuality(q int) int { return q }
 
 func newSpeaker() AudioSink {
 	return &SDLSpeaker{}

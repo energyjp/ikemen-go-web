@@ -2356,13 +2356,26 @@ func (e *Explod) update() {
 	}
 }
 
-// Vertical fit for a screen-space explod of a pre-1.1 MUGEN character in a fight wider than 4:3.
-// Characters scale to the game width (localscl), so in a 16:9 fight a 320-wide character sees a
-// 320x180 screen. WinMUGEN and MUGEN 1.0 always gave it a 4:3 screen (320x240), and their characters
-// place screen explods with fixed numbers for that screen: a meter at y = 230 lands below a 16:9
-// screen. Here the 4:3 screen height is mapped onto the real one, the way the width already is, so
-// a y keeps the share of the screen it had in those engines. Draw only: positions and triggers are
-// unchanged, and a 4:3 fight or a character made for 1.1 or Ikemen gets 1.
+// Vertical fit for a screen-space explod of a pre-1.1 MUGEN character in a fight wider than the
+// screen it was made for. Characters scale to the game width (localscl), so in a 16:9 fight a
+// 320x240 character sees a 320x180 screen. WinMUGEN and MUGEN gave it a 4:3 screen (320x240), and
+// such characters place screen explods with fixed numbers for that screen: a meter at y = 230 lands
+// below a 16:9 screen. Here that screen's height is mapped onto the real one, the way the width
+// already is, so a y keeps the share of the screen it had there. Draw only: positions and triggers
+// are unchanged, and a fight no wider than that screen or a character made for 1.1 or Ikemen gets 1.
+//
+// The screen a character was made for is the widest of two shapes:
+//   - its own localcoord's: a character converted to 427x240 was made for a 16:9 screen, sees
+//     exactly that screen in a 16:9 fight, and its numbers already fit it;
+//   - a wide MUGEN 1.0 screenpack's (mugenversion 1.0, no ikemenversion): MUGEN 1.0 fits a wide
+//     game screen to the width, so there a 320x240 character saw a 320x180 screen and was built
+//     for it. add004 says so in its own notes ("v1.0: adjust the height to the width") and places
+//     its power bars from GameHeight / GameWidth. MUGEN 1.1 keeps a pre-1.1 character's screen
+//     240 high, so a 1.1 or Ikemen screenpack (Infinite Legacy X says 1.1; ikemen1 has
+//     ikemenversion) says nothing here.
+//
+// Capcom VS SNK EVOLUTION REV 2 is both (427x240 MUGEN 1.0 characters, a 1280x720 MUGEN 1.0
+// screenpack); a 4:3 fit there lifted add004's power bars to 72% of the screen.
 func (e *Explod) screenYFit() float32 {
 	root := e.root()
 	if root == nil {
@@ -2372,16 +2385,47 @@ func (e *Explod) screenYFit() float32 {
 	if gi.ikemenver[0] != 0 || gi.ikemenver[1] != 0 || (gi.mugenver[0] == 1 && gi.mugenver[1] == 1) {
 		return 1
 	}
-	return screenYFit43(sys.gameWidth, sys.gameHeight)
+	return screenYFitTo(sys.gameWidth, sys.gameHeight, screenYFitAspect(gi.localcoord, sys.motif.Info))
+}
+
+// The shape (height / width) of the screen a pre-1.1 character was made for: the widest of 4:3,
+// its localcoord's shape and a MUGEN 1.0 screenpack's shape (see screenYFit).
+func screenYFitAspect(localcoord [2]int32, info InfoProperties) float32 {
+	a := screenYFitShape(localcoord)
+	if strings.TrimSpace(info.IkemenVersion) == "" && ParseMugenVersion(info.MugenVersion) == [2]uint16{1, 0} {
+		if b := screenYFitShape(info.Localcoord); b < a {
+			a = b
+		}
+	}
+	return a
+}
+
+// A localcoord's shape (height / width) when it is between 2:1 and 4:3 (427x240 and 1280x720 are
+// 16:9), else 4:3. A character def that gives only a width (localcoord = 640) is read as 640x240,
+// which is not a shape anyone made a character for, so it keeps 4:3.
+func screenYFitShape(localcoord [2]int32) float32 {
+	if localcoord[0] > 0 && localcoord[1] > 0 {
+		if a := float32(localcoord[1]) / float32(localcoord[0]); a >= 0.5 && a < 0.75 {
+			return a
+		}
+	}
+	return 0.75
 }
 
 // Ratio of the game height to the height of a 4:3 screen of the same width. 1 when the game is 4:3 or taller.
 func screenYFit43(gameWidth, gameHeight float32) float32 {
-	h43 := gameWidth * 3 / 4
-	if gameHeight <= 0 || h43 <= gameHeight {
+	return screenYFitTo(gameWidth, gameHeight, 0.75)
+}
+
+// Ratio of the game height to the height of a screen of the same width and the given shape
+// (height / width). 1 when the game is that shape or taller; a game within a thousandth of that
+// shape counts as it (a 1280x720 shape at a game width of 426.6667 is a hair over 240 in float32).
+func screenYFitTo(gameWidth, gameHeight, aspect float32) float32 {
+	ref := gameWidth * aspect
+	if gameHeight <= 0 || ref <= gameHeight*1.001 {
 		return 1
 	}
-	return gameHeight / h43
+	return gameHeight / ref
 }
 
 func (e *Explod) cueDraw() {

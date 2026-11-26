@@ -27,7 +27,25 @@ package main
 //	end     the host's match is over: its last frame and the inputs of its
 //	        last frames as the host simulated them, so the watcher finishes
 //	        exactly where the host did even if the tail never came over GGPO.
-//	nowatch this match cannot be watched (delay netcode, Turns/Tag/Simul).
+//	nowatch this match cannot be watched (delay netcode, or a match the host
+//	        could not describe).
+//
+// TEAM MATCHES. Simul and Tag are one GGPO session like a single match: the
+// select lists every member of both teams in order (NumChars per side), and
+// is sent only once both teams are complete (watchTeamNeed), never with a
+// partial roster. Turns runs one game() for the whole match but a NEW GGPO
+// session for every turn (fight(): a member is KO'd, the next one comes in).
+// It stays ONE watch match across its turns: no new select; the host keeps
+// this match's watchers and registers them again with each turn's session
+// (watchHostNextTurn), and start, drop and end carry the turn number (Turn,
+// 0 first). The watcher keys those three by turn and builds a new spectator
+// session at the same point of game() where the host builds its next one
+// (watchNextTurn, after the turn loop's break test). A start for the next
+// turn that arrives early is kept for it; a drop for a later turn ends the
+// match after this turn. A rematch with no next turn is a new match, offered
+// again, as before. The watcher side keys on "this game() started as a
+// watched match" (captured before the turn loop), never on sys.watch.active:
+// a lobby member who watched and then plays keeps active set.
 //
 // A watcher that arrives during a match waits for the next select: joining
 // mid-match needs a state transfer and is later work. The players never wait
@@ -76,6 +94,9 @@ type watchMsg struct {
 	T     string `json:"t"`
 	Match int    `json:"match"`
 	Why   string `json:"why,omitempty"`
+	// Turns: which turn (GGPO session) of the match a start, drop or end is
+	// about, 0 first. Every other mode has turn 0 only.
+	Turn int `json:"turn,omitempty"`
 
 	// select
 	GameMode       string               `json:"gameMode,omitempty"`
@@ -94,6 +115,15 @@ type watchMsg struct {
 	AiLevel        [MaxPlayerNo]float32 `json:"aiLevel"`
 	InputRemap     [MaxPlayerNo]int     `json:"inputRemap"`
 	Params         string               `json:"params,omitempty"`
+	// The ConsecutiveWins trigger's two counters as the match begins. The
+	// players reset them in main.f_default; a watcher does not, so a lobby
+	// member who watched earlier matches would carry its own.
+	ConsecutiveWins [2]int32 `json:"cwins"`
+	// The fight screen's win counters ([WinCount], "WINS 0") as the match
+	// begins: they go on from match to match (the lobby's players reset them
+	// in main.f_default, a room's rematches do not), and a watcher that
+	// counted its own would show its own history, or none.
+	WinCounts [2]int32 `json:"wcount"`
 	// The host's screenpack and fight screen (the menus load the build's own;
 	// a quick match loads the fight screen alone), so the watcher draws the
 	// match with the same fight screen.
@@ -195,6 +225,11 @@ var watchHost struct {
 	offered bool   // this match was offered (a select or a nowatch)
 	ok      bool   // the offer was a select: this match's watchers may be registered
 	params  string // loadStart's params plus each character's override params
+	// Turns: the turn (GGPO session) of this match being played, 0 first, and
+	// the last match whose offer was a select (a next turn may register
+	// watchers only when it is this match).
+	turn     int
+	selMatch int
 }
 
 // watchHostLoadStart opens the offer of the match the host's Lua started
@@ -235,12 +270,38 @@ func watchHostTryOffer(force bool) {
 	watchHostSelect(watchHost.params)
 }
 
-// watchSelectionComplete: a stage and a character on each side (only single
-// vs single is watched).
+// watchSelectionComplete: a stage and each side's whole team. The select
+// screen picks side 1's team before side 2's, so "a character on each side"
+// would offer a team match at side 2's first member.
 func watchSelectionComplete() bool {
 	sys.selMutex.RLock()
 	defer sys.selMutex.RUnlock()
-	return sys.sel.selectedStageNo > 0 && len(sys.sel.selected[0]) >= 1 && len(sys.sel.selected[1]) >= 1
+	if sys.sel.selectedStageNo <= 0 {
+		return false
+	}
+	for side := 0; side < 2; side++ {
+		if len(sys.sel.selected[side]) < watchTeamNeed(side) {
+			return false
+		}
+	}
+	return true
+}
+
+// watchTeamNeed is how many characters side's team selects: the team size in
+// Turns (numTurns), Simul and Tag (numSimul), else 1. Read under selMutex
+// (setTeamMode writes these under it).
+func watchTeamNeed(side int) int {
+	n := int32(1)
+	switch sys.tmode[side] {
+	case TM_Turns:
+		n = sys.numTurns[side]
+	case TM_Simul, TM_Tag:
+		n = sys.numSimul[side]
+	}
+	if n < 1 {
+		n = 1
+	}
+	return int(n)
 }
 
 // watchHostSelect offers the match the host's Lua is loading. With no watcher
@@ -251,13 +312,16 @@ func watchHostSelect(params string) {
 		return
 	}
 	watchHostMatch++
-	watchHost.offered, watchHost.ok = true, false
+	watchHost.offered, watchHost.ok, watchHost.turn = true, false, 0
 	m := watchMsg{T: "select", Match: watchHostMatch}
 	if why := watchUnwatchable(); why != "" {
 		m.T, m.Why = "nowatch", why
 		platformWatchOffer(watchHostMatch, mustJSON(&m))
 		return
 	}
+	// Each side's whole team, in member order (the order the watcher's Lua
+	// selects them in, so P1, P3, P5... are the host's).
+	var need [2]int
 	sys.selMutex.RLock()
 	for side := 0; side < 2; side++ {
 		for _, sel := range sys.sel.selected[side] {
@@ -267,6 +331,7 @@ func watchHostSelect(params string) {
 			m.Chars = append(m.Chars, watchChar{Side: side + 1, Def: sys.sel.charlist[sel[0]].def, Pal: sel[1]})
 		}
 		m.NumChars[side] = int32(len(sys.sel.selected[side]))
+		need[side] = watchTeamNeed(side)
 	}
 	if n := sys.sel.selectedStageNo; n > 0 && n <= len(sys.sel.stagelist) {
 		m.Stage = sys.sel.stagelist[n-1].def
@@ -280,6 +345,12 @@ func watchHostSelect(params string) {
 	m.MatchWins, m.Wins, m.MaxDraws = sys.matchWins, sys.wins, sys.maxDraws
 	m.RoundTime, m.FramesPerCount, m.MatchNo = sys.maxRoundTime, sys.curFramesPerCount, sys.matchNo
 	m.Home, m.AiLevel, m.InputRemap = sys.home, sys.aiLevel, sys.inputRemap
+	m.ConsecutiveWins = sys.consecutiveWins
+	for i, wc := range sys.fightScreen.winCounts {
+		if wc != nil {
+			m.WinCounts[i] = wc.wins
+		}
+	}
 	m.Params = params
 	m.Motif, m.Fight = sys.motif.Def, sys.fightScreen.def
 	if m.Header != nil {
@@ -287,27 +358,81 @@ func watchHostSelect(params string) {
 		// up); the start message carries them for every match.
 		m.Header.Setups = sys.replaySetups()
 	}
-	if m.Stage == "" || len(m.Chars) != 2 || m.Header == nil {
+	if m.Stage == "" || m.Header == nil || !watchTeamsWhole(m.Chars, m.NumChars, need) {
 		m.T, m.Why = "nowatch", "the host's match could not be described to a watcher"
 	}
 	watchHost.ok = m.T == "select"
+	if watchHost.ok {
+		watchHost.selMatch = watchHostMatch
+	}
 	platformWatchOffer(watchHostMatch, mustJSON(&m))
 }
 
+// watchTeamsWhole: each side lists exactly its NumChars characters (none was
+// skipped as invalid), at least its whole team and at least one. A forced
+// offer with a team still being picked is a nowatch, never a partial roster.
+func watchTeamsWhole(chars []watchChar, numChars [2]int32, need [2]int) bool {
+	for side := 0; side < 2; side++ {
+		n := 0
+		for _, c := range chars {
+			if c.Side == side+1 {
+				n++
+			}
+		}
+		if n < 1 || n != int(numChars[side]) || n < need[side] {
+			return false
+		}
+	}
+	return true
+}
+
 // watchUnwatchable says why the current selection cannot be watched ("" when
-// it can). P0 covers single vs single only: in Turns the host builds a new
-// GGPO session for every turn, and Tag and Simul are not proven yet, so they
-// are refused with a message rather than registered half right.
+// it can). Every team mode of a versus match is watched (Single, Simul, Tag,
+// Turns at any size); delay netcode has no spectator path. The online co-op
+// runs (ARCADE CO-OP, SURVIVAL CO-OP: both players on side 1 against the
+// computer) stay refused, as they were while every team mode was: a run
+// carries state from match to match (life kept between matches, the next
+// survival opponent loaded ahead, continues), and no watcher has been
+// proven to follow it.
 func watchUnwatchable() string {
 	if !sys.cfg.Netplay.RollbackNetcode {
 		return "watching needs rollback netcode; this match uses delay netcode"
 	}
-	for i := 0; i < 2; i++ {
-		if sys.tmode[i] != TM_Single {
-			return "watching Turns, Tag and Simul matches is not supported yet"
-		}
+	switch sys.gameMode {
+	case "netplayteamcoop", "netplaysurvivalcoop":
+		return "watching co-op runs is not supported yet"
 	}
 	return ""
+}
+
+// watchHostNextTurn: the host's Turns match goes on to its next turn (game()'s
+// turn loop, watchNextTurn). It is the same watch match: no new offer, and
+// the watchers of this match's select are registered again with the next
+// turn's GGPO session (watchTransport, then addWatchers). watchEnd cleared
+// the offer at the end of the turn; this puts it back as it was.
+func watchHostNextTurn() {
+	if !platformWatchHosting() || watchHostMatch == 0 {
+		return
+	}
+	watchHost.pending = false
+	watchHost.offered = true
+	watchHost.ok = watchHost.selMatch == watchHostMatch
+	watchHost.turn++
+}
+
+// watchNextTurn runs at the point of game()'s Turns loop where the next turn
+// begins (after the break test). watched: this game() began as a watched
+// match (sys.spectating() before the turn loop). A watcher builds the next
+// turn's spectator session there, or ends the match (false) when it cannot
+// follow it; the host carries its watchers on to the next turn.
+func watchNextTurn(watched bool) bool {
+	if watched {
+		return sys.watch.nextTurn()
+	}
+	if sys.netConnection != nil && sys.netConnection.host {
+		watchHostNextTurn()
+	}
+	return true
 }
 
 type watchReg struct {
@@ -348,14 +473,14 @@ func (rs *RollbackSession) addWatchers(peer *ggpo.Peer) {
 	if len(rs.watchSlots) == 0 || sys.netConnection == nil {
 		return
 	}
-	start := watchMsg{T: "start", Match: watchHostMatch,
+	start := watchMsg{T: "start", Match: watchHostMatch, Turn: watchHost.turn,
 		Seed: sys.netConnection.lastSeed, PmTime: sys.netConnection.preMatchTime, NetTime: rs.netTime,
 		Setups: sys.replaySetups(), Menu: watchMenuSnapshot()}
 	for _, slot := range rs.watchSlots {
 		player := ggpo.NewSpectatorPlayer(20, webrtcPeerIPForWatch, watchBasePort+slot)
 		var handle ggpo.PlayerHandle
 		if err := peer.AddPlayer(&player, &handle); err != nil {
-			platformWatchSend(slot, mustJSON(&watchMsg{T: "drop", Match: watchHostMatch,
+			platformWatchSend(slot, mustJSON(&watchMsg{T: "drop", Match: watchHostMatch, Turn: watchHost.turn,
 				Why: "the host could not add this watcher: " + err.Error()}))
 			continue
 		}
@@ -366,7 +491,11 @@ func (rs *RollbackSession) addWatchers(peer *ggpo.Peer) {
 	for i := range rs.watchTail {
 		rs.watchTail[i].F = -1
 	}
-	platformWatchLog(fmt.Sprintf("match %d: %d watcher(s) registered", watchHostMatch, len(rs.watchers)))
+	if watchHost.turn > 0 || sys.tmode[0] == TM_Turns || sys.tmode[1] == TM_Turns {
+		platformWatchLog(fmt.Sprintf("match %d turn %d: %d watcher(s) registered", watchHostMatch, watchHost.turn, len(rs.watchers)))
+	} else {
+		platformWatchLog(fmt.Sprintf("match %d: %d watcher(s) registered", watchHostMatch, len(rs.watchers)))
+	}
 }
 
 // watchRecord keeps the inputs the host simulated a frame with, latest wins
@@ -417,7 +546,7 @@ func (rs *RollbackSession) onWatcherEvent(info *ggpo.Event) {
 				why = "the watcher disconnected"
 			}
 			platformWatchLog(fmt.Sprintf("watcher %d dropped: %s", w.slot, why))
-			platformWatchSend(w.slot, mustJSON(&watchMsg{T: "drop", Match: watchHostMatch, Why: why}))
+			platformWatchSend(w.slot, mustJSON(&watchMsg{T: "drop", Match: watchHostMatch, Turn: watchHost.turn, Why: why}))
 		}
 	}
 }
@@ -428,7 +557,8 @@ func (rs *RollbackSession) watchEnd() {
 	// The match's hub stops reading the page now, watched or not: a next match
 	// with no watcher must not inherit it.
 	platformWatchHubClose()
-	// The next match is offered again, loadStart or not.
+	// The next match is offered again, loadStart or not; a Turns match's next
+	// turn puts this match's offer back (watchHostNextTurn).
 	watchHost.pending, watchHost.offered, watchHost.ok = false, false, false
 	if len(rs.watchers) == 0 {
 		return
@@ -438,7 +568,7 @@ func (rs *RollbackSession) watchEnd() {
 		return
 	}
 	last := peer.CurrentFrame() - 1
-	end := watchMsg{T: "end", Match: watchHostMatch, Last: last}
+	end := watchMsg{T: "end", Match: watchHostMatch, Turn: watchHost.turn, Last: last}
 	for f := last - watchTailFrames + 1; f <= last; f++ {
 		if f < 0 {
 			continue
@@ -475,6 +605,18 @@ type watchState struct {
 	loading int  // the match this watcher loaded (apply)
 	escKey  bool // this watcher's own Esc key, pressed while it watches a match
 	left    bool // ... so it left watching
+	// Turns: the turn this watcher runs (0 first), and what the host already
+	// said about the next one while this one still ran: its start, its end
+	// (a turn shorter than the watcher's lag) and a drop.
+	turn     int
+	early    *watchMsg
+	endNext  *watchMsg
+	dropNext string
+}
+
+// resetTurns: a new match starts at turn 0 with nothing kept for a next turn.
+func (w *watchState) resetTurns() {
+	w.turn, w.early, w.endNext, w.dropNext = 0, nil, nil, ""
 }
 
 // leaveLocal: the watcher pressed Esc while it loaded or watched a match. Like
@@ -510,39 +652,98 @@ func (w *watchState) poll() {
 			platformWatchLog("unreadable message from the host: " + err.Error())
 			continue
 		}
-		switch m.T {
-		case "select", "nowatch":
+		w.take(m)
+	}
+}
+
+// take is one message from the host. A start, drop or end is about this
+// watcher's match only, and about the turn it names (Turns; every other mode
+// has turn 0 only): one for this turn takes effect now, a start, end or drop
+// for a later turn waits for that turn (nextTurn), one for an earlier turn is
+// stale and ignored.
+func (w *watchState) take(m watchMsg) {
+	switch m.T {
+	case "select", "nowatch":
+		mm := m
+		if w.running {
+			w.next = &mm
+		} else {
+			w.sel, w.start, w.end, w.dropped = &mm, nil, nil, ""
+			w.resetTurns()
+		}
+		if m.T == "nowatch" {
+			w.notice = m.Why
+			platformWatchLog("this match cannot be watched: " + m.Why)
+		}
+	case "start":
+		if w.sel != nil && m.Match == w.sel.Match {
 			mm := m
-			if w.running {
-				w.next = &mm
-			} else {
-				w.sel, w.start, w.end, w.dropped = &mm, nil, nil, ""
-			}
-			if m.T == "nowatch" {
-				w.notice = m.Why
-				platformWatchLog("this match cannot be watched: " + m.Why)
-			}
-		case "start":
-			if w.sel != nil && m.Match == w.sel.Match {
-				mm := m
+			switch {
+			case m.Turn == w.turn:
 				w.start = &mm
+			case m.Turn > w.turn:
+				w.early = &mm
 			}
-		case "drop":
-			if w.sel != nil && m.Match == w.sel.Match {
+		}
+	case "drop":
+		if w.sel != nil && m.Match == w.sel.Match {
+			switch {
+			case m.Turn == w.turn:
 				w.dropped = m.Why
 				platformWatchLog("dropped from this match: " + m.Why)
+			case m.Turn > w.turn:
+				w.dropNext = m.Why
+				platformWatchLog(fmt.Sprintf("dropped from turn %d of this match: %s", m.Turn, m.Why))
 			}
-		case "end":
-			if w.sel != nil && m.Match == w.sel.Match {
-				mm := m
-				w.end = &mm
-				w.tail = map[int][]byte{}
-				for _, t := range m.Tail {
-					w.tail[t.F] = t.B
-				}
+		}
+	case "end":
+		if w.sel != nil && m.Match == w.sel.Match {
+			mm := m
+			switch {
+			case m.Turn == w.turn:
+				w.setEnd(&mm)
+			case m.Turn > w.turn:
+				w.endNext = &mm
 			}
 		}
 	}
+}
+
+// setEnd takes the host's end of the turn this watcher runs, with its tail.
+func (w *watchState) setEnd(m *watchMsg) {
+	w.end = m
+	w.tail = map[int][]byte{}
+	for _, t := range m.Tail {
+		w.tail[t.F] = t.B
+	}
+}
+
+// nextTurn is the watcher's side of a Turns match going on to its next turn,
+// at the point of game() where the host builds that turn's session: a new
+// spectator session for it, which the next fight() synchronizes with the
+// host's start for that turn. False, with no session, when this watcher
+// cannot follow the match on: the host is gone, it left, it was dropped (from
+// this turn or the next), or the host moved on to another match.
+func (w *watchState) nextTurn() bool {
+	w.poll()
+	if w.gone || w.left || w.dropped != "" || w.dropNext != "" ||
+		w.sel == nil || w.sel.T != "select" || w.sel.Match != w.loading {
+		sys.rollback.session = nil
+		return false
+	}
+	w.turn++
+	w.start, w.end, w.tail = nil, nil, nil
+	if w.early != nil && w.early.Turn == w.turn {
+		w.start = w.early
+	}
+	if w.endNext != nil && w.endNext.Turn == w.turn {
+		w.setEnd(w.endNext)
+	}
+	w.early, w.endNext = nil, nil
+	s := NewRollbackSession(sys.cfg.Netplay.Rollback)
+	s.spectating = true
+	sys.rollback.session = &s
+	return true
 }
 
 // watchNextMatch is the select to load next (nil while there is none), and
@@ -551,6 +752,7 @@ func (w *watchState) nextMatch() (*watchMsg, bool) {
 	w.poll()
 	if w.next != nil && !w.running {
 		w.sel, w.next, w.start, w.end, w.dropped = w.next, nil, nil, nil, ""
+		w.resetTurns()
 	}
 	if w.gone {
 		return nil, false
@@ -632,12 +834,19 @@ func (w *watchState) applyRules(m *watchMsg) {
 	sys.matchWins, sys.wins, sys.maxDraws = m.MatchWins, m.Wins, m.MaxDraws
 	sys.curFramesPerCount, sys.maxRoundTime, sys.matchNo = m.FramesPerCount, m.RoundTime, m.MatchNo
 	sys.home, sys.aiLevel, sys.inputRemap = m.Home, m.AiLevel, m.InputRemap
+	sys.consecutiveWins = m.ConsecutiveWins
+	for i, wc := range sys.fightScreen.winCounts {
+		if wc != nil {
+			wc.wins = m.WinCounts[i]
+		}
+	}
 	// A watcher's match runs in the rollback loop with a spectator session:
 	// usesRollbackMatch and the input path key off this being non-nil.
 	session := NewRollbackSession(sys.cfg.Netplay.Rollback)
 	session.spectating = true
 	sys.rollback.session = &session
 	w.start, w.end, w.dropped, w.tail = nil, nil, "", nil
+	w.resetTurns()
 }
 
 // synchronize is the watcher's counterpart of NetConnection.Synchronize: it
@@ -843,23 +1052,27 @@ func watchMatchSummary() string {
 	out := fmt.Sprintf("wins %d-%d", sys.wins[0], sys.wins[1])
 	for _, r := range m.Rounds {
 		out += fmt.Sprintf(" | r%d t=%d", r.Index, r.Timer)
+		// every fighter of each side (a team's partners, each Turns turn's
+		// member), so the line host and watcher print covers them all
 		for side := 0; side < 2; side++ {
-			if len(r.Fighters[side]) == 0 {
-				continue
+			for i, f := range r.Fighters[side] {
+				res := "lose"
+				switch {
+				case f.DrawGame:
+					res = "draw"
+				case f.Win && f.WinKO:
+					res = "win KO"
+				case f.Win && f.WinTime:
+					res = "win time"
+				case f.Win:
+					res = "win"
+				}
+				if i == 0 {
+					out += fmt.Sprintf(" P%d life=%d %s", side+1, f.Life, res)
+				} else {
+					out += fmt.Sprintf(" P%d.%d life=%d %s", side+1, i+1, f.Life, res)
+				}
 			}
-			f := r.Fighters[side][0]
-			res := "lose"
-			switch {
-			case f.DrawGame:
-				res = "draw"
-			case f.Win && f.WinKO:
-				res = "win KO"
-			case f.Win && f.WinTime:
-				res = "win time"
-			case f.Win:
-				res = "win"
-			}
-			out += fmt.Sprintf(" P%d life=%d %s", side+1, f.Life, res)
 		}
 	}
 	return out

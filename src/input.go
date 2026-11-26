@@ -367,6 +367,11 @@ func (m *MouseInput) position() (float32, float32, bool) {
 	dw, dh := sys.window.GetDrawablePixelSize()
 	vx, vy, vw, vh := sys.window.GetScaledViewportSize()
 	viewport := sys.currentDrawViewport()
+	// uiWindowSpace: outside a draw pass a match reads the pointer over the whole
+	// window, where the script draws, not only over the fight.
+	if sys.luaWindowUI && sys.drawViewport == ([4]int32{}) && sys.middleOfMatch() && sys.cfg.Video.KeepAspect {
+		viewport = sys.aspectViewport(sys.getMotifAspect())
+	}
 	if w <= 0 || h <= 0 || vw <= 0 || vh <= 0 || viewport[2] <= 0 || viewport[3] <= 0 {
 		return 0, 0, false
 	}

@@ -285,6 +285,9 @@ type System struct {
 	redrawWait       struct{ nextTime, lastDraw time.Time }
 	debugFont        *TextSprite
 	debugDisplay     bool
+	// Lua draws and reads the mouse over the whole window mid-match
+	// (uiWindowSpace). Render only, not game state.
+	luaWindowUI bool
 	debugRef         [2]int // player number, helper index
 	debugLastID      int32
 	soundMixer       *beep.Mixer
@@ -1051,7 +1054,7 @@ func (s *System) motifOverlayActive() bool {
 
 func (s *System) shouldComposeFullResolution() bool {
 	return s.canUseFullResolutionAspect() &&
-		(!s.middleOfMatch() || s.motifOverlayActive() || s.debugDisplay)
+		(!s.middleOfMatch() || s.motifOverlayActive() || s.debugDisplay || s.luaWindowUI)
 }
 
 // Fit content with the given aspect ratio into the middle of the render target.
@@ -3175,12 +3178,14 @@ func (s *System) luaQueueLayerDraw(layer int, fn func()) {
 func (s *System) luaFlushDrawQueue() {
 	// Pre-pass
 	for _, fn := range s.luaDrawPreOps {
+		s.luaUnclip()
 		fn()
 	}
 	s.luaDrawPreOps = s.luaDrawPreOps[:0]
 	// Layered passes
 	for i := range s.luaDrawLayerOps {
 		for _, fn := range s.luaDrawLayerOps[i] {
+			s.luaUnclip()
 			fn()
 		}
 		s.luaDrawLayerOps[i] = s.luaDrawLayerOps[i][:0]
@@ -3188,6 +3193,23 @@ func (s *System) luaFlushDrawQueue() {
 	// Every queued text draw ran: its slots serve the next frame (luatextdraw.go).
 	luaTextDrawsUsed = 0
 }
+
+// With uiWindowSpace on, each queued Lua draw starts unclipped (bounded by
+// the composition, the whole window), as on the desktop renderers. The web
+// renderer defers a sprite's DisableScissor until something flushes it and a
+// rect never does, so a queued rect was clipped by whatever window the last
+// sprite left: the fight's box (rects in the bars vanished) or an icon's.
+// Render only; nothing changes without the flag.
+func (s *System) luaUnclip() {
+	if !s.luaWindowUI {
+		return
+	}
+	if f, ok := gfx.(interface{ flushScissorDisable() }); ok {
+		gfx.DisableScissor()
+		f.flushScissorDisable()
+	}
+}
+
 func (s *System) luaDiscardDrawQueue() {
 	s.luaDrawPreOps = s.luaDrawPreOps[:0]
 	for i := range s.luaDrawLayerOps {
@@ -5258,6 +5280,8 @@ func (s *System) runMatch() (reload bool) {
 	s.fightLoopEnd = false
 	s.aiInput = [len(s.aiInput)]AiInput{}
 	s.saveState = NewGameState()
+	// A script asks for the whole window again in each match (uiWindowSpace).
+	s.luaWindowUI = false
 
 	// Disable debug during netplay (but not during replays)
 	if !s.debugModeAllowed() {
@@ -5270,6 +5294,7 @@ func (s *System) runMatch() (reload bool) {
 	// Defer resetting variables on return
 	defer func() {
 		s.oldNextAddTime = 1
+		s.luaWindowUI = false
 		s.nomusic = false
 		s.allPalFX.clear()
 		s.allPalFX.enable = false

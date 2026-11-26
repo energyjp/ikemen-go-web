@@ -915,6 +915,19 @@ func (u *UdpProtocol) OnInvalid(msg messages.UDPMessage, len int) (bool, error) 
 }
 
 func (u *UdpProtocol) OnSyncRequest(msg messages.UDPMessage, len int) (bool, error) {
+	// A watcher's line belongs to ONE host session. Once it has synced, a sync
+	// request with another magic is a newer session of the same host (the next
+	// Turns turn, a rematch) reaching this one while it finishes its last
+	// frames: answering it would let that session's endpoint sync with this
+	// one and pin its magic, and then it rejects everything the watcher's real
+	// next session sends (acks, keep-alives) until it drops the watcher. Not
+	// answered, the host keeps asking until the watcher's next session does.
+	// (Upstream GGPO checks this on every endpoint; the players' keep their
+	// behavior.)
+	if u.watcherLine && u.remoteMagicNumber != 0 && msg.Header().Magic != u.remoteMagicNumber {
+		util.Log.Printf("Ignoring sync request from another session (%d != %d).\n", msg.Header().Magic, u.remoteMagicNumber)
+		return false, nil
+	}
 	request := msg.(*messages.SyncRequestPacket)
 	reply := messages.NewUDPMessage(messages.SyncReplyMsg)
 	syncReply := reply.(*messages.SyncReplyPacket)

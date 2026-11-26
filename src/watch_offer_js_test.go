@@ -56,21 +56,29 @@ func saveWatchHostState(t *testing.T) {
 	}{sys.sel.charlist, sys.sel.stagelist, sys.sel.selected, sys.sel.selectedStageNo}
 	tmode, rb, ov, host, match := sys.tmode, sys.cfg.Netplay.RollbackNetcode, sys.netplayOverride, watchHost, watchHostMatch
 	setups := sys.sessionSetups
+	numSimul, numTurns, cwins := sys.numSimul, sys.numTurns, sys.consecutiveWins
+	gameMode := sys.gameMode
 	t.Cleanup(func() {
 		js.Global().Delete("ikemenWatch")
 		sys.sel.charlist, sys.sel.stagelist, sys.sel.selected, sys.sel.selectedStageNo = sel.chars, sel.stages, sel.selected, sel.stageNo
 		sys.tmode, sys.cfg.Netplay.RollbackNetcode, sys.netplayOverride, watchHost, watchHostMatch = tmode, rb, ov, host, match
 		sys.sessionSetups = setups
+		sys.numSimul, sys.numTurns, sys.consecutiveWins = numSimul, numTurns, cwins
+		sys.gameMode = gameMode
 	})
 	sys.sel.charlist = []SelectChar{{def: "chars/kfm/kfm.def"}, {def: "chars/ryudx/RyuDX.def"}}
 	sys.sel.stagelist = []SelectStage{{def: "stages/kfm.def"}}
 	sys.sel.selected = [2][][2]int{}
 	sys.sel.selectedStageNo = 1
 	sys.tmode = [2]TeamMode{TM_Single, TM_Single}
+	sys.numSimul, sys.numTurns = [2]int32{1, 1}, [2]int32{1, 1}
+	sys.consecutiveWins = [2]int32{}
+	sys.gameMode = "netplayversus"
 	sys.cfg.Netplay.RollbackNetcode = true
 	sys.netplayOverride = SessionConfigOverride{Active: true, Source: "netplay", SyncVersion: syncConfigVersion}
 	sys.sessionSetups = nil
 	watchHost.pending, watchHost.offered, watchHost.ok = false, false, false
+	watchHost.turn, watchHost.selMatch = 0, 0
 }
 
 func TestWatchOfferWaitsForTheSelection(t *testing.T) {
@@ -142,22 +150,42 @@ func TestWatchOfferAtLoadStartWhenSelected(t *testing.T) {
 	}
 }
 
-// Turns, Tag, Simul and delay netcode are refused at once, and a match after a
-// nowatch registers no watcher (it would only drop it 240 frames in).
+// Delay netcode is refused at once, and a match after a nowatch registers no
+// watcher (it would only drop it 480 frames in). Turns, Tag and Simul VERSUS
+// matches are watched since 2026-11-24 (TestWatchTeamOfferWaitsForTheWholeTeams);
+// the online co-op runs (both players on side 1, so always a team mode) stay
+// refused as before, whole teams selected or not.
 func TestWatchNowatchRegistersNobody(t *testing.T) {
 	for _, c := range []struct {
-		name  string
-		tmode TeamMode
-		delay bool
-	}{{"turns", TM_Turns, false}, {"tag", TM_Tag, false}, {"simul", TM_Simul, false}, {"delay", TM_Single, true}} {
+		name     string
+		tmode    TeamMode
+		delay    bool
+		gameMode string
+		why      string
+	}{
+		{"delay", TM_Single, true, "netplayversus", "delay netcode"},
+		{"delay-simul", TM_Simul, true, "netplayversus", "delay netcode"},
+		{"arcade-coop-simul", TM_Simul, false, "netplayteamcoop", "co-op"},
+		{"arcade-coop-tag", TM_Tag, false, "netplayteamcoop", "co-op"},
+		{"arcade-coop-turns", TM_Turns, false, "netplayteamcoop", "co-op"},
+		{"survival-coop-simul", TM_Simul, false, "netplaysurvivalcoop", "co-op"},
+		{"survival-coop-turns", TM_Turns, false, "netplaysurvivalcoop", "co-op"},
+	} {
 		t.Run(c.name, func(t *testing.T) {
 			saveWatchHostState(t)
 			f := installFakeWatchHost(t)
 			sys.tmode = [2]TeamMode{c.tmode, TM_Single}
 			sys.cfg.Netplay.RollbackNetcode = !c.delay
+			sys.gameMode = c.gameMode
+			if c.tmode != TM_Single {
+				// the whole teams: a co-op run is refused at once anyway
+				sys.numSimul, sys.numTurns = [2]int32{2, 1}, [2]int32{2, 1}
+				sys.sel.selected[0] = [][2]int{{0, 1}, {1, 1}}
+				sys.sel.selected[1] = [][2]int{{0, 2}}
+			}
 			watchHostLoadStart("")
-			if len(f.offers) != 1 || f.offers[0].T != "nowatch" || f.offers[0].Why == "" {
-				t.Fatalf("offers %+v, want one nowatch with a reason", f.offers)
+			if len(f.offers) != 1 || f.offers[0].T != "nowatch" || !strings.Contains(f.offers[0].Why, c.why) {
+				t.Fatalf("offers %+v, want one nowatch saying %q", f.offers, c.why)
 			}
 			var rs RollbackSession
 			rs.watchTransport([]transport.Connection{transport.NewWebRTC(js.Global().Get("Object").New(), webrtcPeerIPForWatch, 7550)})

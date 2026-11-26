@@ -3454,6 +3454,12 @@ func systemScriptInit(l *lua.LState) {
 			// Defer synchronizing with external inputs on return
 			defer sys.synchronize()
 
+			// A watched match (watch.go): a watcher follows every Turns turn
+			// with a spectator session of its own. Captured here, not read from
+			// sys.watch.active, which stays set on a lobby member who watched
+			// earlier matches and now plays.
+			watched := sys.spectating()
+
 			// Loop calling gameplay until match ends
 			// Will repeat on turns mode character change and hard reset
 			for {
@@ -3474,6 +3480,12 @@ func systemScriptInit(l *lua.LState) {
 					sys.wins[1] >= sys.matchWins[1] ||
 					sys.gameEnd ||
 					sys.endMatch {
+					break
+				}
+				// The next turn is a new GGPO session: the host registers its
+				// watchers with it again, a watcher builds its spectator
+				// session for it (or stops here when it cannot follow).
+				if !watchNextTurn(watched) {
 					break
 				}
 
@@ -6265,6 +6277,25 @@ func systemScriptInit(l *lua.LState) {
 		@treturn boolean moved*/
 		sys.pollDevices()
 		l.Push(lua.LBool(sys.mouse.enabled() && sys.mouse.moved))
+		return 1
+	})
+	luaRegister(l, "uiWindowSpace", func(l *lua.LState) int {
+		/*Let this script draw and read the mouse over the whole window during a match,
+		  the pillarbox or letterbox bars around a fight of another shape included.
+		  Rects, texts and anims drawn with the fight's localcoord keep their place over
+		  the fight; coordinates past its edges reach the bars. The fight itself is
+		  drawn where it always is. Cleared at the start and end of every match.
+		@function uiWindowSpace
+		@tparam boolean on `true` to turn it on, `false` to turn it off.
+		@treturn number|boolean width The window's width in 240-high units (426.67 at 16:9),
+		  or `false` when the game does not keep its aspect (there are no bars).*/
+		if !sys.cfg.Video.KeepAspect {
+			sys.luaWindowUI = false
+			l.Push(lua.LFalse)
+			return 1
+		}
+		sys.luaWindowUI = !nilArg(l, 1) && boolArg(l, 1)
+		l.Push(lua.LNumber(240 * sys.getMotifAspect()))
 		return 1
 	})
 	luaRegister(l, "mouseOver", func(l *lua.LState) int {

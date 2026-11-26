@@ -1334,7 +1334,6 @@ function main.f_watch(fromMenu, once)
 			f_watchWaiting(once and netLobby('text', '') or nil)
 			refresh()
 		end
-		setFightScreenElements({guardbar = gameOption('Options.GuardBreak'), stunbar = gameOption('Options.Dizzy'), redlifebar = gameOption('Options.RedLife')})
 		clearSelected()
 		selectStage(sel.stage)
 		setTeamMode(1, sel.teamMode[1], sel.numChars[1])
@@ -1343,6 +1342,10 @@ function main.f_watch(fromMenu, once)
 			selectChar(c[1], c[2], c[3])
 		end
 		watchApply()
+		--After watchApply: it sets the host's game mode (netplayversus), and
+		--fight.def's per-mode items ([WinCount] enabled.netplayversus...) are
+		--picked by the game mode, as the players' start.f_setRounds does.
+		setFightScreenElements(main.fightscreen or {guardbar = gameOption('Options.GuardBreak'), stunbar = gameOption('Options.Dizzy'), redlifebar = gameOption('Options.RedLife')})
 		--the host's loadStart params (versusresults, pausemenu, coopturns...)
 		--and its characters' override params, on fresh per-match params as the
 		--host's select screen starts from (resetGameParams)
